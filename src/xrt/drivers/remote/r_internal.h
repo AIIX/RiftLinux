@@ -1,0 +1,111 @@
+// Copyright 2020-2022, Collabora, Ltd.
+// SPDX-License-Identifier: BSL-1.0
+/*!
+ * @file
+ * @brief  Internal stuff in remote driver.
+ * @author Jakob Bornecrantz <jakob@collabora.com>
+ * @ingroup drv_remote
+ */
+
+#pragma once
+
+#include "r_interface.h"
+
+#include "xrt/xrt_device.h"
+#include "xrt/xrt_system.h"
+#include "xrt/xrt_tracking.h"
+
+#include "os/os_threading.h"
+
+#include "util/u_hand_tracking.h"
+
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+/*!
+ * Central object remote object.
+ *
+ * @ingroup drv_remote
+ */
+struct r_hub
+{
+	// System devices wrapper.
+	struct xrt_system_devices base;
+
+	//! Origin for all locations.
+	struct xrt_tracking_origin origin;
+
+	//! Connection to the controller.
+	struct r_remote_connection rc;
+
+	//! The data that the is the reset position.
+	struct r_remote_data reset;
+
+	//! The latest data received.
+	struct r_remote_data latest;
+
+	//! Incoming connection socket.
+	r_socket_t accept_fd;
+
+	uint16_t port;
+	uint32_t view_count;
+	uint32_t w_pixels;
+	uint32_t h_pixels;
+	float w_meters;
+	float h_meters;
+
+	struct os_thread_helper oth;
+
+	//! Index to the left controller.
+	int32_t left_index;
+
+	//! Index to the right controller.
+	int32_t right_index;
+
+	struct
+	{
+		bool hmd, left, right;
+	} gui;
+};
+
+/*!
+ * HMD
+ *
+ * @ingroup drv_remote
+ */
+struct r_hmd
+{
+	struct xrt_device base;
+
+	struct r_hub *r;
+};
+
+/*!
+ * Device
+ *
+ * @ingroup drv_remote
+ */
+struct r_device
+{
+	struct xrt_device base;
+
+	struct r_hub *r;
+
+	struct u_hand_tracking hand_tracking;
+
+	bool is_left;
+};
+
+
+struct xrt_device *
+r_hmd_create(struct r_hub *r);
+
+struct xrt_device *
+r_device_create(struct r_hub *r, bool is_left);
+
+
+#ifdef __cplusplus
+}
+#endif

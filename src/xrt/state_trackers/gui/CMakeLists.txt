@@ -1,0 +1,92 @@
+# Copyright 2019-2024, Collabora, Ltd.
+# Copyright 2024-2026, NVIDIA CORPORATION.
+# SPDX-License-Identifier: BSL-1.0
+
+# c-imgui doesn't do well with IPO - lots of warnings.
+set(CMAKE_INTERPROCEDURAL_OPTIMIZATION OFF)
+
+###
+# Base GUI
+add_library(
+	st_gui_base STATIC
+	gui_common.h
+	gui_imgui.h
+	gui_ogl.c
+	gui_ogl.h
+	gui_ogl_sink.c
+	gui_scene.cpp
+	gui_scene_debug.c
+	gui_stb.c
+	gui_widget_native_images.c
+	gui_widget_native_images.h
+	gui_window_record.c
+	gui_window_record.h
+	)
+target_link_libraries(
+	st_gui_base
+	PRIVATE
+		xrt-external-stb
+		aux_util
+		aux_util_sink
+		aux_os
+		aux_ogl
+		xrt-external-imgui
+	)
+target_include_directories(st_gui_base INTERFACE ${CMAKE_CURRENT_SOURCE_DIR}/..)
+
+###
+# Main GUI
+add_library(
+	st_gui STATIC
+	gui_prober.c
+	gui_scene_calibrate.c
+	gui_scene_constellation_tracker_test.cpp
+	gui_scene_hand_tracking_demo.c
+	gui_scene_main_menu.c
+	gui_scene_record.c
+	gui_scene_record_euroc.c
+	gui_scene_remote.c
+	gui_scene_resampler_test.c
+	gui_scene_tracking_overrides.c
+	gui_scene_video.c
+	)
+target_link_libraries(
+	st_gui
+	PRIVATE
+		xrt-external-imgui
+		xrt-external-stb
+		tracking-includes
+		drv_includes
+		aux_util
+		aux_util_sink
+		aux_os
+		aux_ogl
+		base
+		st_gui_base
+	)
+target_include_directories(st_gui INTERFACE ${CMAKE_CURRENT_SOURCE_DIR}/..)
+
+if(XRT_MODULE_CONSTELLATION_TRACKING)
+	target_link_libraries(st_gui PRIVATE constellation xrt-external-bigceres)
+endif()
+
+if(XRT_HAVE_GST)
+	target_link_libraries(st_gui_base PRIVATE aux_gstreamer)
+	target_link_libraries(st_gui PRIVATE aux_gstreamer)
+endif()
+
+if(XRT_BUILD_DRIVER_DEPTHAI)
+	target_link_libraries(st_gui PRIVATE drv_depthai)
+endif()
+
+if(XRT_BUILD_DRIVER_HANDTRACKING)
+	target_link_libraries(st_gui PRIVATE drv_ht)
+endif()
+
+if(XRT_BUILD_DRIVER_REMOTE)
+	target_link_libraries(st_gui PRIVATE drv_remote)
+endif()
+
+if(XRT_HAVE_SDL2)
+	target_link_libraries(st_gui PUBLIC xrt-external-imgui-sdl2)
+endif()

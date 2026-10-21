@@ -1,0 +1,341 @@
+// Copyright 2020-2024, Collabora, Ltd.
+// Copyright 2025-2026, NVIDIA CORPORATION.
+// SPDX-License-Identifier: BSL-1.0
+/*!
+ * @file
+ * @brief  Header for @ref xrt_instance object.
+ * @author Jakob Bornecrantz <jakob@collabora.com>
+ * @author Korcan Hussein <korcan.hussein@collabora.com>
+ * @ingroup xrt_iface
+ */
+
+#pragma once
+
+#include "xrt/xrt_compiler.h"
+#include "xrt/xrt_defines.h"
+#include "xrt/xrt_config_os.h"
+#include "xrt/xrt_app_policy.h"
+
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+
+struct xrt_prober;
+struct xrt_device;
+struct xrt_instance_android;
+struct xrt_space_overseer;
+struct xrt_system;
+struct xrt_system_devices;
+struct xrt_system_compositor;
+
+struct _JavaVM;
+
+/*!
+ * Platform-specific information for an instance.
+ *
+ * Does not get transported between processes.
+ *
+ * @addtogroup xrt_iface
+ */
+struct xrt_platform_info
+{
+#if defined(XRT_OS_ANDROID) || defined(XRT_DOXYGEN)
+	/*!
+	 * @name Android members
+	 * @{
+	 */
+	struct _JavaVM *vm;
+	void *context;
+	/*! @} */
+#else
+	//! To avoid empty structs.
+	uint32_t _padding;
+#endif
+};
+
+
+/*!
+ * @addtogroup xrt_iface
+ * @{
+ */
+
+#define XRT_MAX_APPLICATION_NAME_SIZE 128
+
+/*!
+ * Non-process-specific information provided by the application at instance create time.
+ *
+ * This is transported between client and server over IPC.
+ *
+ * @see xrt_instance_info
+ */
+struct xrt_application_info
+{
+	char application_name[XRT_MAX_APPLICATION_NAME_SIZE];
+	bool immediate_disconnect;
+	bool ext_hand_tracking_enabled;
+	bool ext_hand_tracking_data_source_enabled;
+	bool ext_eye_gaze_interaction_enabled;
+	bool ext_future_enabled;
+	bool ext_hand_interaction_enabled;
+	bool htc_facial_tracking_enabled;
+	bool fb_body_tracking_enabled;
+	bool fb_face_tracking2_enabled;
+	bool meta_body_tracking_full_body_enabled;
+	bool meta_body_tracking_calibration_enabled;
+	bool meta_body_tracking_fidelity_enabled;
+	bool android_face_tracking_enabled;
+	bool view_configuration_views_change_supported;
+};
+
+/*!
+ * Information provided by the application at instance create time.
+ *
+ * Some information may be process-specific.
+ */
+struct xrt_instance_info
+{
+	//! Generic data from application.
+	struct xrt_application_info app_info;
+
+	//! Process-specific, platform-specific data.
+	struct xrt_platform_info platform_info;
+};
+
+/*!
+ * @interface xrt_instance
+ *
+ * This interface acts as a root object for Monado.
+ * It typically either wraps an @ref xrt_prober or forms a connection to an
+ * out-of-process XR service.
+ *
+ * This is as close to a singleton object as there is in Monado: you should not
+ * create more than one xrt_instance implementation per process.
+ *
+ * Each "target" will provide its own (private) implementation of this
+ * interface, which is exposed by implementing xrt_instance_create().
+ *
+ * Additional information can be found in @ref understanding-targets.
+ *
+ * @sa ipc_instance_create
+ */
+struct xrt_instance
+{
+	/*!
+	 * @name Interface Methods
+	 *
+	 * All implementations of the xrt_instance interface must
+	 * populate all these function pointers with their implementation
+	 * methods. To use this interface, see the helper functions.
+	 * @{
+	 */
+
+	/*!
+	 * Checks if the system can be created with create_system().
+	 */
+	xrt_result_t (*is_system_available)(struct xrt_instance *xinst, bool *out_available);
+
+	/*!
+	 * Creates all of the system resources like the devices and system
+	 * compositor. The system compositor is optional.
+	 *
+	 * Should only be called once.
+	 *
+	 * @note Code consuming this interface should use xrt_instance_create_system()
+	 *
+	 * @param      xinst     Pointer to self
+	 * @param[out] out_xsys  Return of system, required.
+	 * @param[out] out_xsysd Return of devices, required.
+	 * @param[out] out_xsysc Return of system compositor, optional.
+	 *
+	 * @see xrt_prober::probe, xrt_prober::select, xrt_gfx_provider_create_native
+	 */
+	xrt_result_t (*create_system)(struct xrt_instance *xinst,
+	                              struct xrt_system **out_xsys,
+	                              struct xrt_system_devices **out_xsysd,
+	                              struct xrt_space_overseer **out_xso,
+	                              struct xrt_system_compositor **out_xsysc);
+
+	/*!
+	 * Get the instance @ref xrt_prober, if any.
+	 *
+	 * If the instance is not using an @ref xrt_prober, it may return null.
+	 *
+	 * The instance retains ownership of the prober and is responsible for
+	 * destroying it.
+	 *
+	 * Can be called multiple times. (The prober is usually created at
+	 * instance construction time.)
+	 *
+	 * @note Code consuming this interface should use
+	 * xrt_instance_get_prober().
+	 *
+	 * @param xinst Pointer to self
+	 * @param[out] out_xp Pointer to xrt_prober pointer, will be populated
+	 * or set to NULL.
+	 *
+	 * @return XRT_SUCCESS on success, other error code on error.
+	 */
+	xrt_result_t (*get_prober)(struct xrt_instance *xinst, struct xrt_prober **out_xp);
+
+	/*!
+	 * Creates an application instance, should only be called once per application.
+	 *
+	 * All @ref xrt_app_instance instances created by this function are expected to be destroyed before the
+	 * xrt_instance is destroyed.
+	 *
+	 * @note Code consuming this interface should use xrt_instance_create_app_instance()
+	 *
+	 * @param      xinst      Pointer to self
+	 * @param[out] out_xainst Return of application instance, required.
+	 */
+	xrt_result_t (*create_app_instance)(struct xrt_instance *xinst, struct xrt_app_instance **out_xainst);
+
+	/*!
+	 * Destroy the instance and its owned objects, including the prober (if
+	 * any).
+	 *
+	 * Code consuming this interface should use xrt_instance_destroy().
+	 *
+	 * @param xinst Pointer to self
+	 */
+	void (*destroy)(struct xrt_instance *xinst);
+	/*!
+	 * @}
+	 */
+
+	/*!
+	 * Instance information structure, including both platform and application info.
+	 */
+	struct xrt_instance_info instance_info;
+
+	/*!
+	 * CLOCK_MONOTONIC timestamp of the instance startup.
+	 */
+	int64_t startup_timestamp;
+
+	/*!
+	 * An "aspect" of the xrt_instance interface, used only on Android.
+	 *
+	 * @see xrt_instance_android
+	 */
+	struct xrt_instance_android *android_instance;
+};
+
+
+/*!
+ * @copydoc xrt_instance::create_system
+ *
+ * Helper for calling through the function pointer.
+ *
+ * @public @memberof xrt_instance
+ */
+XRT_NONNULL_ALL static inline xrt_result_t
+xrt_instance_is_system_available(struct xrt_instance *xinst, bool *out_available)
+{
+	return xinst->is_system_available(xinst, out_available);
+}
+
+/*!
+ * @copydoc xrt_instance::create_system
+ *
+ * Helper for calling through the function pointer.
+ *
+ * @public @memberof xrt_instance
+ */
+static inline xrt_result_t
+xrt_instance_create_system(struct xrt_instance *xinst,
+                           struct xrt_system **out_xsys,
+                           struct xrt_system_devices **out_xsysd,
+                           struct xrt_space_overseer **out_xso,
+                           struct xrt_system_compositor **out_xsysc)
+{
+	return xinst->create_system(xinst, out_xsys, out_xsysd, out_xso, out_xsysc);
+}
+
+/*!
+ * @copydoc xrt_instance::get_prober
+ *
+ * Helper for calling through the function pointer.
+ *
+ * @public @memberof xrt_instance
+ */
+XRT_NONNULL_ALL static inline xrt_result_t
+xrt_instance_get_prober(struct xrt_instance *xinst, struct xrt_prober **out_xp)
+{
+	return xinst->get_prober(xinst, out_xp);
+}
+
+/*!
+ * @copydoc xrt_instance::create_app_instance
+ *
+ * Helper for calling through the function pointer.
+ *
+ * @public @memberof xrt_instance
+ */
+XRT_NONNULL_ALL static inline xrt_result_t
+xrt_instance_create_app_instance(struct xrt_instance *xinst, struct xrt_app_instance **out_xainst)
+{
+	return xinst->create_app_instance(xinst, out_xainst);
+}
+
+/*!
+ * Destroy an xrt_instance - helper function.
+ *
+ * @param[in,out] xinst_ptr A pointer to your instance implementation pointer.
+ *
+ * Will destroy the instance if *xinst_ptr is not NULL. Will then set *xinst_ptr
+ * to NULL.
+ *
+ * @public @memberof xrt_instance
+ */
+XRT_NONNULL_ALL static inline void
+xrt_instance_destroy(struct xrt_instance **xinst_ptr)
+{
+	struct xrt_instance *xinst = *xinst_ptr;
+	if (xinst == NULL) {
+		return;
+	}
+
+	xinst->destroy(xinst);
+	*xinst_ptr = NULL;
+}
+
+/*!
+ * @name Factory
+ * Implemented in each target.
+ * @{
+ */
+/*!
+ * Create an implementation of the xrt_instance interface.
+ *
+ * Creating more then one @ref xrt_instance is probably never the right thing
+ * to do, so avoid it.
+ *
+ * Each target must implement this function.
+ *
+ * @param[in] ii A pointer to a info struct containing information about the
+ *               application, optional can be null.
+ * @param[out] out_xinst A pointer to an xrt_instance pointer. Will be
+ * populated.
+ *
+ * @return 0 on success
+ *
+ * @relates xrt_instance
+ */
+xrt_result_t
+xrt_instance_create(struct xrt_instance_info *ii, struct xrt_instance **out_xinst);
+
+/*!
+ * @}
+ */
+
+/*!
+ * @}
+ */
+
+
+#ifdef __cplusplus
+}
+#endif

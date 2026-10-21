@@ -1,0 +1,169 @@
+{
+ "default_bindings": [
+  {
+   "controller_type": "oculus_touch",
+   "binding_url": "bindings_oculus_touch.json"
+  }
+ ],
+ "actions": [
+  {
+   "name": "/actions/check/in/left_x_click",
+   "type": "boolean"
+  },
+  {
+   "name": "/actions/check/in/left_x_touch",
+   "type": "boolean"
+  },
+  {
+   "name": "/actions/check/in/left_y_click",
+   "type": "boolean"
+  },
+  {
+   "name": "/actions/check/in/left_y_touch",
+   "type": "boolean"
+  },
+  {
+   "name": "/actions/check/in/left_menu_click",
+   "type": "boolean"
+  },
+  {
+   "name": "/actions/check/in/left_trigger_value",
+   "type": "vector1"
+  },
+  {
+   "name": "/actions/check/in/left_trigger_click",
+   "type": "boolean"
+  },
+  {
+   "name": "/actions/check/in/left_trigger_touch",
+   "type": "boolean"
+  },
+  {
+   "name": "/actions/check/in/left_grip_value",
+   "type": "vector1"
+  },
+  {
+   "name": "/actions/check/in/left_grip_click",
+   "type": "boolean"
+  },
+  {
+   "name": "/actions/check/in/left_stick",
+   "type": "vector2"
+  },
+  {
+   "name": "/actions/check/in/left_stick_click",
+   "type": "boolean"
+  },
+  {
+   "name": "/actions/check/in/left_stick_touch",
+   "type": "boolean"
+  },
+  {
+   "name": "/actions/check/in/left_thumbrest_touch",
+   "type": "boolean"
+  },
+  {
+   "name": "/actions/check/in/left_skeleton",
+   "type": "skeleton",
+   "skeleton": "/skeleton/hand/left"
+  },
+  {
+   "name": "/actions/check/in/right_a_click",
+   "type": "boolean"
+  },
+  {
+   "name": "/actions/check/in/right_a_touch",
+   "type": "boolean"
+  },
+  {
+   "name": "/actions/check/in/right_b_click",
+   "type": "boolean"
+  },
+  {
+   "name": "/actions/check/in/right_b_touch",
+   "type": "boolean"
+  },
+  {
+   "name": "/actions/check/in/right_trigger_value",
+   "type": "vector1"
+  },
+  {
+   "name": "/actions/check/in/right_trigger_click",
+   "type": "boolean"
+  },
+  {
+   "name": "/actions/check/in/right_trigger_touch",
+   "type": "boolean"
+  },
+  {
+   "name": "/actions/check/in/right_grip_value",
+   "type": "vector1"
+  },
+  {
+   "name": "/actions/check/in/right_grip_click",
+   "type": "boolean"
+  },
+  {
+   "name": "/actions/check/in/right_stick",
+   "type": "vector2"
+  },
+  {
+   "name": "/actions/check/in/right_stick_click",
+   "type": "boolean"
+  },
+  {
+   "name": "/actions/check/in/right_stick_touch",
+   "type": "boolean"
+  },
+  {
+   "name": "/actions/check/in/right_thumbrest_touch",
+   "type": "boolean"
+  },
+  {
+   "name": "/actions/check/in/right_skeleton",
+   "type": "skeleton",
+   "skeleton": "/skeleton/hand/right"
+  }
+ ],
+ "action_sets": [
+  {
+   "name": "/actions/check",
+   "usage": "single"
+  }
+ ],
+ "localization": [
+  {
+   "language_tag": "en_US",
+   "/actions/check": "Controller check",
+   "/actions/check/in/left_x_click": "left x click",
+   "/actions/check/in/left_x_touch": "left x touch",
+   "/actions/check/in/left_y_click": "left y click",
+   "/actions/check/in/left_y_touch": "left y touch",
+   "/actions/check/in/left_menu_click": "left menu click",
+   "/actions/check/in/left_trigger_value": "left trigger value",
+   "/actions/check/in/left_trigger_click": "left trigger click",
+   "/actions/check/in/left_trigger_touch": "left trigger touch",
+   "/actions/check/in/left_grip_value": "left grip value",
+   "/actions/check/in/left_grip_click": "left grip click",
+   "/actions/check/in/left_stick": "left stick",
+   "/actions/check/in/left_stick_click": "left stick click",
+   "/actions/check/in/left_stick_touch": "left stick touch",
+   "/actions/check/in/left_thumbrest_touch": "left thumbrest touch",
+   "/actions/check/in/left_skeleton": "left skeleton",
+   "/actions/check/in/right_a_click": "right a click",
+   "/actions/check/in/right_a_touch": "right a touch",
+   "/actions/check/in/right_b_click": "right b click",
+   "/actions/check/in/right_b_touch": "right b touch",
+   "/actions/check/in/right_trigger_value": "right trigger value",
+   "/actions/check/in/right_trigger_click": "right trigger click",
+   "/actions/check/in/right_trigger_touch": "right trigger touch",
+   "/actions/check/in/right_grip_value": "right grip value",
+   "/actions/check/in/right_grip_click": "right grip click",
+   "/actions/check/in/right_stick": "right stick",
+   "/actions/check/in/right_stick_click": "right stick click",
+   "/actions/check/in/right_stick_touch": "right stick touch",
+   "/actions/check/in/right_thumbrest_touch": "right thumbrest touch",
+   "/actions/check/in/right_skeleton": "right skeleton"
+  }
+ ]
+}

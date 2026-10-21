@@ -1,0 +1,1594 @@
+#!/usr/bin/env python3
+# SPDX-FileCopyrightText: 2026 Aditya Mehra <aix.m@outlook.com>
+# SPDX-FileCopyrightText: 2016 Philipp Zabel (the pairing protocol, ported from ouvrt's rift-radio.c and rift.c)
+# SPDX-License-Identifier: BSL-1.0
+"""riftlinux-setup: gets the Oculus Rift CV1 working with SteamVR on Linux, on any desktop.
+
+  riftlinux-setup check [--json]          what is set up and what is missing; changes nothing
+  riftlinux-setup install [--yes] [--openxr steamvr|keep] [--direct-mode on|off]
+                                          set up everything that is missing, asking before each change
+  riftlinux-setup repair [--yes]          what SteamVR updates or crashes undo: driver blocked by safe mode,
+                                          compositor priority, room setup, direct mode switch out of step
+  riftlinux-setup direct-mode on|off|status
+                                          SteamVR's frames through our compositor (Auto-HDR, motion smoothing) or not
+  riftlinux-setup nvidia-vrr status|conceal|restore
+                                          NVIDIA on Wayland: a monitor offering adaptive sync (VRR) makes NVIDIA show
+                                          the headset's frames without vsync (the lower part tears and lags); conceal
+                                          hides VRR from NVIDIA (your monitors lose VRR), restore gives it back; both
+                                          need a reboot
+  riftlinux-setup uninstall [--yes]       unregister the driver (settings and calibration stay)
+  riftlinux-setup register [--quiet]      what an installed package runs by itself for each user (udev, login):
+                                          keeps the user's copy of the installed driver current and registered
+                                          with SteamVR, and lifts SteamVR's safe-mode block; never asks anything
+  riftlinux-setup pair [--timeout S]      pair Touch controllers (or the Remote) with this headset, no Windows needed
+                                          (SteamVR closed; the headset restarts into pairing mode and back)
+  riftlinux-setup recalibrate             measure every sensor again, as on a first start (after moving sensors):
+                                          at once while SteamVR runs, else at the next start; the floor is kept
+  riftlinux-setup record on|off|status    record SteamVR's sessions for a bug report (from its next start): the
+                                          sensors' views, tracking and output, into ~/.cache/riftlinux, and the
+                                          tracker's details in SteamVR's log; large files, turn it off after
+
+Options: --package DIR (the driver package; default: the directory this tool is in), --json (machine-readable
+output for front ends), --yes (no questions), --print-root (only print the commands that need root).
+
+Every file is copied to <file>.bak-riftlinux-<time> before it is changed; nothing is deleted. Steps that need root
+(udev rules, the compositor's priority) go through pkexec (the desktop's password prompt), else sudo in a terminal,
+else they are printed for you to run.
+"""
+
+import argparse
+import datetime
+import glob
+import json
+import os
+import shutil
+import struct
+import subprocess
+import sys
+
+VENDOR = "2833"
+PRODUCTS = {"0031": "Rift CV1 headset", "0211": "Rift CV1 sensor", "0021": "Rift DK2 (not supported)"}
+DRIVER_NAME = "monado"
+UNIVERSE = "2"
+UDEV_NAME = "70-rift-cv1.rules"
+CAP_SYS_NICE = 23
+
+HOME = os.path.expanduser("~")
+XDG_CONFIG = os.environ.get("XDG_CONFIG_HOME") or os.path.join(HOME, ".config")
+XDG_CACHE = os.environ.get("XDG_CACHE_HOME") or os.path.join(HOME, ".cache")
+STAMP = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
+_backed_up = set()
+
+
+# --------------------------------------------------------------------------------------------------------------------
+# Small helpers
+
+
+def read_json(path):
+    try:
+        with open(path) as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return None
+
+
+def backup(path):
+    if path in _backed_up or not os.path.exists(path):
+        return
+    real = os.path.realpath(path)
+    shutil.copy2(real, f"{real}.bak-riftlinux-{STAMP}")
+    _backed_up.add(path)
+
+
+def write_json(path, data, indent="\t"):
+    backup(path)
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    tmp = f"{path}.tmp-riftlinux"
+    with open(tmp, "w") as f:
+        json.dump(data, f, indent=indent)
+        f.write("\n")
+    os.replace(tmp, os.path.realpath(path) if os.path.islink(path) else path)
+
+
+def run(cmd):
+    try:
+        return subprocess.run(cmd, capture_output=True, text=True, timeout=10)
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+
+
+def sysfs(path, name):
+    try:
+        with open(os.path.join(path, name)) as f:
+            return f.read().strip()
+    except OSError:
+        return None
+
+
+# --------------------------------------------------------------------------------------------------------------------
+# Where things are
+
+
+class Paths:
+    def __init__(self, package):
+        self.package = os.path.abspath(package)
+        self.manifest = os.path.join(self.package, "driver.vrdrivermanifest")
+        self.driver_so = os.path.join(self.package, "bin", "linux64", "driver_monado.so")
+        self.openvrpaths = os.path.join(XDG_CONFIG, "openvr", "openvrpaths.vrpath")
+        self.openxr_active = os.path.join(XDG_CONFIG, "openxr", "1", "active_runtime.json")
+        self.settings = os.path.join(XDG_CONFIG, "riftlinux", "settings.json")
+        self.rig = os.path.join(XDG_CONFIG, "monado", "constellation", "rig.json")
+        self.udev_src = os.path.join(self.package, "udev", UDEV_NAME)
+        vp = read_json(self.openvrpaths) or {}
+        self.steamvr = None
+        for r in vp.get("runtime", []) + self.steam_library_steamvr():
+            if os.path.exists(os.path.join(r, "bin", "linux64", "vrserver")):
+                self.steamvr = os.path.realpath(r)
+                break
+        self.steam_config = None
+        for c in vp.get("config", []) + [os.path.join(s, "config") for s in self.steam_roots()]:
+            if os.path.isdir(c):
+                self.steam_config = c
+                break
+        self.vrsettings = os.path.join(self.steam_config, "steamvr.vrsettings") if self.steam_config else None
+        self.chaperone = os.path.join(self.steam_config, "chaperone_info.vrchap") if self.steam_config else None
+
+    @staticmethod
+    def steam_roots():
+        roots = []
+        for c in ("~/.steam/steam", "~/.local/share/Steam", "~/.steam/debian-installation",
+                  "~/.var/app/com.valvesoftware.Steam/.local/share/Steam", "~/snap/steam/common/.local/share/Steam"):
+            p = os.path.expanduser(c)
+            if os.path.isdir(p) and os.path.realpath(p) not in [os.path.realpath(r) for r in roots]:
+                roots.append(p)
+        return roots
+
+    def steam_library_steamvr(self):
+        found = []
+        for root in self.steam_roots():
+            libs = [root]
+            try:
+                with open(os.path.join(root, "steamapps", "libraryfolders.vdf")) as f:
+                    for line in f:
+                        parts = line.strip().split('"')
+                        if len(parts) >= 4 and parts[1] == "path":
+                            libs.append(parts[3])
+            except OSError:
+                pass
+            found += [os.path.join(lib, "steamapps", "common", "SteamVR") for lib in libs]
+        return found
+
+
+# --------------------------------------------------------------------------------------------------------------------
+# Checks. Each returns a dict: id, title, state (ok, info, warn, fix, error), detail, and optionally fix (a callable
+# applying it, with kind "user" or "root") and root_cmds.
+
+
+def result(cid, title, state, detail, fix=None, kind=None, root_cmds=None):
+    return {"id": cid, "title": title, "state": state, "detail": detail, "fix": fix, "kind": kind,
+            "root_cmds": root_cmds or []}
+
+
+def check_steam(p, opts):
+    roots = p.steam_roots()
+    if not roots:
+        return result("steam", "Steam", "error", "No Steam installation found (~/.steam, ~/.local/share/Steam, Flatpak).")
+    if p.steamvr is None:
+        return result("steam", "Steam and SteamVR", "error",
+                      f"Steam at {roots[0]}, but SteamVR is not installed: install it from Steam's library (Tools).")
+    ver = None
+    vfile = os.path.join(p.steamvr, "bin", "version.txt")
+    try:
+        ver = open(vfile).read().strip().splitlines()[0]
+    except (OSError, IndexError):
+        pass
+    if not os.path.exists(p.openvrpaths):
+        return result("steam", "Steam and SteamVR", "error",
+                      f"SteamVR at {p.steamvr} has never been started: start it once from Steam, then run this again.")
+    return result("steam", "Steam and SteamVR", "ok", f"SteamVR (build {ver}) at {p.steamvr}" if ver else f"SteamVR at {p.steamvr}")
+
+
+def check_package(p, opts):
+    if not os.path.exists(p.manifest) or not os.path.exists(p.driver_so):
+        return result("package", "Driver package", "error",
+                      f"{p.package} has no driver.vrdrivermanifest and bin/linux64/driver_monado.so: "
+                      "run this tool from the unpacked package or pass --package.")
+    return result("package", "Driver package", "ok", p.package)
+
+
+def check_registered(p, opts):
+    vp = read_json(p.openvrpaths)
+    if vp is None:
+        return result("registered", "Driver registered with SteamVR", "error", "No openvrpaths.vrpath (start SteamVR once).")
+    drivers = vp.get("external_drivers", []) or []
+    mine = [d for d in drivers if os.path.realpath(d) == os.path.realpath(p.package)]
+    others = []
+    for d in drivers:
+        if os.path.realpath(d) == os.path.realpath(p.package):
+            continue
+        m = read_json(os.path.join(d, "driver.vrdrivermanifest")) or {}
+        if m.get("name") == DRIVER_NAME:
+            others.append(d)
+
+    def fix():
+        vp2 = read_json(p.openvrpaths)
+        ext = [d for d in vp2.get("external_drivers", []) or [] if d not in others]
+        if not any(os.path.realpath(d) == os.path.realpath(p.package) for d in ext):
+            ext.append(p.package)
+        vp2["external_drivers"] = ext
+        write_json(p.openvrpaths, vp2)
+
+    if mine and not others:
+        return result("registered", "Driver registered with SteamVR", "ok", p.package)
+    detail = []
+    if not mine:
+        detail.append(f"{p.package} is not registered")
+    if others:
+        detail.append("another driver named \"monado\" is registered too (only one can load): " + ", ".join(others) +
+                      "; it will be unregistered (its files stay)")
+    return result("registered", "Driver registered with SteamVR", "fix", "; ".join(detail) + ".", fix, "user")
+
+
+def check_sandboxed(p, opts):
+    """Flatpak or Snap Steam: its SteamVR reads only its own directories, so it needs its own copy, in its own list."""
+    missing = []
+    present = []
+    for name, config_dir, data_dir, _ in steam_installs()[1:]:
+        present.append(name)
+        dst = user_copy_dir(data_dir)
+        vp = read_json(os.path.join(config_dir, "openvr", "openvrpaths.vrpath")) or {}
+        listed = any(os.path.realpath(d) == os.path.realpath(dst) for d in vp.get("external_drivers", []) or [])
+        if not listed or not os.path.exists(os.path.join(dst, "driver.vrdrivermanifest")):
+            missing.append((name, config_dir, dst))
+    title = "Driver registered with Flatpak or Snap Steam"
+    if not present:
+        return result("sandboxed", title, "ok", "no Flatpak or Snap Steam")
+    if not missing:
+        return result("sandboxed", title, "ok", ", ".join(present))
+
+    def fix():
+        src = system_package_dir() or p.package
+        for name, config_dir, dst in missing:
+            sync_user_copy(src, print, dst)
+            openvrpaths_register(dst, print, config_dir)
+
+    return result("sandboxed", title, "fix",
+                  ", ".join(n for n, _, _ in missing) + " Steam: the driver is copied where it can read it and registered.",
+                  fix, "user")
+
+
+# --------------------------------------------------------------------------------------------------------------------
+# NVIDIA and adaptive sync on Wayland: with any connected monitor offering VRR, NVIDIA flips a leased
+# display (the headset on Wayland) without vsync, so the lower part of the picture tears and lags when the head turns
+# (NVIDIA open-gpu-kernel-modules #992). The fix hides VRR from NVIDIA, which takes it away from the monitors too: the
+# user's choice, never done by the package or by install/repair.
+
+NVIDIA_VRR_CONF = "/etc/modprobe.d/riftlinux-nvidia-vrr.conf"
+NVIDIA_VRR_OPTION = "options nvidia-modeset conceal_vrr_caps=1"
+
+
+def nvidia_loaded():
+    return os.path.exists("/proc/driver/nvidia/version")
+
+
+def vrr_concealed_in_config():
+    """A modprobe.d file setting conceal_vrr_caps=1 (ours or the user's own)."""
+    for d in ("/etc/modprobe.d", "/usr/lib/modprobe.d", "/lib/modprobe.d", "/run/modprobe.d"):
+        try:
+            names = sorted(os.listdir(d))
+        except OSError:
+            continue
+        for n in names:
+            if not n.endswith(".conf"):
+                continue
+            try:
+                for line in open(os.path.join(d, n), errors="replace"):
+                    line = line.split("#", 1)[0]
+                    if "nvidia-modeset" in line.replace("_", "-") and "conceal_vrr_caps=1" in line:
+                        return os.path.join(d, n)
+            except OSError:
+                pass
+    return None
+
+
+def vrr_monitors():
+    """Connected connectors whose monitor offers adaptive sync (the kernel's vrr_capable), read without DRM master."""
+    import ctypes
+    import fcntl
+
+    def iowr(nr, size):
+        return (3 << 30) | (size << 16) | (ord("d") << 8) | nr
+
+    class Res(ctypes.Structure):
+        _fields_ = [(n, ctypes.c_uint64) for n in ("fbs", "crtcs", "conns", "encs")] + \
+                   [(n, ctypes.c_uint32) for n in ("n_fbs", "n_crtcs", "n_conns", "n_encs", "minw", "maxw", "minh",
+                                                    "maxh")]
+
+    class Props(ctypes.Structure):
+        _fields_ = [("ids", ctypes.c_uint64), ("vals", ctypes.c_uint64), ("count", ctypes.c_uint32),
+                    ("obj", ctypes.c_uint32), ("type", ctypes.c_uint32)]
+
+    class Prop(ctypes.Structure):
+        _fields_ = [("values", ctypes.c_uint64), ("blobs", ctypes.c_uint64), ("id", ctypes.c_uint32),
+                    ("flags", ctypes.c_uint32), ("name", ctypes.c_char * 32), ("n_values", ctypes.c_uint32),
+                    ("n_blobs", ctypes.c_uint32)]
+
+    class Conn(ctypes.Structure):
+        _fields_ = [(n, ctypes.c_uint64) for n in ("encs", "modes", "props", "vals")] + \
+                   [(n, ctypes.c_uint32) for n in ("n_modes", "n_props", "n_encs", "enc", "id", "type", "type_id",
+                                                    "connection", "mmw", "mmh", "subpixel", "pad")]
+
+    types = {10: "DP", 11: "HDMI-A", 14: "eDP", 3: "DVI-D"}
+    found = []
+    for card in sorted(glob.glob("/dev/dri/card*")):
+        try:
+            fd = os.open(card, os.O_RDWR)
+        except OSError:
+            continue
+        try:
+            res = Res()
+            fcntl.ioctl(fd, iowr(0xA0, ctypes.sizeof(Res)), res)
+            ids = (ctypes.c_uint32 * res.n_conns)()
+            res2 = Res(conns=ctypes.addressof(ids), n_conns=res.n_conns)
+            fcntl.ioctl(fd, iowr(0xA0, ctypes.sizeof(Res)), res2)
+            for cid in ids:
+                c = Conn(id=cid)
+                fcntl.ioctl(fd, iowr(0xA7, ctypes.sizeof(Conn)), c)
+                if c.connection != 1:
+                    continue
+                pr = Props(obj=cid, type=0xC0C0C0C0)
+                fcntl.ioctl(fd, iowr(0xB9, ctypes.sizeof(Props)), pr)
+                pids = (ctypes.c_uint32 * pr.count)()
+                pvals = (ctypes.c_uint64 * pr.count)()
+                pr2 = Props(ids=ctypes.addressof(pids), vals=ctypes.addressof(pvals), count=pr.count, obj=cid,
+                            type=0xC0C0C0C0)
+                fcntl.ioctl(fd, iowr(0xB9, ctypes.sizeof(Props)), pr2)
+                for pid, val in zip(pids, pvals):
+                    gp = Prop(id=pid)
+                    fcntl.ioctl(fd, iowr(0xAA, ctypes.sizeof(Prop)), gp)
+                    if gp.name == b"vrr_capable" and val == 1:
+                        found.append(f"{types.get(c.type, 'connector')}-{c.type_id}")
+        except OSError:
+            pass
+        finally:
+            os.close(fd)
+    return found
+
+
+def initramfs_cmd():
+    for tool, cmd in (("update-initramfs", "update-initramfs -u"), ("dracut", "dracut -f"),
+                      ("mkinitcpio", "mkinitcpio -P")):
+        if shutil.which(tool):
+            return cmd
+    return None
+
+
+def desktop_session_type():
+    """The desktop session's type (wayland, x11), also when run from an SSH login or a service, where the shell's own
+    variables say nothing: the user's session on a seat, from logind."""
+    t = os.environ.get("XDG_SESSION_TYPE")
+    if t in ("wayland", "x11"):
+        return t
+    if os.environ.get("WAYLAND_DISPLAY"):
+        return "wayland"
+    if shutil.which("loginctl"):
+        r = run(["loginctl", "list-sessions", "--no-legend"])
+        for line in (r.stdout.splitlines() if r is not None and r.returncode == 0 else []):
+            f = line.split()
+            # SESSION UID USER SEAT ...: this user's session on a seat.
+            if len(f) >= 4 and f[1] == str(os.getuid()) and f[3].startswith("seat"):
+                q = run(["loginctl", "show-session", f[0], "-p", "Type", "--value"])
+                if q is not None and q.returncode == 0 and q.stdout.strip() in ("wayland", "x11"):
+                    return q.stdout.strip()
+    return "x11" if os.environ.get("DISPLAY") else None
+
+
+def nvidia_major():
+    """The NVIDIA kernel module's major version (615 for 615.78.08), 0 if unknown."""
+    try:
+        return int(open("/sys/module/nvidia/version").read().split(".")[0])
+    except (OSError, ValueError):
+        return 0
+
+
+# The headset's picture tore on Wayland with drivers 570-580 and a VRR monitor; not with 615 here (KDE Plasma 6.8), but
+# others report it with 615 too. NVIDIA names no fixed version: from 615 on the check only informs.
+NVIDIA_VRR_TEAR_FIXED_MAJOR = 615
+
+
+def check_nvidia_vrr(p, opts):
+    title = "NVIDIA and adaptive sync (Wayland)"
+    if not nvidia_loaded():
+        return result("nvidia-vrr", title, "ok", "not an NVIDIA GPU")
+    conf = vrr_concealed_in_config()
+    monitors = vrr_monitors()
+    wayland = desktop_session_type() == "wayland"
+    if conf and monitors:
+        return result("nvidia-vrr", title, "warn",
+                      f"VRR is hidden from NVIDIA by {conf}, but not yet in effect ({', '.join(monitors)} still offer "
+                      "it): reboot.")
+    if conf:
+        return result("nvidia-vrr", title, "ok", f"VRR hidden from NVIDIA ({conf}): the headset is in sync on Wayland.")
+    if not monitors:
+        return result("nvidia-vrr", title, "ok", "no monitor offers adaptive sync")
+    major = nvidia_major()
+    if major >= NVIDIA_VRR_TEAR_FIXED_MAJOR:
+        return result("nvidia-vrr", title, "info",
+                      f"{', '.join(monitors)} with VRR and NVIDIA {major}: the headset tore with drivers 570-580 on "
+                      "Wayland; it did not here with 615 on KDE Plasma, but others report it with 615 too (NVIDIA's "
+                      "bug, https://github.com/NVIDIA/open-gpu-kernel-modules/issues/992). If the lower part of the "
+                      "picture tears: `riftlinux-setup nvidia-vrr conceal`.")
+    detail = (f"{', '.join(monitors)} offer(s) adaptive sync (VRR); with NVIDIA, on Wayland the headset's frames are "
+              "shown without vsync and the lower part of the picture tears and lags when you turn your head. Fix "
+              "(your monitors lose VRR): `riftlinux-setup nvidia-vrr conceal`, then reboot.")
+    if not wayland:
+        return result("nvidia-vrr", title, "info", "only on Wayland, not in an X11 session: " + detail)
+    return result("nvidia-vrr", title, "warn", detail)
+
+
+def cmd_nvidia_vrr(p, opts):
+    if opts.action == "status":
+        report([check_nvidia_vrr(p, opts)], opts.json)
+        return 0
+    if not nvidia_loaded():
+        print("Not an NVIDIA GPU: nothing to do.")
+        return 0
+    rebuild = initramfs_cmd()
+    if opts.action == "conceal":
+        if vrr_concealed_in_config():
+            print(f"Already set ({vrr_concealed_in_config()}); reboot if the check still shows VRR.")
+            return 0
+        print("This hides adaptive sync (VRR) from the NVIDIA driver: the headset's picture is then in sync on "
+              "Wayland, and your monitors no longer offer VRR (on X11 too) until `riftlinux-setup nvidia-vrr "
+              "restore`.")
+        if not ask(opts, "Hide VRR from NVIDIA?"):
+            return 1
+        cmds = [f"printf '%s\\n' '# RiftLinux: the headset in sync on Wayland (riftlinux-setup nvidia-vrr)' "
+                f"'{NVIDIA_VRR_OPTION}' > {NVIDIA_VRR_CONF}"]
+    else:
+        if not os.path.exists(NVIDIA_VRR_CONF):
+            other = vrr_concealed_in_config()
+            print(f"Not set by RiftLinux{f' (set in {other}: remove that line yourself)' if other else ''}.")
+            return 0
+        if not ask(opts, "Give adaptive sync (VRR) back to NVIDIA? The headset may tear again on Wayland."):
+            return 1
+        cmds = [f"rm -f {NVIDIA_VRR_CONF}"]
+    if rebuild:
+        cmds.append(rebuild)
+    if not run_root(cmds, opts):
+        return 1
+    print("Done. Reboot for it to take effect.")
+    return 0
+
+
+def check_enabled(p, opts):
+    if not p.vrsettings:
+        return result("enabled", "Driver enabled in SteamVR", "info", "No SteamVR settings yet.")
+    vs = read_json(p.vrsettings) or {}
+    sect = vs.get("driver_" + DRIVER_NAME, {})
+    blocked = bool(sect.get("blocked_by_safe_mode"))
+    disabled = sect.get("enable") is False
+
+    def fix():
+        vs2 = read_json(p.vrsettings) or {}
+        s2 = vs2.setdefault("driver_" + DRIVER_NAME, {})
+        s2["blocked_by_safe_mode"] = False
+        s2["enable"] = True
+        write_json(p.vrsettings, vs2, indent=3)
+
+    if blocked or disabled:
+        why = []
+        if blocked:
+            why.append("SteamVR blocked it after a crash (safe mode)")
+        if disabled:
+            why.append("it is switched off in SteamVR's add-ons")
+        return result("enabled", "Driver enabled in SteamVR", "fix", " and ".join(why) + "; it will be enabled again.",
+                      fix, "user")
+    return result("enabled", "Driver enabled in SteamVR", "ok", "Enabled, not blocked.")
+
+
+def usb_devices():
+    devs = []
+    base = "/sys/bus/usb/devices"
+    try:
+        names = os.listdir(base)
+    except OSError:
+        return devs
+    for n in sorted(names):
+        d = os.path.join(base, n)
+        if sysfs(d, "idVendor") != VENDOR:
+            continue
+        prod = sysfs(d, "idProduct")
+        bus, dev = sysfs(d, "busnum"), sysfs(d, "devnum")
+        node = f"/dev/bus/usb/{int(bus):03d}/{int(dev):03d}" if bus and dev else None
+        devs.append({"sysfs": d, "product": prod, "name": PRODUCTS.get(prod, f"Oculus device {prod}"),
+                     "speed": sysfs(d, "speed"), "node": node,
+                     "access": bool(node and os.access(node, os.R_OK | os.W_OK))})
+    return devs
+
+
+def hidraw_nodes():
+    out = []
+    base = "/sys/class/hidraw"
+    try:
+        names = os.listdir(base)
+    except OSError:
+        return out
+    for n in sorted(names):
+        d = os.path.realpath(os.path.join(base, n, "device"))
+        while d and d != "/":
+            if sysfs(d, "idVendor") == VENDOR:
+                node = os.path.join("/dev", n)
+                out.append({"node": node, "access": os.access(node, os.R_OK | os.W_OK)})
+                break
+            d = os.path.dirname(d)
+    return out
+
+
+def check_devices(p, opts):
+    devs = usb_devices()
+    hmd = [d for d in devs if d["product"] == "0031"]
+    sensors = [d for d in devs if d["product"] == "0211"]
+    if not hmd:
+        return result("devices", "Rift connected", "warn",
+                      "No Rift CV1 headset on USB (plug in its USB and HDMI cables; the headset's box must be on).")
+    parts = ["headset"]
+    slow = [s for s in sensors if s["speed"] and float(s["speed"]) < 5000]
+    parts.append(f"{len(sensors)} sensor(s)" + (f", {len(slow)} on USB 2 (works, lower frame rate; USB 3 is best)" if slow else ""))
+    state = "ok" if sensors else "warn"
+    if not sensors:
+        parts.append("no sensor found: tracking needs at least one")
+    return result("devices", "Rift connected", state, ", ".join(parts) + ".")
+
+
+def udev_rules_text():
+    return ("# Oculus Rift CV1: headset, sensors and the Touch controllers' radio (USB vendor 2833), for the user at\n"
+            "# the machine (uaccess; no group needed). Installed by riftlinux-setup.\n"
+            f'SUBSYSTEM=="usb", ATTRS{{idVendor}}=="{VENDOR}", MODE="0660", TAG+="uaccess"\n'
+            f'SUBSYSTEM=="hidraw", ATTRS{{idVendor}}=="{VENDOR}", MODE="0660", TAG+="uaccess"\n')
+
+
+def check_access(p, opts):
+    devs = usb_devices()
+    hid = hidraw_nodes()
+    if not devs:
+        installed = any(os.path.exists(os.path.join(d, UDEV_NAME)) for d in ("/etc/udev/rules.d", "/usr/lib/udev/rules.d"))
+        return result("access", "Device access", "info" if installed else "fix",
+                      "Rules installed; plug in the Rift to check access." if installed else
+                      "No rules for the Rift's devices yet (needed to use them without root).",
+                      None, "root" if not installed else None, [] if installed else udev_root_cmds(p))
+    missing = [d["node"] for d in devs if not d["access"]] + [h["node"] for h in hid if not h["access"]]
+    if not missing:
+        return result("access", "Device access", "ok", f"{len(devs)} USB devices and {len(hid)} HID interfaces usable.")
+    return result("access", "Device access", "fix", "No access to " + ", ".join(missing) + ": udev rules needed.",
+                  None, "root", udev_root_cmds(p))
+
+
+def udev_root_cmds(p):
+    src = p.udev_src if os.path.exists(p.udev_src) else None
+    target = f"/etc/udev/rules.d/{UDEV_NAME}"
+    if src:
+        install = f"install -m 0644 '{src}' {target}"
+    else:
+        install = f"printf %s {json.dumps(udev_rules_text())} > {target}"
+    return [install, "udevadm control --reload-rules", f"udevadm trigger --attr-match=idVendor={VENDOR}"]
+
+
+def file_has_cap(path, cap):
+    try:
+        data = os.getxattr(path, "security.capability")
+    except OSError:
+        return False
+    if len(data) < 12:
+        return False
+    permitted = struct.unpack_from("<I", data, 4)[0]
+    return bool(permitted & (1 << cap))
+
+
+def check_priority(p, opts):
+    if not p.steamvr:
+        return result("priority", "SteamVR compositor priority", "info", "SteamVR not found.")
+    launcher = os.path.join(p.steamvr, "bin", "linux64", "vrcompositor-launcher")
+    if not os.path.exists(launcher):
+        return result("priority", "SteamVR compositor priority", "info", "No vrcompositor-launcher in this SteamVR.")
+    if file_has_cap(launcher, CAP_SYS_NICE):
+        return result("priority", "SteamVR compositor priority", "ok", "vrcompositor-launcher has CAP_SYS_NICE.")
+    return result("priority", "SteamVR compositor priority", "fix",
+                  "vrcompositor-launcher lacks CAP_SYS_NICE (SteamVR updates remove it): its compositor would run at "
+                  "normal priority.", None, "root", [f"setcap CAP_SYS_NICE=eip '{launcher}'"])
+
+
+def openxr_runtime(p):
+    if not os.path.exists(p.openxr_active):
+        return "none", None
+    target = os.path.realpath(p.openxr_active)
+    j = read_json(p.openxr_active) or {}
+    rt = j.get("runtime", {})
+    if rt.get("VALVE_runtime_is_steamvr") or "steamxr" in os.path.basename(target):
+        return "steamvr", target
+    name = (rt.get("name") or os.path.basename(target)).lower()
+    if "monado" in name or "monado" in (rt.get("library_path") or ""):
+        return "monado", target
+    return "other", target
+
+
+def check_openxr(p, opts):
+    kind, target = openxr_runtime(p)
+    want = getattr(opts, "openxr", None)
+    steamxr = os.path.join(p.steamvr, "steamxr_linux64.json") if p.steamvr else None
+
+    def fix():
+        backup(p.openxr_active)
+        os.makedirs(os.path.dirname(p.openxr_active), exist_ok=True)
+        tmp = p.openxr_active + ".tmp-riftlinux"
+        if os.path.lexists(tmp):
+            os.unlink(tmp)
+        os.symlink(steamxr, tmp)
+        os.replace(tmp, p.openxr_active)
+
+    if kind == "steamvr":
+        return result("openxr", "OpenXR runtime", "ok", "SteamVR (OpenXR games go through SteamVR and this driver).")
+    if not steamxr or not os.path.exists(steamxr):
+        return result("openxr", "OpenXR runtime", "info", f"{kind}; SteamVR's OpenXR runtime file not found.")
+    if kind == "none":
+        if want == "keep":
+            return result("openxr", "OpenXR runtime", "warn", "None set: OpenXR games will open on the monitor.")
+        return result("openxr", "OpenXR runtime", "fix",
+                      "None set: OpenXR games (PLAY'A VR and others) would open on the monitor; SteamVR will be set.",
+                      fix, "user")
+    # Another runtime (Monado service, WiVRn, ALVR...): the user's choice, changed only when asked.
+    if want == "steamvr":
+        return result("openxr", "OpenXR runtime", "fix", f"{kind} ({target}) will be replaced by SteamVR.", fix, "user")
+    return result("openxr", "OpenXR runtime", "warn",
+                  f"Another runtime is active ({kind}: {target}); OpenXR games will not use SteamVR. "
+                  "`riftlinux-setup install --openxr steamvr` switches.")
+
+
+def default_universe():
+    h = 2.43
+    corners = [(-1, -1), (1, -1), (1, 1), (-1, 1)]
+    walls = []
+    for i in range(4):
+        (x0, z0), (x1, z1) = corners[i], corners[(i + 1) % 4]
+        walls.append([[x0, 0, z0], [x0, h, z0], [x1, h, z1], [x1, 0, z1]])
+    return {"collision_bounds": walls, "play_area": [2, 2],
+            "seated": {"translation": [0, 0, 0], "yaw": 0},
+            "standing": {"translation": [0, 0, 0], "yaw": 0},
+            "time": datetime.datetime.now().strftime("%a %b %d %H:%M:%S %Y"), "universeID": UNIVERSE}
+
+
+def check_chaperone(p, opts):
+    if not p.chaperone:
+        return result("room", "Room setup", "info", "No SteamVR config directory yet.")
+    c = read_json(p.chaperone) or {}
+    uni = next((u for u in c.get("universes", []) if str(u.get("universeID")) == UNIVERSE), None)
+    complete = uni is not None and uni.get("play_area") and uni.get("collision_bounds") and "standing" in uni and \
+        "seated" in uni and uni.get("time")
+
+    def fix():
+        c2 = read_json(p.chaperone) or {"jsonid": "chaperone_info", "version": 5, "universes": []}
+        c2.setdefault("universes", [])
+        u = next((u for u in c2["universes"] if str(u.get("universeID")) == UNIVERSE), None)
+        d = default_universe()
+        if u is None:
+            c2["universes"].append(d)
+        else:
+            for k, v in d.items():
+                if not u.get(k):
+                    u[k] = v
+        write_json(p.chaperone, c2, indent=3)
+
+    if complete:
+        return result("room", "Room setup", "ok", "Standing and seated set, 2 x 2 m bounds or your own.")
+    # The driver gives SteamVR a standing room itself at each start when none is set up: nothing to
+    # write. `repair` still writes one, for a driver older than that.
+    return result("room", "Room setup", "ok",
+                  "None saved: the driver gives SteamVR a standing 2 x 2 m room at each start, so no Room Setup is "
+                  "needed (SteamVR's Room Setup sets your own).", fix if getattr(opts, "cmd", None) == "repair" else None,
+                  "user" if getattr(opts, "cmd", None) == "repair" else None)
+
+
+def direct_mode_state(p):
+    """(the driver's manifest lets it drive the display, settings.json's display.direct_mode). The setting is on
+    unless it says false, as the driver reads it; the package's manifest always says yes, off is the setting alone."""
+    m = read_json(p.manifest) or {}
+    s = read_json(p.settings) or {}
+    v = s.get("display", {}).get("direct_mode")
+    return bool(m.get("redirectsDisplay")), v is not False and v != 0
+
+
+def set_direct_mode(p, on):
+    """Direct mode on or off from SteamVR's next start: settings.json only. A driver folder of its own (a development
+    build, not the package's copy) whose manifest does not let it drive the display gets that too when turned on."""
+    s = read_json(p.settings) or {}
+    s.setdefault("display", {})["direct_mode"] = on
+    write_json(p.settings, s)
+    m = read_json(p.manifest) or {}
+    managed = os.path.exists(os.path.join(os.path.dirname(p.manifest), ".riftlinux-managed"))
+    if on and not m.get("redirectsDisplay") and not managed and os.path.exists(p.manifest):
+        m["redirectsDisplay"] = True
+        write_json(p.manifest, m)
+
+
+def check_settings(p, opts):
+    s = read_json(p.settings)
+    want = getattr(opts, "direct_mode", None)
+    man, sett = direct_mode_state(p) if os.path.exists(p.manifest) else (False, False)
+    if s is None and os.path.exists(p.settings):
+        return result("settings", "RiftLinux settings", "error", f"{p.settings} is not valid JSON; fix or move it.")
+    if s is None and want not in ("on", "off"):
+        return result("settings", "RiftLinux settings", "ok",
+                      "No settings yet: the defaults (notices on, direct mode on); the Rift tab writes them.")
+    if sett and not man:
+        return result("settings", "RiftLinux settings", "warn",
+                      f"Direct mode is on in the settings, but the driver's manifest ({p.manifest}) does not let it drive "
+                      "the display: reinstall the package (or `riftlinux-setup direct-mode on` for a driver folder of "
+                      "your own).")
+    if want in ("on", "off") and (want == "on") != sett:
+        return result("settings", "RiftLinux settings", "fix", f"Direct mode {want}.", lambda: set_direct_mode(p, want == "on"),
+                      "user")
+    return result("settings", "RiftLinux settings", "ok", f"Direct mode {'on' if sett else 'off'}; {p.settings}.")
+
+
+def check_display(p, opts):
+    found = []
+    base = "/sys/class/drm"
+    try:
+        names = os.listdir(base)
+    except OSError:
+        names = []
+    for n in sorted(names):
+        try:
+            with open(os.path.join(base, n, "edid"), "rb") as f:
+                e = f.read()
+        except OSError:
+            continue
+        if len(e) < 10:
+            continue
+        v = (e[8] << 8) | e[9]
+        pnp = "".join(chr(((v >> s) & 31) + 64) for s in (10, 5, 0))
+        if pnp == "OVR":
+            found.append((n, sysfs(os.path.join(base, n), "status")))
+    # Only what the X server reads: xorg.conf and *.conf in its conf.d directories; commented lines do not count.
+    allow_hmd = []
+    files = ["/etc/X11/xorg.conf"]
+    for d in ("/etc/X11/xorg.conf.d", "/usr/share/X11/xorg.conf.d"):
+        try:
+            files += [os.path.join(d, f) for f in sorted(os.listdir(d)) if f.endswith(".conf")]
+        except OSError:
+            pass
+    for path in files:
+        try:
+            lines = open(path, errors="replace").read().lower().splitlines()
+        except OSError:
+            continue
+        if any("allowhmd" in l.split("#")[0] and "yes" in l.split("#")[0] for l in lines):
+            allow_hmd.append(path)
+    if allow_hmd:
+        return result("display", "Headset display", "warn",
+                      "An X configuration allows the headset as a desktop monitor (AllowHMD): " + ", ".join(allow_hmd) +
+                      ". The desktop then takes the headset and SteamVR cannot drive it; move that file away (root).")
+    if not found:
+        if any(d["product"] == "0031" for d in usb_devices()):
+            return result("display", "Headset display", "info",
+                          "Not visible from here: the CV1 is on HDMI only while its display is on (SteamVR running and "
+                          "the headset worn), and NVIDIA's driver does not show its EDID to this check. SteamVR's log says "
+                          "whether it found it.")
+        return result("display", "Headset display", "warn", "The headset is not seen on HDMI (cable, or the GPU's HDMI port).")
+    session = desktop_session_type() or "?"
+    return result("display", "Headset display", "ok", f"On {found[0][0]} ({found[0][1]}); desktop session: {session}.")
+
+
+def steam_process():
+    for pid in os.listdir("/proc"):
+        if not pid.isdigit():
+            continue
+        try:
+            if open(f"/proc/{pid}/comm").read().strip() == "steam" and os.stat(f"/proc/{pid}").st_uid == os.getuid():
+                return int(pid)
+        except OSError:
+            continue
+    return None
+
+
+def check_realtime(p, opts):
+    # Its D-Bus service file, where every distribution puts it; the daemon itself lives in different places
+    # (/usr/libexec on Debian and Fedora, /usr/lib on Arch).
+    rtkit = os.path.exists("/usr/share/dbus-1/system-services/org.freedesktop.RealtimeKit1.service") or any(
+        os.path.exists(d) for d in ("/usr/libexec/rtkit-daemon", "/usr/lib/rtkit-daemon", "/usr/lib/rtkit/rtkit-daemon")
+    ) or shutil.which("rtkit-daemon")
+    if not rtkit:
+        return result("realtime", "Real-time priority", "warn",
+                      "RealtimeKit (rtkit) is not installed: the Rift's threads will run at normal priority. "
+                      "Install the distribution's rtkit package.")
+    pid = steam_process()
+    if pid is None:
+        return result("realtime", "Real-time priority", "ok", "RealtimeKit present (checked again when Steam runs).")
+    pk = shutil.which("pkcheck")
+    if pk:
+        r = run([pk, "--action-id", "org.freedesktop.RealtimeKit1.acquire-real-time", "--process", str(pid)])
+        if r is not None and r.returncode != 0:
+            return result("realtime", "Real-time priority", "warn",
+                          f"Steam (pid {pid}) may not get real-time priority: it was not started from your desktop "
+                          "session (for example from an SSH login). Quit Steam and start it from the desktop.")
+    return result("realtime", "Real-time priority", "ok", f"RealtimeKit present; Steam (pid {pid}) may use it.")
+
+
+def check_calibration(p, opts):
+    if os.path.exists(p.rig):
+        return result("calibration", "Sensor calibration", "ok", f"Saved ({p.rig}); a moved sensor is found and placed again.")
+    return result("calibration", "Sensor calibration", "info",
+                  "None saved yet: at the first start move the headset slowly in view of the sensors for a few "
+                  "seconds; it is saved by itself.")
+
+
+NATIVE_DIR = "/usr/lib/riftlinux/native"
+
+
+def x86_64():
+    import platform
+    return platform.machine() in ("x86_64", "AMD64")
+
+
+def check_arch(p, opts):
+    import platform
+    if x86_64():
+        return result("arch", "Computer", "ok", "x86-64")
+    return result("arch", "Computer", "error",
+                  f"{platform.machine()}: the SteamVR driver and the own runtime are built for x86-64 (64-bit Intel "
+                  "and AMD) computers only; on this one only `riftlinux-setup check` and `riftlinux-setup pair` work.")
+
+
+def native_dir(p):
+    if os.path.exists(os.path.join(NATIVE_DIR, "monado-service")):
+        return NATIVE_DIR
+    return os.path.join(os.path.dirname(os.path.realpath(p.package)), "rift-cv1-native")
+
+
+def check_native(p, opts):
+    title = "Own runtime (OpenXR without SteamVR)"
+    d = native_dir(p)
+    files = [os.path.join(d, "monado-service"), os.path.join(d, "libopenxr_monado.so")]
+    if not all(os.path.exists(f) for f in files):
+        return result("native", title, "info", "not installed (SteamVR does not need it)")
+    if not x86_64():
+        return result("native", title, "info", "built for x86-64, not this computer")
+    r = run(["ldd"] + files)
+    if r is None:
+        return result("native", title, "info", f"{d}; libraries not checked (no ldd)")
+    missing = sorted({line.split()[0] for line in r.stdout.splitlines() if "not found" in line})
+    if missing:
+        return result("native", title, "warn", "libraries missing: " + ", ".join(missing) + " (install your "
+                      "distribution's packages for them; SteamVR is not affected)")
+    return result("native", title, "ok", f"{d}, every library found; start it with `riftlinux-runtime`")
+
+
+CHECKS = [check_arch, check_steam, check_package, check_registered, check_sandboxed, check_nvidia_vrr, check_enabled, check_devices, check_access, check_display,
+          check_priority, check_openxr, check_chaperone, check_settings, check_realtime, check_calibration, check_native]
+REPAIR = {"enabled", "priority", "room", "settings", "registered", "sandboxed"}
+
+
+# --------------------------------------------------------------------------------------------------------------------
+# Running
+
+
+def run_root(cmds, opts):
+    if not cmds:
+        return True
+    script = " && ".join(cmds)
+    if opts.print_root:
+        print("Run as root:\n  " + "\n  ".join(cmds))
+        return False
+    graphical = bool(os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY"))
+    if graphical and shutil.which("pkexec"):
+        r = subprocess.run(["pkexec", "sh", "-c", script])
+        if r.returncode == 0:
+            return True
+    if sys.stdin.isatty() and shutil.which("sudo"):
+        r = subprocess.run(["sudo", "sh", "-c", script])
+        if r.returncode == 0:
+            return True
+    print("Could not get root here. Run these as root, then `riftlinux-setup check`:\n  " + "\n  ".join(cmds))
+    return False
+
+
+def ask(opts, question):
+    if opts.yes:
+        return True
+    if not sys.stdin.isatty():
+        return False
+    return input(f"{question} [y/N] ").strip().lower() in ("y", "yes")
+
+
+SYMBOL = {"ok": "ok   ", "info": "info ", "warn": "WARN ", "fix": "TODO ", "error": "ERROR"}
+
+
+def report(results, as_json):
+    if as_json:
+        print(json.dumps({"checks": [{k: v for k, v in r.items() if k != "fix"} | {"fixable": r["fix"] is not None or
+                                                                                  bool(r["root_cmds"])}
+                                     for r in results]}, indent=2))
+        return
+    for r in results:
+        print(f"{SYMBOL[r['state']]} {r['title']}: {r['detail']}")
+
+
+def cmd_check(p, opts):
+    results = [c(p, opts) for c in CHECKS]
+    report(results, opts.json)
+    if any(r["state"] == "error" for r in results):
+        return 2
+    return 1 if any(r["state"] in ("fix", "warn") for r in results) else 0
+
+
+def cmd_fix(p, opts, only=None):
+    results = [c(p, opts) for c in CHECKS]
+    report(results, opts.json)
+    if any(r["state"] == "error" and r["id"] in ("steam", "package") for r in results):
+        print("\nFix the errors above first.")
+        return 2
+    todo = [r for r in results if (r["fix"] or r["root_cmds"]) and r["state"] in ("fix", "warn")
+            and (only is None or r["id"] in only)]
+    if not todo:
+        print("\nNothing to change.")
+        return 0
+    print()
+    changed = False
+    root = []
+    for r in todo:
+        if r["fix"] and ask(opts, f"{r['title']}: {r['detail']} Change it?"):
+            r["fix"]()
+            print(f"  done: {r['title']}")
+            changed = True
+        elif r["root_cmds"] and ask(opts, f"{r['title']}: {r['detail']} Change it (needs root)?"):
+            root += r["root_cmds"]
+    if root:
+        changed = run_root(root, opts) or changed
+    if changed:
+        print("\nAfter the changes:")
+        report([c(p, opts) for c in CHECKS], False)
+        print("\nStart SteamVR from Steam (not from a terminal) so it runs in Steam's runtime.")
+    return 0
+
+
+def cmd_direct(p, opts):
+    if opts.mode == "status":
+        man, sett = direct_mode_state(p)
+        print(f"direct mode: {'on' if sett and man else 'off'} (settings {'on' if sett else 'off'}, driver manifest "
+              f"{'allows it' if man else 'does not allow it'})")
+        return 0
+    set_direct_mode(p, opts.mode == "on")
+    print(f"direct mode {opts.mode}; takes effect at the next SteamVR start.")
+    return 0
+
+
+def cmd_record(p, opts):
+    """settings.json diagnostics.record: SteamVR's sessions recorded (from its next start) for a bug report."""
+    s = read_json(p.settings) or {}
+    diag = s.get("diagnostics") if isinstance(s.get("diagnostics"), dict) else {}
+    where = os.path.join(XDG_CACHE, "riftlinux")
+    if opts.mode == "status":
+        files = sorted(glob.glob(os.path.join(where, "riftlinux-*.ctdata")))
+        size = sum(os.path.getsize(f) for f in files) / 1e6
+        print(f"recording: {'on' if diag.get('record') else 'off'}; {len(files)} recording(s) in "
+              f"{where.replace(HOME, '~', 1)} ({size:.0f} MB)")
+        for f in files[-5:]:
+            print(f"  {os.path.basename(f)}  {os.path.getsize(f) / 1e6:.0f} MB")
+        return 0
+    if opts.mode == "on":
+        diag["record"] = True
+        s["diagnostics"] = diag
+    else:
+        diag.pop("record", None)
+        if diag:
+            s["diagnostics"] = diag
+        else:
+            s.pop("diagnostics", None)
+    write_json(p.settings, s)
+    if opts.mode == "on":
+        print(f"Recording on, from SteamVR's next start: each session goes to {where.replace(HOME, '~', 1)}/"
+              "riftlinux-<date>-<time>.ctdata (large: tens of MB a minute), the tracker's details to SteamVR's log "
+              "(~/.steam/steam/logs/vrstartup-linux.txt). Attach both to the bug report, then: riftlinux-setup "
+              "record off")
+    else:
+        print("Recording off, from SteamVR's next start; recordings already made stay until you delete them.")
+    return 0
+
+
+def cmd_uninstall(p, opts):
+    found = False
+    # From every Steam's list (native, Flatpak, Snap): this folder and the copies made for each.
+    for name, config_dir, data_dir, _ in steam_installs():
+        vp_path = os.path.join(config_dir, "openvr", "openvrpaths.vrpath")
+        vp = read_json(vp_path)
+        drivers = (vp or {}).get("external_drivers", []) or []
+        ours = {os.path.realpath(p.package), os.path.realpath(user_copy_dir(data_dir))}
+        hit = [d for d in drivers if os.path.realpath(d) in ours]
+        if not hit:
+            continue
+        found = True
+        where = "SteamVR" if name == "native" else f"{name} Steam's SteamVR"
+        if ask(opts, f"Unregister {', '.join(hit)} from {where}?"):
+            vp["external_drivers"] = [d for d in drivers if d not in hit]
+            write_json(vp_path, vp)
+            cfg = config_dir.replace(HOME, "~", 1)
+            print(f"unregistered from {where}; settings and calibration stay in {cfg}/riftlinux and {cfg}/monado.")
+    if not found:
+        print("not registered.")
+    print(f"The udev rules stay; to remove them (root): rm /etc/udev/rules.d/{UDEV_NAME} && udevadm control --reload-rules")
+    if system_package_dir():
+        print("The installed package registers the driver again at the next login or plug-in: remove the package to stop that.")
+    return 0
+
+
+# --------------------------------------------------------------------------------------------------------------------
+# Installed system-wide: the package puts the driver in a system directory, but SteamVR runs inside
+# Steam's container, which has its own /usr and shares only the home directory. So each user gets a copy in
+# ~/.local/share/riftlinux/steamvr/rift-cv1 (kept current from the system one) and that copy is registered.
+
+SYSTEM_DIRS = ["/usr/lib/riftlinux/steamvr/rift-cv1", "/usr/lib64/riftlinux/steamvr/rift-cv1",
+               "/usr/local/lib/riftlinux/steamvr/rift-cv1", "/opt/riftlinux/steamvr/rift-cv1"]
+MANAGED = ".riftlinux-managed"
+
+
+def system_package_dir():
+    env = os.environ.get("RIFTLINUX_SYSTEM_DIR")
+    for d in ([env] if env else []) + SYSTEM_DIRS:
+        if d and os.path.exists(os.path.join(d, "driver.vrdrivermanifest")):
+            return d
+    return None
+
+
+def user_copy_dir(data=None):
+    data = data or os.environ.get("XDG_DATA_HOME") or os.path.join(HOME, ".local", "share")
+    return os.path.join(data, "riftlinux", "steamvr", "rift-cv1")
+
+
+FLATPAK_STEAM = os.path.join(HOME, ".var", "app", "com.valvesoftware.Steam")
+SNAP_STEAM = os.path.join(HOME, "snap", "steam", "common")
+
+
+def steam_installs():
+    """Each Steam the user has, as its SteamVR sees files: (name, its XDG config dir, a data dir it can read, its
+    Steam config dir). Native Steam reads ~/.config and ~/.local/share. Flatpak Steam (com.valvesoftware.Steam) has
+    its own XDG dirs under ~/.var/app/com.valvesoftware.Steam and cannot read ~/.local/share; the Snap lives in
+    ~/snap/steam/common. A driver must be inside what that Steam sees, registered in that Steam's own list."""
+    native_cfg = None
+    for root in Paths.steam_roots():
+        if not root.startswith((FLATPAK_STEAM, SNAP_STEAM)) and os.path.isdir(os.path.join(root, "config")):
+            native_cfg = os.path.join(root, "config")
+            break
+    out = [("native", XDG_CONFIG, os.environ.get("XDG_DATA_HOME") or os.path.join(HOME, ".local", "share"), native_cfg)]
+    if os.path.isdir(FLATPAK_STEAM):
+        out.append(("Flatpak", os.path.join(FLATPAK_STEAM, "config"), os.path.join(FLATPAK_STEAM, "data"),
+                    os.path.join(FLATPAK_STEAM, ".local", "share", "Steam", "config")))
+    if os.path.isdir(SNAP_STEAM):
+        out.append(("Snap", os.path.join(SNAP_STEAM, ".config"), os.path.join(SNAP_STEAM, ".local", "share"),
+                    os.path.join(SNAP_STEAM, ".local", "share", "Steam", "config")))
+    return out
+
+
+def tree_stamp(d):
+    """Size and modification time of every file: changes whenever the package is updated."""
+    out = []
+    for root, dirs, files in os.walk(d):
+        dirs.sort()
+        for f in sorted(files):
+            if f == MANAGED:
+                continue
+            st = os.stat(os.path.join(root, f))
+            out.append(f"{os.path.relpath(os.path.join(root, f), d)}:{st.st_size}:{int(st.st_mtime)}")
+    return "\n".join(out)
+
+
+def sync_user_copy(system_dir, log, dst=None):
+    """Copy the system driver to the user's directory (@p dst, default the native one) when it is missing or older;
+    replaced as a whole, so a running SteamVR keeps the files it has open."""
+    dst = dst or user_copy_dir()
+    stamp = tree_stamp(system_dir)
+    try:
+        if open(os.path.join(dst, MANAGED)).read() == stamp:
+            return dst, False
+    except OSError:
+        pass
+    parent = os.path.dirname(dst)
+    os.makedirs(parent, exist_ok=True)
+    tmp = dst + f".new-{os.getpid()}"
+    shutil.copytree(system_dir, tmp, symlinks=False)
+    with open(os.path.join(tmp, MANAGED), "w") as f:
+        f.write(stamp)
+    if os.path.exists(dst):
+        old = dst + f".old-{os.getpid()}"
+        os.rename(dst, old)
+        os.rename(tmp, dst)
+        if os.path.exists(os.path.join(old, MANAGED)):
+            shutil.rmtree(old, ignore_errors=True)  # our own earlier copy, never anything else
+    else:
+        os.rename(tmp, dst)
+    log(f"driver copied from {system_dir} to {dst}")
+    return dst, True
+
+
+def openvrpaths_register(path, log, config_dir=None):
+    """Register path as SteamVR's driver (and only it under the name "monado") in the list under @p config_dir (that
+    Steam's XDG config dir, default the native one); creates the list if SteamVR never ran (SteamVR fills in the
+    rest on its first start)."""
+    vp_path = os.path.join(config_dir or XDG_CONFIG, "openvr", "openvrpaths.vrpath")
+    vp = read_json(vp_path)
+    if vp is None:
+        vp = {"external_drivers": [path], "jsonid": "vrpathreg", "version": 1}
+        write_json(vp_path, vp)
+        log(f"SteamVR has not run yet: driver list created with {path}")
+        return True
+    drivers = vp.get("external_drivers", []) or []
+    keep = []
+    for d in drivers:
+        if os.path.realpath(d) == os.path.realpath(path):
+            continue
+        m = read_json(os.path.join(d, "driver.vrdrivermanifest")) or {}
+        if m.get("name") == DRIVER_NAME:
+            log(f"unregistered another driver named \"{DRIVER_NAME}\": {d} (its files stay)")
+            continue
+        keep.append(d)
+    new = keep + [path]
+    if new == drivers:
+        return False
+    vp["external_drivers"] = new
+    write_json(vp_path, vp)
+    log(f"registered {path} with SteamVR")
+    return True
+
+
+def cmd_register(p, opts):
+    logs = []
+
+    def log(msg):
+        logs.append(msg)
+        if not opts.quiet:
+            print(msg)
+
+    if not x86_64():
+        # The driver is built for x86-64: registered here, SteamVR could only fail to load it.
+        log("not an x86-64 computer: the driver is not registered")
+        return 0
+    sysdir = system_package_dir()
+    src = sysdir or (p.package if os.path.exists(p.manifest) else None)
+    if src is None:
+        log("no installed driver found")
+        return 0
+    # Every Steam the user has (native, Flatpak, Snap) gets a copy it can read, in its own list. Without an installed
+    # package (a driver folder run from where it is) only the native Steam, which can read any folder.
+    for name, config_dir, data_dir, steam_config in steam_installs() if sysdir else steam_installs()[:1]:
+        def logn(msg, name=name):
+            log(msg if name == "native" else f"{name} Steam: {msg}")
+
+        path = sync_user_copy(sysdir, logn, user_copy_dir(data_dir))[0] if sysdir else src
+        openvrpaths_register(path, logn, config_dir)
+        # Lift SteamVR's safe-mode block (set after a crash): one more try at each login or headset plug-in.
+        vrsettings = os.path.join(steam_config, "steamvr.vrsettings") if steam_config else None
+        if vrsettings and os.path.exists(vrsettings):
+            vs = read_json(vrsettings) or {}
+            sect = vs.get("driver_" + DRIVER_NAME, {})
+            if sect.get("blocked_by_safe_mode") or sect.get("enable") is False:
+                sect["blocked_by_safe_mode"] = False
+                sect["enable"] = True
+                vs["driver_" + DRIVER_NAME] = sect
+                write_json(vrsettings, vs, indent=3)
+                logn("SteamVR had blocked the driver (safe mode): enabled again")
+    if logs:
+        try:
+            d = os.path.join(os.environ.get("XDG_CACHE_HOME") or os.path.join(HOME, ".cache"), "riftlinux")
+            os.makedirs(d, exist_ok=True)
+            with open(os.path.join(d, "register.log"), "a") as f:
+                for m in logs:
+                    f.write(f"{datetime.datetime.now().isoformat(timespec='seconds')} {m}\n")
+        except OSError:
+            pass
+    return 0
+
+
+# --------------------------------------------------------------------------------------------------------------------
+# Pairing. Protocol from ouvrt (Philipp Zabel, rift-radio.c / rift.c, LGPL-2.1-or-later OR BSL-1.0), checked against
+# a USB capture of the Oculus software pairing both Touch controllers, and made the same way: the headset restarts into
+# radio pairing mode (feature report 0x06 = 2); a controller held in pairing mode reports its address and the headset
+# it is paired to; four radio writes bind it to this headset; about 3 s later the headset restarts into normal mode
+# (0x06 = 0). One controller per visit to pairing mode, and a controller is bound again even when it already belongs
+# to this headset, as the Oculus software does. The Remote's values (type 1, channel 750) are ouvrt's; the capture had
+# no Remote.
+
+PAIR_NAMES = {1: "Remote", 2: "left Touch", 3: "right Touch"}
+PAIR_CHANNEL = {1: 750, 2: 1000, 3: 1250}
+
+
+def hid_ioc(nr, size):
+    return (3 << 30) | (size << 16) | (ord("H") << 8) | nr
+
+
+def hid_set_feature(fd, data):
+    import fcntl
+    buf = bytearray(data)
+    fcntl.ioctl(fd, hid_ioc(0x06, len(buf)), buf)
+
+
+def hid_get_feature(fd, report_id, size):
+    import fcntl
+    buf = bytearray(size)
+    buf[0] = report_id
+    fcntl.ioctl(fd, hid_ioc(0x07, size), buf)
+    return bytes(buf)
+
+
+def cv1_hidraw(interface):
+    for dev in sorted(glob_hidraw()):
+        try:
+            uevent = open(os.path.join(dev, "device", "uevent")).read()
+        except OSError:
+            continue
+        if "HID_ID=0003:00002833:00000031" in uevent and f"input{interface}" in uevent:
+            return "/dev/" + os.path.basename(dev)
+    return None
+
+
+def glob_hidraw():
+    try:
+        return [os.path.join("/sys/class/hidraw", n) for n in os.listdir("/sys/class/hidraw")]
+    except OSError:
+        return []
+
+
+def radio_transfer(fd, a, b, c):
+    import time
+    hid_set_feature(fd, bytes([0x1A, 0, 0, a, b, c]))
+    # Binding a controller keeps the radio busy for about 1 s.
+    end = time.monotonic() + 5.0
+    while True:
+        r = hid_get_feature(fd, 0x1A, 6)
+        if not r[3] & 0x80:
+            break
+        if time.monotonic() > end:
+            raise IOError("radio busy")
+        time.sleep(0.002)
+    if r[3] & 0x08:
+        raise IOError("radio error")
+
+
+def radio_read(fd, a, b, c):
+    radio_transfer(fd, a, b, c)
+    return hid_get_feature(fd, 0x1B, 31)[3:]
+
+
+def radio_write(fd, a, b, c, payload):
+    data = bytes([0x1B, 0, 0]) + bytes(payload) + bytes(28 - len(payload))
+    hid_set_feature(fd, data)
+    radio_transfer(fd, a, b, c)
+
+
+def boot_mode(fd):
+    return hid_get_feature(fd, 0x06, 4)[3]
+
+
+def wait_for_headset(present, timeout=20.0):
+    import time
+    end = time.monotonic() + timeout
+    while time.monotonic() < end:
+        node = cv1_hidraw(0)
+        if bool(node) == present:
+            return node
+        time.sleep(0.25)
+    return cv1_hidraw(0) if present else None
+
+
+def restart_headset(fd, mode):
+    """Restart the headset into a boot mode; returns the new interface-0 node (the old fd is gone)."""
+    import time
+    try:
+        hid_set_feature(fd, bytes([0x06, 0, 0, mode]))
+    except OSError:
+        pass  # It may go away before the call returns.
+    try:
+        os.close(fd)
+    except OSError:
+        pass
+    wait_for_headset(False, 5.0)
+    time.sleep(0.5)
+    node = wait_for_headset(True, 20.0)
+    time.sleep(1.0)
+    return node
+
+
+def busy_runtime():
+    names = {"vrserver", "vrcompositor", "monado-service"}
+    for pid in os.listdir("/proc"):
+        if pid.isdigit():
+            try:
+                if open(f"/proc/{pid}/comm").read().strip() in names:
+                    return open(f"/proc/{pid}/comm").read().strip()
+            except OSError:
+                pass
+    return None
+
+
+PAIR_HOLD_S = 3.0  # After the last write the Oculus software waits about 2.7 s before leaving pairing mode.
+# In pairing mode the headset reports nothing (no radio messages) without a keep-alive: the Oculus software sends
+# feature report 0x08 with a 10 s interval every 3 s, from entering pairing mode until it leaves.
+PAIR_KEEPALIVE = bytes([0x08, 0, 0, 0x10, 0x27])
+PAIR_KEEPALIVE_EVERY_S = 3.0
+
+
+class PairKeepAlive:
+    def __init__(self, fd):
+        self.fd = fd
+        self.next = 0.0
+
+    def tick(self):
+        import time
+        now = time.monotonic()
+        if now >= self.next:
+            hid_set_feature(self.fd, PAIR_KEEPALIVE)
+            self.next = now + PAIR_KEEPALIVE_EVERY_S
+
+    def sleep(self, seconds):
+        import time
+        end = time.monotonic() + seconds
+        while time.monotonic() < end:
+            self.tick()
+            time.sleep(min(0.1, max(0.0, end - time.monotonic())))
+
+
+def wait_pairing_message(rfd, timeout, skip_types, keep_alive):
+    """The next pairing message of a controller held in pairing mode, as (type, device address, the radio address it
+    is paired to, firmware), or None after @p timeout seconds."""
+    import time
+    end = time.monotonic() + timeout
+    while time.monotonic() < end:
+        keep_alive.tick()
+        try:
+            r = os.read(rfd, 64)
+        except BlockingIOError:
+            time.sleep(0.01)
+            continue
+        if len(r) < 59 or r[0] != 0x0C:
+            continue
+        for k in range(2):
+            m = r[3 + 28 * k: 3 + 28 * (k + 1)]
+            if m[:4] != b"\x1a\x00\x03\x01":
+                continue
+            dtype = m[6]
+            if dtype not in PAIR_NAMES or dtype in skip_types:
+                continue
+            fw = bytes(m[17:25]).split(b"\0")[0].decode(errors="replace")
+            return dtype, struct.unpack_from("<I", m, 7)[0], bytes(m[11:16]), fw
+    return None
+
+
+def bind_controller(fd, address, dtype, dev_addr):
+    """The four radio writes that bind a controller to this headset (data report first, then the command)."""
+    radio_write(fd, 0x04, 0x07, 0x05, struct.pack("<I", dev_addr))
+    step = bytearray(28)
+    step[0], step[1], step[2] = 0x11, 0x0F, dtype
+    step[3:7] = address[:4]
+    step[7:12] = address[:5]
+    struct.pack_into("<H", step, 12, PAIR_CHANNEL[dtype])
+    struct.pack_into("<H", step, 16, 2000)
+    radio_write(fd, 0x04, 0x09, 0x05, step)
+    radio_write(fd, 0x04, 0x09, 0x05, bytes([0x21]))
+    radio_write(fd, 0x04, 0x08, 0x05, b"")
+
+
+def reopen_headset(fd, mode):
+    """Restarts the headset into @p mode; the new interface-0 descriptor, or -1 when it did not come back in it."""
+    node = restart_headset(fd, mode)
+    if not node:
+        print("The headset did not come back; unplug and replug its USB cable.")
+        return -1
+    fd = os.open(node, os.O_RDWR)
+    if boot_mode(fd) != mode:
+        os.close(fd)
+        print("The headset did not enter " + ("pairing" if mode == 2 else "normal") + " mode; replug its USB cable.")
+        return -1
+    return fd
+
+
+def driver_request(request, timeout=5.0):
+    """One request to the running SteamVR driver's socket (each Steam's cache dir: the driver lives in its
+    container); its answer as a dict, or None when no driver answers."""
+    import socket
+    dirs = [os.environ.get("XDG_CACHE_HOME") or os.path.join(HOME, ".cache")]
+    for _, config_dir, _, _ in steam_installs()[1:]:
+        dirs.append(os.path.join(os.path.dirname(config_dir), "cache"))
+    for d in dirs:
+        path = os.path.join(d, "riftlinux", "driver.sock")
+        if not os.path.exists(path):
+            continue
+        try:
+            with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as c:
+                c.settimeout(timeout)
+                c.connect(path)
+                c.sendall((json.dumps(request) + "\n").encode())
+                answer = b""
+                while not answer.endswith(b"\n"):
+                    chunk = c.recv(4096)
+                    if not chunk:
+                        break
+                    answer += chunk
+            return json.loads(answer.decode() or "null")
+        except (OSError, ValueError):
+            continue
+    return None
+
+
+def cmd_recalibrate(p, opts):
+    running = busy_runtime()
+    if running in ("vrserver", "vrcompositor"):
+        answer = driver_request({"recalibrate": True})
+        if answer is None:
+            print("SteamVR runs, but its RiftLinux driver did not answer: use the Rift tab's Measure button "
+                  "(Display & status page).")
+            return 2
+        if answer.get("started"):
+            print("Measuring every sensor again: put the headset on, face the sensors and slowly turn your head left "
+                  "and right, then up and down, until the measuring notice goes away. Your floor carries over; if it "
+                  "is off afterwards, use Set floor in the Rift tab.")
+            return 0
+        print("Not now: the sensors are being solved right now; try again in a moment.")
+        return 1
+    if running == "monado-service":
+        print("RiftLinux's own runtime is running: press Measure in the Rift panel (Display & status page).")
+        return 1
+    # Nothing running: the saved placement set aside (not deleted) for every Steam's config and the own runtime's,
+    # so the next start measures every sensor anew.
+    moved = []
+    for _, config_dir, _, _ in steam_installs():
+        rig = os.path.join(config_dir, "monado", "constellation", "rig.json")
+        if os.path.exists(rig):
+            os.replace(rig, rig + ".before-recalibration")
+            moved.append(rig.replace(HOME, "~", 1))
+    if moved:
+        print("Set aside: " + ", ".join(moved) + " (as .before-recalibration). The next start of SteamVR (or "
+              "riftlinux-runtime) measures every sensor again: put the headset on, face the sensors and slowly turn "
+              "your head left and right, then up and down, until the measuring notice goes away. Then check the "
+              "floor (Set floor in the Rift tab).")
+    else:
+        print("No saved sensor placement: the next start measures the sensors anyway.")
+    return 0
+
+
+def cmd_pair(p, opts):
+    import time
+    busy = busy_runtime()
+    if busy:
+        print(f"{busy} is running and holds the headset: close SteamVR (or the Monado session) first.")
+        return 2
+    node = cv1_hidraw(0)
+    if not node:
+        print("No Rift CV1 headset found (USB plugged in, and its box on?).")
+        return 2
+    fd = os.open(node, os.O_RDWR)
+    try:
+        mode = boot_mode(fd)
+    except OSError as e:
+        os.close(fd)
+        print(f"Could not talk to the headset ({e}); check `riftlinux-setup check` (device access).")
+        return 2
+    paired = []
+    done_types = set()
+    try:
+        while True:
+            if mode != 2:
+                print("Restarting the headset into pairing mode (it leaves USB for a few seconds) ...")
+                fd = reopen_headset(fd, 2)
+                if fd < 0:
+                    return 2
+                mode = 2
+            address = radio_read(fd, 0x05, 0x03, 0x05)[:5]
+            keep_alive = PairKeepAlive(fd)
+            keep_alive.tick()
+            radio_node = cv1_hidraw(1)
+            if not radio_node:
+                print("The headset's radio interface did not appear.")
+                return 2
+            rfd = os.open(radio_node, os.O_RDONLY | os.O_NONBLOCK)
+            print("\nPairing mode (headset radio " + " ".join(f"{b:02x}" for b in address) + "). One controller at a "
+                  "time: hold the Oculus button and Y (left controller) or the Oculus button and B (right controller) "
+                  "until its light blinks; on the Remote, hold its back button. Waiting up to "
+                  f"{opts.timeout} s; Ctrl+C to finish.")
+            try:
+                got = wait_pairing_message(rfd, opts.timeout, done_types, keep_alive)
+            except KeyboardInterrupt:
+                print()
+                got = None
+            finally:
+                os.close(rfd)
+            if got is None:
+                break
+            dtype, dev_addr, cur, fw = got
+            name = PAIR_NAMES[dtype]
+            if cur == address:
+                print(f"{name} {dev_addr:08x} (firmware {fw}): already paired with this headset; pairing it again ...")
+            else:
+                print(f"{name} {dev_addr:08x} (firmware {fw}), paired to {' '.join(f'{b:02x}' for b in cur)}: "
+                      "pairing it with this headset ...")
+            bind_controller(fd, address, dtype, dev_addr)
+            paired.append(name)
+            done_types.add(dtype)
+            print(f"{name}: paired.")
+            keep_alive.sleep(PAIR_HOLD_S)
+            print("Restarting the headset in normal mode ...")
+            fd = reopen_headset(fd, 0)
+            if fd < 0:
+                return 2
+            mode = 0
+            if {2, 3} <= done_types:
+                break
+            print("Next controller (Ctrl+C if there is none).")
+    except OSError as e:
+        print(f"The headset's radio did not answer ({e}).")
+        return 2
+    finally:
+        if fd >= 0:
+            if mode == 2:
+                print("Restarting the headset in normal mode ...")
+                fd = reopen_headset(fd, 0)
+                if fd >= 0:
+                    print("Headset back in normal mode.")
+            if fd >= 0:
+                os.close(fd)
+    print("Paired: " + (", ".join(paired) if paired else "nothing") + ".")
+    return 0
+
+
+def main():
+    here = os.path.dirname(os.path.realpath(__file__))
+    if not os.path.exists(os.path.join(here, "driver.vrdrivermanifest")):
+        # Installed in /usr/bin: the driver SteamVR uses is the user's copy of the system one.
+        here = user_copy_dir() if os.path.exists(os.path.join(user_copy_dir(), "driver.vrdrivermanifest")) else \
+            (system_package_dir() or here)
+    ap = argparse.ArgumentParser(prog="riftlinux-setup", description=__doc__.split("\n\n")[0],
+                                 formatter_class=argparse.RawDescriptionHelpFormatter, epilog=__doc__)
+    ap.add_argument("--package", default=here)
+    ap.add_argument("--json", action="store_true")
+    ap.add_argument("--yes", action="store_true")
+    ap.add_argument("--print-root", action="store_true")
+    sub = ap.add_subparsers(dest="cmd", required=True)
+    sub.add_parser("check")
+    i = sub.add_parser("install")
+    i.add_argument("--openxr", choices=["steamvr", "keep"])
+    i.add_argument("--direct-mode", choices=["on", "off"])
+    sub.add_parser("repair")
+    d = sub.add_parser("direct-mode")
+    d.add_argument("mode", choices=["on", "off", "status"])
+    nv = sub.add_parser("nvidia-vrr")
+    nv.add_argument("action", choices=["status", "conceal", "restore"])
+    sub.add_parser("uninstall")
+    rg = sub.add_parser("register")
+    rg.add_argument("--quiet", action="store_true")
+    sub.add_parser("recalibrate")
+    rc = sub.add_parser("record")
+    rc.add_argument("mode", choices=["on", "off", "status"])
+    pp = sub.add_parser("pair")
+    pp.add_argument("--timeout", type=int, default=90)
+    opts = ap.parse_args()
+    p = Paths(opts.package)
+    if opts.cmd == "check":
+        return cmd_check(p, opts)
+    if opts.cmd == "install":
+        return cmd_fix(p, opts)
+    if opts.cmd == "repair":
+        return cmd_fix(p, opts, REPAIR)
+    if opts.cmd == "direct-mode":
+        return cmd_direct(p, opts)
+    if opts.cmd == "register":
+        return cmd_register(p, opts)
+    if opts.cmd == "nvidia-vrr":
+        return cmd_nvidia_vrr(p, opts)
+    if opts.cmd == "recalibrate":
+        return cmd_recalibrate(p, opts)
+    if opts.cmd == "pair":
+        return cmd_pair(p, opts)
+    if opts.cmd == "record":
+        return cmd_record(p, opts)
+    return cmd_uninstall(p, opts)
+
+
+if __name__ == "__main__":
+    sys.exit(main())

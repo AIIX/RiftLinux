@@ -1,0 +1,99 @@
+// Copyright 2020-2022, Collabora, Ltd.
+// SPDX-License-Identifier: BSL-1.0
+
+plugins {
+    id 'com.android.library'
+    id 'kotlin-android'
+
+    id 'kotlin-kapt'
+    id 'dagger.hilt.android.plugin'
+
+    id 'com.diffplug.spotless'
+}
+
+android {
+    compileSdk project.sharedCompileSdk
+    buildToolsVersion = buildToolsVersion
+
+
+    defaultConfig {
+        // needed for ASharedMemory, etc.
+        minSdkVersion 26
+        targetSdkVersion project.sharedTargetSdk
+
+        def defaultServiceLibName = "monado-service"
+        def serviceLibName = project.hasProperty("serviceLibName") ?
+            project.serviceLibName : defaultServiceLibName
+        if (serviceLibName == null || serviceLibName.length() == 0) {
+            serviceLibName = defaultServiceLibName
+        }
+
+        // Single point of truth for these names.
+        def serviceAction = "org.freedesktop.monado.ipc.CONNECT"
+        def shutdownAction = "org.freedesktop.monado.ipc.SHUTDOWN"
+        manifestPlaceholders = [
+                serviceActionName : serviceAction,
+                shutdownActionName: shutdownAction
+        ]
+        buildConfigField("String", "SERVICE_ACTION", "\"${serviceAction}\"")
+        buildConfigField("String", "SHUTDOWN_ACTION", "\"${shutdownAction}\"")
+        buildConfigField("Long", "WATCHDOG_TIMEOUT_MILLISECONDS", "1500L")
+        buildConfigField("String", "SERVICE_LIB_NAME", "\"${serviceLibName}\"")
+    }
+
+    buildTypes {
+        release {
+            minifyEnabled false
+            // Gradle plugin produces proguard-android-optimize.txt from @Keep annotations
+            proguardFiles getDefaultProguardFile('proguard-android-optimize.txt'), 'proguard-rules.pro'
+        }
+    }
+
+    compileOptions {
+        sourceCompatibility JavaVersion.VERSION_17
+        targetCompatibility JavaVersion.VERSION_17
+    }
+    kotlinOptions {
+        jvmTarget = JavaVersion.VERSION_17
+    }
+    packagingOptions {
+        resources {
+            excludes += ['META-INF/*.kotlin_module']
+        }
+    }
+    namespace 'org.freedesktop.monado.ipc'
+    lint {
+        fatal 'StopShip'
+    }
+    buildFeatures {
+        aidl true
+        buildConfig true
+    }
+}
+
+dependencies {
+    implementation project(':src:xrt:auxiliary')
+    implementation "androidx.annotation:annotation:$androidxAnnotationVersion"
+    implementation "androidx.core:core-ktx:$androidxCoreVersion"
+    implementation "org.jetbrains.kotlin:kotlin-stdlib-jdk8:$kotlinVersion"
+
+    // for Hilt dependency injection
+    api "com.google.dagger:hilt-android:$hiltVersion"
+    kapt "com.google.dagger:hilt-compiler:$hiltVersion"
+}
+
+spotless {
+    java {
+        target 'src/main/java/**/*.java'
+        // apply a specific flavor of google-java-format.
+        googleJavaFormat('1.18.1').aosp().reflowLongStrings()
+        // fix formatting of type annotations.
+        formatAnnotations()
+    }
+
+    kotlin {
+        target 'src/main/java/**/*.kt'
+        // Use ktfmt(https://github.com/facebook/ktfmt) as the default Kotlin formatter.
+        ktfmt("$ktfmtVersion").kotlinlangStyle()
+    }
+}

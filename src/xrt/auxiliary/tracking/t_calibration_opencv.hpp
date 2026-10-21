@@ -1,0 +1,301 @@
+// Copyright 2019-2020, Collabora, Ltd.
+// SPDX-License-Identifier: BSL-1.0
+/*!
+ * @file
+ * @brief  OpenCV calibration helpers.
+ * @author Pete Black <pblack@collabora.com>
+ * @author Jakob Bornecrantz <jakob@collabora.com>
+ * @author Rylie Pavlik <rylie.pavlik@collabora.com>
+ * @ingroup aux_tracking
+ */
+
+#pragma once
+
+#ifndef __cplusplus
+#error "This header is C++-only."
+#endif
+
+#include "tracking/t_tracking.h"
+
+#include <opencv2/opencv.hpp>
+#include <sys/stat.h>
+
+namespace xrt::auxiliary::tracking {
+
+static inline size_t
+t_num_opencv_params_from_distortion_model(const enum t_camera_distortion_model model)
+{
+	switch (model) {
+	case T_DISTORTION_WMR:
+		// OpenCV doesn't know what to do with codx, cody or rpmax. We reinterpret it as
+		// T_DISTORTION_OPENCV_RADTAN_8.
+		return t_num_params_from_distortion_model(T_DISTORTION_OPENCV_RADTAN_8);
+		break;
+	default: return t_num_params_from_distortion_model(model);
+	}
+}
+
+/*!
+ * @brief Determines whether a camera distortion model is suitable for use in OpenCV as a fisheye distortion.
+ *
+ * @param model The distortion model in question.
+ */
+static inline bool
+t_camera_distortion_model_is_opencv_fisheye(const enum t_camera_distortion_model model)
+{
+	return model == T_DISTORTION_FISHEYE_KB4;
+}
+
+/*!
+ * @brief Determines whether a camera distortion model is suitable for use in OpenCV as a non-fisheye distortion.
+ *
+ * @param model The distortion model in question.
+ */
+static inline bool
+t_camera_distortion_model_is_opencv_non_fisheye(const enum t_camera_distortion_model model)
+{
+	switch (model) {
+	case T_DISTORTION_OPENCV_RADTAN_5:
+	case T_DISTORTION_OPENCV_RADTAN_8:
+	case T_DISTORTION_OPENCV_RADTAN_14:
+	// @note WMR is not supported by OpenCV, but we re-interpret it into a format which is, so this is also valid.
+	case T_DISTORTION_WMR: return true;
+	default: return false;
+	}
+}
+
+/*!
+ * @brief Essential calibration data wrapped for C++.
+ *
+ * Like the cv::Mat that it holds, this object does not own all the memory
+ * it points to!
+ */
+struct CameraCalibrationWrapper
+{
+	t_camera_calibration &base;
+	xrt_size &image_size_pixels;
+	const cv::Size image_size_pixels_cv;
+	cv::Mat_<double> intrinsics_mat;
+	cv::Mat_<double> distortion_mat;
+	enum t_camera_distortion_model &distortion_model;
+
+	CameraCalibrationWrapper(t_camera_calibration &calib)
+	    : base(calib),                                                                //
+	      image_size_pixels(calib.image_size_pixels),                                 //
+	      image_size_pixels_cv(calib.image_size_pixels.w, calib.image_size_pixels.h), //
+	      intrinsics_mat(3, 3, &calib.intrinsics[0][0]),                              //
+	      distortion_mat(t_num_opencv_params_from_distortion_model(base.distortion_model),
+	                     1,
+	                     &calib.distortion_parameters_as_array[0]), //
+	      distortion_model(calib.distortion_model)
+	{
+		if (base.distortion_model == T_DISTORTION_WMR) {
+			U_LOG_W("Reinterpreting T_DISTORTION_WMR model as T_DISTORTION_OPENCV_RADTAN_8!");
+		}
+		assert(isDataStorageValid());
+	}
+
+	//! Try to verify nothing was reallocated.
+	bool
+	isDataStorageValid() const noexcept
+	{
+		return intrinsics_mat.size() == cv::Size(3, 3) &&
+		       (double *)intrinsics_mat.data == &(base.intrinsics[0][0]) &&
+		       (base.distortion_model != T_DISTORTION_FISHEYE_KB4 || distortion_mat.size() == cv::Size(1, 4)) &&
+		       distortion_mat.size() ==
+		           cv::Size(1, t_num_opencv_params_from_distortion_model(base.distortion_model)) &&
+		       (double *)distortion_mat.data == &(base.distortion_parameters_as_array[0]);
+	}
+};
+
+
+/*!
+ * @brief Essential stereo calibration data wrapped for C++.
+ *
+ * Like the cv::Mat that it holds, this object does not own (all) the
+ * memory it points to!
+ */
+struct StereoCameraCalibrationWrapper
+{
+	t_stereo_camera_calibration *base;
+	CameraCalibrationWrapper view[2];
+	cv::Mat_<double> camera_translation_mat;
+	cv::Mat_<double> camera_rotation_mat;
+	cv::Mat_<double> camera_essential_mat;
+	cv::Mat_<double> camera_fundamental_mat;
+
+
+	static t_stereo_camera_calibration *
+	allocData(enum t_camera_distortion_model distortion_model)
+	{
+		t_stereo_camera_calibration *data_ptr = NULL;
+		t_stereo_camera_calibration_alloc(&data_ptr, distortion_model);
+		return data_ptr;
+	}
+
+	StereoCameraCalibrationWrapper(t_stereo_camera_calibration *stereo)
+	    : base(stereo), view{CameraCalibrationWrapper{stereo->view[0]}, CameraCalibrationWrapper{stereo->view[1]}},
+	      camera_translation_mat(3, 1, &stereo->camera_translation[0]),
+	      camera_rotation_mat(3, 3, &stereo->camera_rotation[0][0]),
+	      camera_essential_mat(3, 3, &stereo->camera_essential[0][0]),
+	      camera_fundamental_mat(3, 3, &stereo->camera_fundamental[0][0])
+	{
+		// Correct reference counting.
+		t_stereo_camera_calibration *temp = NULL;
+		t_stereo_camera_calibration_reference(&temp, stereo);
+
+		assert(isDataStorageValid());
+	}
+
+	StereoCameraCalibrationWrapper(enum t_camera_distortion_model distortion_model)
+	    : StereoCameraCalibrationWrapper(allocData(distortion_model))
+	{
+
+		// The function allocData returns with a ref count of one,
+		// the constructor increments the refcount with one,
+		// so to correct it we need to decrement the ref count with one.
+		t_stereo_camera_calibration *tmp = base;
+		t_stereo_camera_calibration_reference(&tmp, NULL);
+	}
+
+	~StereoCameraCalibrationWrapper()
+	{
+		t_stereo_camera_calibration_reference(&base, NULL);
+	}
+
+	bool
+	isDataStorageValid() const noexcept
+	{
+		return camera_translation_mat.size() == cv::Size(1, 3) &&
+		       (double *)camera_translation_mat.data == &base->camera_translation[0] &&
+
+		       camera_rotation_mat.size() == cv::Size(3, 3) &&
+		       (double *)camera_rotation_mat.data == &base->camera_rotation[0][0] &&
+
+		       camera_essential_mat.size() == cv::Size(3, 3) &&
+		       (double *)camera_essential_mat.data == &base->camera_essential[0][0] &&
+
+		       camera_fundamental_mat.size() == cv::Size(3, 3) &&
+		       (double *)camera_fundamental_mat.data == &base->camera_fundamental[0][0] &&
+
+		       view[0].isDataStorageValid() && view[1].isDataStorageValid();
+	}
+};
+
+
+/*!
+ * @brief An x,y pair of matrices for the remap() function.
+ *
+ * @see calibration_get_undistort_map
+ */
+struct RemapPair
+{
+	cv::Mat remap_x;
+	cv::Mat remap_y;
+};
+
+/*!
+ * @brief Prepare undistortion/normalization remap structures for a rectilinear
+ * or fisheye image.
+ *
+ * @param calib A single camera calibration structure.
+ * @param rectify_transform_optional A rectification transform to apply, if
+ * desired.
+ * @param new_camera_matrix_optional Unlike OpenCV, the default/empty matrix
+ * here uses the input camera matrix as your output camera matrix.
+ */
+RemapPair
+calibration_get_undistort_map(t_camera_calibration &calib,
+                              cv::InputArray rectify_transform_optional = cv::noArray(),
+                              cv::Mat new_camera_matrix_optional = cv::Mat());
+
+/*!
+ * @brief Rectification, rotation, projection data for a single view in a stereo
+ * pair.
+ *
+ * @see StereoRectificationMaps
+ */
+struct ViewRectification
+{
+	RemapPair rectify;
+	cv::Mat rotation_mat = {};
+	cv::Mat projection_mat = {};
+};
+
+/*!
+ * @brief Rectification maps as well as transforms for a stereo camera.
+ *
+ * Computed in the constructor from saved calibration data.
+ */
+struct StereoRectificationMaps
+{
+	ViewRectification view[2];
+
+	//! Disparity and position to camera world coordinates.
+	cv::Mat disparity_to_depth_mat = {};
+
+	/*!
+	 * @brief Constructor - produces rectification data for a stereo camera
+	 * based on calibration data.
+	 */
+	StereoRectificationMaps(t_stereo_camera_calibration *data);
+};
+
+
+/*!
+ * @brief Provides cached, precomputed normalized image coordinates from original, distorted ones.
+ *
+ * Populates internal structures using cv::undistortPoints() and performs
+ * subpixel sampling to interpolate for each query. Essentially, this class lets
+ * you perform cv::undistortPoints() while caching the initial setup work
+ * required for that function.
+ */
+class NormalizedCoordsCache
+{
+public:
+	/*!
+	 * @brief Set up the precomputed cache for a given camera.
+	 *
+	 * @param size Size of the image in pixels
+	 * @param distortion_model Model used with `distortion`
+	 * @param intrinsics Camera intrinsics matrix
+	 * @param distortion Distortion coefficients
+	 * @param rectification Rectification matrix - corresponds to parameter
+	 * `R` to cv::undistortPoints().
+	 * @param new_camera_or_projection_matrix A new 3x3 camera matrix or
+	 * 3x4 projection matrix - corresponds to parameter `P` to
+	 * cv::undistortPoints().
+	 */
+	NormalizedCoordsCache(cv::Size size,
+	                      t_camera_distortion_model distortion_model,
+	                      cv::InputArray intrinsics,
+	                      cv::InputArray distortion,
+	                      cv::InputArray rectification = cv::noArray(),
+	                      cv::InputArray new_camera_or_projection_matrix = cv::noArray());
+
+	/*!
+	 * @brief Get normalized, undistorted coordinates from a point in the
+	 * original (distorted, etc.) image.
+	 *
+	 * @param origCoords Image coordinates in original image
+	 *
+	 * @return Corresponding undistorted coordinates in a "normalized" image
+	 */
+	cv::Vec2f
+	getNormalizedImageCoords(cv::Point2f origCoords) const;
+
+	/*!
+	 * @brief Get normalized vector in the camera-space direction
+	 * corresponding to the original (distorted, etc.) image coordinates.
+	 *
+	 * Note that the Z component will be negative by convention.
+	 */
+	cv::Vec3f
+	getNormalizedVector(cv::Point2f origCoords) const;
+
+private:
+	cv::Mat_<float> cacheX_;
+	cv::Mat_<float> cacheY_;
+};
+
+} // namespace xrt::auxiliary::tracking

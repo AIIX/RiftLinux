@@ -1,0 +1,57 @@
+{
+    "$schema": "https://proclamation.gitlab.io/proclamation/proclamation.schema.json",
+    "#": "This is a config file for Proclamation, the changelog combiner: https://gitlab.com/proclamation/proclamation",
+    "SPDX-License-Identifier: CC0-1.0": "",
+    "SPDX-FileCopyrightText: 2020-2025 Collabora, Ltd. and the Proclamation contributors": "",
+    "project_name": "Monado",
+    "base_url": "https://gitlab.freedesktop.org/monado/monado",
+    "news_filename": "../CHANGELOG.md",
+    "sections": {
+        "Major changes": {
+            "directory": "big"
+        },
+        "XRT Interface": {
+            "directory": "xrt",
+            "sort_by_prefix": true
+        },
+        "libmonado Interface": {
+            "directory": "libmonado",
+            "sort_by_prefix": true
+        },
+        "State Trackers": {
+            "directory": "state_trackers",
+            "sort_by_prefix": true
+        },
+        "Drivers": {
+            "directory": "drivers",
+            "sort_by_prefix": true
+        },
+        "IPC": {
+            "directory": "ipc",
+            "sort_by_prefix": true
+        },
+        "Compositor": {
+            "directory": "compositor",
+            "sort_by_prefix": true
+        },
+        "Tracking": {
+            "directory": "tracking",
+            "sort_by_prefix": true
+        },
+        "Helper Libraries": {
+            "directory": "auxiliary",
+            "sort_by_prefix": true
+        },
+        "Documentation": {
+            "directory": "doc"
+        },
+        "Misc. Features": {
+            "directory": "misc_features",
+            "sort_by_prefix": true
+        },
+        "Misc. Fixes": {
+            "directory": "misc_fixes",
+            "sort_by_prefix": true
+        }
+    }
+}

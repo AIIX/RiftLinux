@@ -1,0 +1,54 @@
+// SPDX-FileCopyrightText: 2026 Aditya Mehra <aix.m@outlook.com>
+// SPDX-License-Identifier: BSL-1.0
+// Author: Aditya Mehra <aix.m@outlook.com>
+//
+// Motion smoothing: the in-between frame. Each pixel shows the newest frame's content that has moved
+// there by the fraction of a frame's motion that has passed: the content at s moves to s - alpha * v(s), so the pixel
+// y shows s with s = y + alpha * v(s), found by a few fixed-point steps on the smooth (bilinear) field. No blocks: the
+// picture stretches gently where motion changes (as ASW's mesh warp does). Outside the view's rect the image is copied
+// as it is, so everything the distortion pass reads stays the same. With a fraction of 0 the pass copies the frame
+// (texel centres), how each new frame is kept.
+//
+// push.v0: the view's normalised rect; push.v1.x: the fraction; push.v1.yz: half-size pixels per frame pixel;
+// push.v1.w: field cell size in half-size pixels; push.i0.x: fixed-point steps.
+
+#version 460
+#extension GL_GOOGLE_include_directive : require
+#include "motion.inc.glsl"
+
+layout(set = 0, binding = 0) uniform sampler2D source;
+layout(set = 0, binding = 1) uniform sampler2D field;
+layout(set = 0, binding = 5, rgba16f) uniform writeonly restrict image2D target;
+
+void
+main()
+{
+	ivec2 size = imageSize(target);
+	ivec2 xy = ivec2(gl_GlobalInvocationID.xy);
+	if (any(greaterThanEqual(xy, size))) {
+		return;
+	}
+
+	vec2 rect_min = push.v0.xy * vec2(size);
+	vec2 rect_size = push.v0.zw * vec2(size);
+	vec2 local = (vec2(xy) + 0.5 - rect_min) / rect_size;
+	if (any(lessThan(local, vec2(0.0))) || any(greaterThanEqual(local, vec2(1.0)))) {
+		imageStore(target, xy, texelFetch(source, xy, 0));
+		return;
+	}
+
+	const float alpha = push.v1.x;
+	const vec2 scale = push.v1.yz;
+	const vec2 s0 = (vec2(xy) + 0.5 - rect_min) * scale;
+	vec2 s = s0;
+	if (alpha != 0.0) {
+		const vec2 cells = vec2(textureSize(field, 0)) * push.v1.w;
+		for (int k = 0; k < push.i0.x; k++) {
+			vec2 v = textureLod(field, s / cells, 0.0).xy;
+			s = s0 + alpha * v;
+		}
+	}
+	vec2 p = rect_min + s / scale;
+	p = clamp(p, rect_min + 0.5, rect_min + rect_size - 0.5);
+	imageStore(target, xy, textureLod(source, p / vec2(size), 0.0));
+}

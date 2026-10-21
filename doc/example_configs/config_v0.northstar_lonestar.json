@@ -1,0 +1,47 @@
+{
+	"$schema": "https://monado.pages.freedesktop.org/monado/config_v0.schema.json",
+	"active": "tracking",
+	"tracking": {
+		"tracking_overrides": [
+			{
+				"target_device_serial": "North Star",
+				"tracker_device_serial": "Intel RealSense Device-SLAM",
+				"type": "direct",
+				"offset": {
+					"orientation": {
+						"x": -0.102931,
+						"y": 0,
+						"z": 0,
+						"w": 0.994689
+					},
+					"position": {
+						"x": 0,
+						"y": 0.0683,
+						"z": -0.0744
+					}
+				},
+				"xrt_input_name": "XRT_INPUT_GENERIC_TRACKER_POSE"
+			},
+			{
+				"target_device_serial": "Leap Motion v2 driver",
+				"tracker_device_serial": "Intel RealSense Device-SLAM",
+				"type": "attached",
+				"offset": {
+					"orientation": {
+						"x": 0,
+						"y": 0,
+						"z": 0,
+						"w": 1
+					},
+					"position": {
+						"x": 0,
+						"y": 0.005,
+						"z": 0
+					}
+				},
+				"xrt_input_name": "XRT_INPUT_GENERIC_TRACKER_POSE"
+			}
+		],
+		"version": 0
+	}
+}

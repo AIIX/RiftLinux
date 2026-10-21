@@ -1,0 +1,13 @@
+# SPDX-FileCopyrightText: 2026 Aditya Mehra <aix.m@outlook.com>
+# SPDX-License-Identifier: BSL-1.0
+# Dolphin's (KDE) right-click entry for programs: "Run with the Rift".
+[Desktop Entry]
+Type=Service
+MimeType=application/x-executable;application/x-pie-executable;application/vnd.appimage;application/x-shellscript;application/x-desktop;
+Actions=riftlinux-run
+X-KDE-Priority=TopLevel
+
+[Desktop Action riftlinux-run]
+Name=Run with the Rift (RiftLinux)
+Icon=riftlinux
+Exec=riftlinux-run %f

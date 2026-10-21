@@ -1,0 +1,10 @@
+# SPDX-FileCopyrightText: 2026 Aditya Mehra <aix.m@outlook.com>
+# SPDX-License-Identifier: BSL-1.0
+[Desktop Entry]
+Type=Application
+Name=Oculus Rift CV1 driver (RiftLinux)
+Comment=Keeps the Rift CV1 driver registered with SteamVR
+Exec=/usr/bin/riftlinux-setup register --quiet
+NoDisplay=true
+Terminal=false
+X-GNOME-Autostart-enabled=true

@@ -1,0 +1,84 @@
+// Copyright 2020-2025, Collabora, Ltd.
+// SPDX-License-Identifier: BSL-1.0
+
+plugins {
+    id 'com.android.library'
+    id 'kotlin-android'
+
+    // Hilt dependency injection
+    id 'kotlin-kapt'
+    id 'dagger.hilt.android.plugin'
+
+    // SVG files in the "raw" resource directory will be transformed into vector drawables of the same name.
+    id 'com.quittle.svg-2-android-vector'
+
+    // Use spotless to format Java and Kotlin code.
+    id 'com.diffplug.spotless'
+}
+
+spotless {
+    java {
+        target 'src/main/java/**/*.java'
+        // apply a specific flavor of google-java-format.
+        googleJavaFormat('1.18.1').aosp().reflowLongStrings()
+        // fix formatting of type annotations.
+        formatAnnotations()
+    }
+
+    kotlin {
+        target 'src/main/java/**/*.kt'
+        // Use ktfmt(https://github.com/facebook/ktfmt) as the default Kotlin formatter. .
+        ktfmt("$ktfmtVersion").kotlinlangStyle()
+    }
+}
+
+android {
+    compileSdk project.sharedCompileSdk
+    buildToolsVersion = buildToolsVersion
+
+    defaultConfig {
+        minSdkVersion project.sharedMinSdk
+        targetSdkVersion project.sharedTargetSdk
+    }
+
+    buildTypes {
+        release {
+            minifyEnabled false
+            // Gradle plugin produces proguard-android-optimize.txt from @Keep annotations
+            proguardFiles getDefaultProguardFile('proguard-android-optimize.txt'), 'proguard-rules.pro'
+        }
+    }
+
+    compileOptions {
+        sourceCompatibility JavaVersion.VERSION_17
+        targetCompatibility JavaVersion.VERSION_17
+    }
+    kotlinOptions {
+        jvmTarget = JavaVersion.VERSION_17
+    }
+    packagingOptions {
+        resources {
+            excludes += ['META-INF/*.kotlin_module']
+        }
+    }
+    namespace 'org.freedesktop.monado.android_common'
+    lint {
+        fatal 'StopShip'
+    }
+}
+
+dependencies {
+    implementation project(':src:xrt:auxiliary')
+    implementation "androidx.appcompat:appcompat:$androidxAppCompatVersion"
+    implementation "org.jetbrains.kotlin:kotlin-stdlib:$kotlinVersion"
+    implementation "androidx.constraintlayout:constraintlayout:$androidxConstraintLayoutVersion"
+    implementation "com.google.android.material:material:$materialVersion"
+
+    // Not directly used but included to avoid version conflicts
+    implementation "androidx.lifecycle:lifecycle-viewmodel:$androidxLifecycleVersion"
+    implementation "androidx.lifecycle:lifecycle-viewmodel-ktx:$androidxLifecycleVersion"
+
+    // for Hilt dependency injection
+    implementation "com.google.dagger:hilt-android:$hiltVersion"
+    kapt "com.google.dagger:hilt-compiler:$hiltVersion"
+}

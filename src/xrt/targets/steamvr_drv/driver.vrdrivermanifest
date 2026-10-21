@@ -1,0 +1,12 @@
+{
+	"alwaysActivate": false,
+	"name" : "monado",
+	"directory" : "",
+	"resourceOnly" : false,
+
+	"hmd_presence" :
+	[
+		"2833.0031"
+	],
+	"redirectsDisplay": true
+}

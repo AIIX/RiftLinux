@@ -1,0 +1,18 @@
+# SPDX-FileCopyrightText: 2026 Aditya Mehra <aix.m@outlook.com>
+# SPDX-License-Identifier: BSL-1.0
+[Desktop Entry]
+Type=Application
+Name=RiftLinux Runtime
+GenericName=OpenXR runtime for the Rift CV1
+Comment=Runs OpenXR applications on the Rift CV1 without SteamVR. Open a program with it to run that program on the Rift.
+Icon=riftlinux
+Exec=riftlinux-run %f
+Terminal=false
+Categories=Game;
+Keywords=VR;OpenXR;Rift;Oculus;
+MimeType=application/x-executable;application/x-pie-executable;application/vnd.appimage;application/x-shellscript;application/x-desktop;
+Actions=stop;
+
+[Desktop Action stop]
+Name=Stop RiftLinux Runtime
+Exec=riftlinux-runtime --stop

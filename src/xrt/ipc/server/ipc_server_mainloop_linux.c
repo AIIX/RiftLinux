@@ -1,0 +1,364 @@
+// Copyright 2020-2021, Collabora, Ltd.
+// Copyright 2025, NVIDIA CORPORATION.
+// SPDX-FileCopyrightText: 2026 Aditya Mehra <aix.m@outlook.com>
+// SPDX-License-Identifier: BSL-1.0
+/*!
+ * @file
+ * @brief  Server mainloop details on Linux.
+ * @author Pete Black <pblack@collabora.com>
+ * @author Jakob Bornecrantz <jakob@collabora.com>
+ * @author Rylie Pavlik <rylie.pavlik@collabora.com>
+ * @ingroup ipc_server
+ */
+
+#include "xrt/xrt_device.h"
+#include "xrt/xrt_instance.h"
+#include "xrt/xrt_compositor.h"
+#include "xrt/xrt_config_have.h"
+#include "xrt/xrt_config_os.h"
+
+#include "os/os_time.h"
+#include "util/u_var.h"
+#include "util/u_misc.h"
+#include "util/u_debug.h"
+#include "util/u_trace_marker.h"
+#include "util/u_file.h"
+#include "util/u_truncate_printf.h"
+
+#include "shared/ipc_shmem.h"
+#include "server/ipc_server.h"
+
+#include <stdlib.h>
+#include <unistd.h>
+#include <stdbool.h>
+#include <sys/types.h>
+#include <sys/stat.h>
+#include <sys/mman.h>
+#include <sys/socket.h>
+#include <sys/un.h>
+#include <sys/epoll.h>
+#include <fcntl.h>
+#include <errno.h>
+#include <stdio.h>
+#include <string.h>
+#include <signal.h>
+#include <assert.h>
+#include <limits.h>
+#include "util/u_debug.h"
+
+#ifdef XRT_HAVE_SYSTEMD
+#include <systemd/sd-daemon.h>
+#endif
+
+
+/*
+ *
+ * Static functions.
+ *
+ */
+static int
+get_systemd_socket(struct ipc_server_mainloop *ml, int *out_fd)
+{
+#ifdef XRT_HAVE_SYSTEMD
+	// We may have been launched with socket activation
+	int num_fds = sd_listen_fds(0);
+	if (num_fds > 1) {
+		U_LOG_E("Too many file descriptors passed by systemd.");
+		return -1;
+	}
+	if (num_fds == 1) {
+		*out_fd = SD_LISTEN_FDS_START + 0;
+		ml->launched_by_socket = true;
+		U_LOG_D("Got existing socket from systemd.");
+	}
+#endif
+	return 0;
+}
+
+static int
+create_listen_socket(struct ipc_server_mainloop *ml, int *out_fd)
+{
+	// no fd provided
+	struct sockaddr_un addr = XRT_STRUCT_INIT;
+	int fd;
+	int ret;
+
+	fd = socket(PF_UNIX, SOCK_STREAM, 0);
+	if (fd < 0) {
+		U_LOG_E("Message Socket Create Error!");
+		return fd;
+	}
+
+
+	char sock_file[PATH_MAX];
+
+	int size = u_file_get_path_in_runtime_dir(XRT_IPC_MSG_SOCK_FILENAME, sock_file, PATH_MAX);
+	if (size == -1) {
+		U_LOG_E("Could not get socket file name");
+		return -1;
+	}
+
+	// Make sure the path fits.
+	const int dst_size = (int)ARRAY_SIZE(addr.sun_path);
+	if (size >= dst_size) {
+		U_LOG_E("Total IPC path too long (%i > %i)", size, dst_size);
+		return -1;
+	}
+
+	// Struct zero init at declaration.
+	addr.sun_family = AF_UNIX;
+	// Use truncate here to avoid warnings.
+	u_truncate_snprintf(addr.sun_path, dst_size, "%s", sock_file);
+
+	ret = bind(fd, (struct sockaddr *)&addr, sizeof(addr));
+
+#ifndef XRT_HAVE_LIBBSD
+	// Without libbsd's pid file nothing proves this is the only instance: the socket file is left from an instance
+	// that ended without removing it (killed, its terminal closed) when nothing answers on it. Removed then, else
+	// every later start fails on it.
+	if (ret < 0 && errno == EADDRINUSE) {
+		bool left = false;
+		int probe = socket(PF_UNIX, SOCK_STREAM, 0);
+		if (probe >= 0) {
+			left = connect(probe, (struct sockaddr *)&addr, sizeof(addr)) != 0 && errno == ECONNREFUSED;
+			close(probe);
+		}
+		if (left) {
+			U_LOG_W("Removing the socket file %s left by an earlier instance (nothing answers on it)", sock_file);
+			if (unlink(sock_file) == 0) {
+				ret = bind(fd, (struct sockaddr *)&addr, sizeof(addr));
+			}
+		} else {
+			errno = EADDRINUSE; // A running instance answers: the message below.
+		}
+	}
+#endif
+
+#ifdef XRT_HAVE_LIBBSD
+	// no other instance is running, or we would have never arrived here
+	if (ret < 0 && errno == EADDRINUSE) {
+		U_LOG_W("Removing stale socket file %s", sock_file);
+
+		ret = unlink(sock_file);
+		if (ret < 0) {
+			U_LOG_E("Failed to remove stale socket file %s: %s", sock_file, strerror(errno));
+			return ret;
+		}
+		ret = bind(fd, (struct sockaddr *)&addr, sizeof(addr));
+	}
+#endif
+
+	if (ret < 0) {
+		U_LOG_E("Could not bind socket to path %s: %s. Is the service running already?", sock_file,
+		        strerror(errno));
+#ifdef XRT_HAVE_SYSTEMD
+		U_LOG_E("Or, is the systemd unit monado.socket or monado-dev.socket active?");
+#endif
+		if (errno == EADDRINUSE) {
+			U_LOG_E("If monado-service is not running, delete %s before starting a new instance",
+			        sock_file);
+		}
+		close(fd);
+		return ret;
+	}
+	// Save for later
+	ml->socket_filename = strdup(sock_file);
+
+	ret = listen(fd, IPC_MAX_CLIENTS);
+	if (ret < 0) {
+		close(fd);
+		return ret;
+	}
+	U_LOG_D("Created listening socket %s.", sock_file);
+	*out_fd = fd;
+	return 0;
+}
+
+static int
+init_listen_socket(struct ipc_server_mainloop *ml)
+{
+	int fd = -1;
+	int ret;
+	ml->listen_socket = -1;
+
+	ret = get_systemd_socket(ml, &fd);
+	if (ret < 0) {
+		return ret;
+	}
+
+	if (fd == -1) {
+		ret = create_listen_socket(ml, &fd);
+		if (ret < 0) {
+			return ret;
+		}
+	}
+	// All ok!
+	ml->listen_socket = fd;
+	U_LOG_D("Listening socket is fd %d", ml->listen_socket);
+
+	return fd;
+}
+
+static volatile sig_atomic_t got_shutdown_signal = 0;
+
+static void
+shutdown_signal_handler(int sig)
+{
+	(void)sig;
+	got_shutdown_signal = 1;
+}
+
+static void
+install_signal_handlers(void)
+{
+	struct sigaction sa = {0};
+	sa.sa_handler = shutdown_signal_handler;
+	sigemptyset(&sa.sa_mask);
+	// SA_RESETHAND: after first signal, reset to default so a second signal kills immediately.
+	sa.sa_flags = SA_RESETHAND;
+	sigaction(SIGTERM, &sa, NULL);
+	sigaction(SIGINT, &sa, NULL);
+	// Its terminal closed (an SSH login ended): shut down as for the others, so the socket file goes and the
+	// headset is let go, instead of being killed by the default action.
+	sigaction(SIGHUP, &sa, NULL);
+}
+
+static int
+init_epoll(struct ipc_server_mainloop *ml, bool no_stdin)
+{
+	int ret = epoll_create1(EPOLL_CLOEXEC);
+	if (ret < 0) {
+		return ret;
+	}
+
+	ml->epoll_fd = ret;
+
+	struct epoll_event ev = {0};
+
+	if (!ml->launched_by_socket && !no_stdin) {
+		// Can't do this when launched by systemd socket activation by
+		// default.
+		// This polls stdin.
+		ev.events = EPOLLIN;
+		ev.data.fd = 0; // stdin
+		ret = epoll_ctl(ml->epoll_fd, EPOLL_CTL_ADD, 0, &ev);
+		if (ret < 0) {
+			U_LOG_E("epoll_ctl(stdin) failed '%i'", ret);
+			return ret;
+		}
+	}
+
+	ev.events = EPOLLIN;
+	ev.data.fd = ml->listen_socket;
+	ret = epoll_ctl(ml->epoll_fd, EPOLL_CTL_ADD, ml->listen_socket, &ev);
+	if (ret < 0) {
+		U_LOG_E("epoll_ctl(listen_socket) failed '%i'", ret);
+		return ret;
+	}
+
+	return 0;
+}
+
+static void
+handle_listen(struct ipc_server *vs, struct ipc_server_mainloop *ml)
+{
+	int ret = accept(ml->listen_socket, NULL, NULL);
+	if (ret < 0) {
+		U_LOG_E("accept '%i'", ret);
+		ipc_server_handle_failure(vs);
+		return;
+	}
+
+	// Call into the generic client connected handling code.
+	ipc_server_handle_client_connected(vs, ret);
+}
+
+#define NUM_POLL_EVENTS 8
+#define NO_SLEEP 0
+
+/*
+ *
+ * Exported functions
+ *
+ */
+
+void
+ipc_server_mainloop_poll(struct ipc_server *vs, struct ipc_server_mainloop *ml)
+{
+	IPC_TRACE_MARKER();
+
+	int epoll_fd = ml->epoll_fd;
+
+	struct epoll_event events[NUM_POLL_EVENTS] = {0};
+
+	// No sleeping, returns immediately.
+	int ret = epoll_wait(epoll_fd, events, NUM_POLL_EVENTS, NO_SLEEP);
+	if (ret < 0) {
+		U_LOG_E("epoll_wait failed with '%i'.", ret);
+		ipc_server_handle_failure(vs);
+		return;
+	}
+
+	// Check if a signal handler set the shutdown flag.
+	if (got_shutdown_signal) {
+		U_LOG_I("Got shutdown signal, shutting down.");
+		ipc_server_handle_shutdown_signal(vs);
+		return;
+	}
+
+	for (int i = 0; i < ret; i++) {
+		// If we get data on stdin, stop.
+		if (events[i].data.fd == 0) {
+			ipc_server_handle_shutdown_signal(vs);
+			return;
+		}
+
+		// Somebody new at the door.
+		if (events[i].data.fd == ml->listen_socket) {
+			handle_listen(vs, ml);
+		}
+	}
+}
+
+int
+ipc_server_mainloop_init(struct ipc_server_mainloop *ml, bool no_stdin)
+{
+	IPC_TRACE_MARKER();
+
+	int ret = init_listen_socket(ml);
+	if (ret < 0) {
+		ipc_server_mainloop_deinit(ml);
+		return ret;
+	}
+
+	install_signal_handlers();
+
+	ret = init_epoll(ml, no_stdin);
+	if (ret < 0) {
+		ipc_server_mainloop_deinit(ml);
+		return ret;
+	}
+	return 0;
+}
+
+void
+ipc_server_mainloop_deinit(struct ipc_server_mainloop *ml)
+{
+	IPC_TRACE_MARKER();
+
+	if (ml == NULL) {
+		return;
+	}
+	if (ml->listen_socket > 0) {
+		// Close socket on exit
+		close(ml->listen_socket);
+		ml->listen_socket = -1;
+		if (!ml->launched_by_socket && ml->socket_filename) {
+			// Unlink it too, but only if we bound it.
+			unlink(ml->socket_filename);
+			free(ml->socket_filename);
+			ml->socket_filename = NULL;
+		}
+	}
+	//! @todo close epoll_fd?
+}

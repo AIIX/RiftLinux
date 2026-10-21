@@ -1,0 +1,133 @@
+# SPDX-FileCopyrightText: 2026 Aditya Mehra <aix.m@outlook.com>
+# SPDX-License-Identifier: BSL-1.0
+
+name: Bug report
+description: Something does not work with your Rift CV1. Reports without the setup check and SteamVR's log cannot be acted on.
+title: "[Bug]: "
+labels: ["bug", "needs-triage"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for reporting. Please fill in every field: a report without `riftlinux-setup --json check` and SteamVR's log is marked as needing information.
+        Security problems do **not** go here: see [SECURITY.md](https://github.com/AIIX/RiftLinux/blob/main/SECURITY.md).
+
+  - type: checkboxes
+    id: prerequisites
+    attributes:
+      label: Before you file
+      options:
+        - label: I searched the [existing issues](https://github.com/AIIX/RiftLinux/issues?q=is%3Aissue) and the README's Known issues, and this is not among them.
+          required: true
+        - label: I am on the latest release and can still reproduce it.
+          required: true
+        - label: I quit SteamVR, started it again, and the problem is still there.
+          required: true
+
+  - type: input
+    id: version
+    attributes:
+      label: RiftLinux version
+      description: "`cat /usr/lib/riftlinux/steamvr/rift-cv1/VERSION`"
+      placeholder: e.g. 0.1.0+git20261018.abcdef123
+    validations:
+      required: true
+
+  - type: dropdown
+    id: install
+    attributes:
+      label: How did you install it?
+      options:
+        - ".deb package (Debian, Ubuntu and others)"
+        - "Arch package (Arch, CachyOS and others)"
+        - ".rpm package (Fedora and others)"
+        - "Tarball (install.sh)"
+        - "Built from source"
+    validations:
+      required: true
+
+  - type: input
+    id: system
+    attributes:
+      label: Distribution, desktop and session
+      placeholder: e.g. Ubuntu 25.04, GNOME 48, Wayland
+    validations:
+      required: true
+
+  - type: input
+    id: gpu
+    attributes:
+      label: Graphics card and driver version
+      placeholder: e.g. NVIDIA RTX 3080, driver 615.78
+    validations:
+      required: true
+
+  - type: input
+    id: steamvr
+    attributes:
+      label: SteamVR version, sensors and their USB ports
+      placeholder: e.g. SteamVR 2.17, two sensors on USB 3
+    validations:
+      required: true
+
+  - type: textarea
+    id: steps
+    attributes:
+      label: Steps to reproduce
+      description: Exact, numbered steps, including the game or app.
+      placeholder: |
+        1. Start SteamVR from Steam
+        2. Start ...
+        3. ...
+    validations:
+      required: true
+
+  - type: textarea
+    id: expected
+    attributes:
+      label: What you expected
+    validations:
+      required: true
+
+  - type: textarea
+    id: actual
+    attributes:
+      label: What happened instead
+      description: Include any message the headset, SteamVR or the desktop showed.
+    validations:
+      required: true
+
+  - type: textarea
+    id: check
+    attributes:
+      label: Output of riftlinux-setup --json check (required)
+      description: Run `riftlinux-setup --json check` and paste the whole output.
+      render: json
+    validations:
+      required: true
+
+  - type: textarea
+    id: log
+    attributes:
+      label: SteamVR's log (required)
+      description: |
+        From the session with the problem: `~/.local/share/Steam/logs/vrserver.txt` (the driver's lines start with `driver_monado`); for picture problems also `vrcompositor.txt`. Attach the files or paste the part around the problem. They contain your headset's serial numbers and your user name in paths; remove anything you prefer to keep private.
+      render: text
+    validations:
+      required: true
+
+  - type: textarea
+    id: recording
+    attributes:
+      label: A recording, for tracking problems (optional)
+      description: |
+        Run `riftlinux-setup record on`, start SteamVR and do what shows the problem, then attach (or link) the newest `~/.cache/riftlinux/riftlinux-*.ctdata` and `~/.steam/steam/logs/vrstartup-linux.txt`. Turn it off afterwards with `riftlinux-setup record off`.
+    validations:
+      required: false
+
+  - type: textarea
+    id: extra
+    attributes:
+      label: What you already tried (optional)
+    validations:
+      required: false

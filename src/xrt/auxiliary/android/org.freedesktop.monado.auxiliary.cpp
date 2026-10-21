@@ -1,0 +1,44 @@
+// Copyright 2020-2021, Collabora, Ltd.
+// SPDX-License-Identifier: BSL-1.0
+/*!
+ * @file
+ * @brief  Out-of-line implementations for partially-generated wrapper for the
+ * `org.freedesktop.monado.auxiliary` Java package.
+ * @author Rylie Pavlik <rylie.pavlik@collabora.com>
+ * @ingroup aux_android
+ */
+
+#include "org.freedesktop.monado.auxiliary.hpp"
+
+namespace wrap {
+namespace org::freedesktop::monado::auxiliary {
+	MonadoView::Meta::Meta(jni::jclass clazz)
+	    : MetaBase(MonadoView::getTypeName(), clazz),
+	      attachToWindow(classRef().getStaticMethod(
+	          "attachToWindow",
+	          "(Landroid/content/Context;JLandroid/view/WindowManager$LayoutParams;)Lorg/freedesktop/monado/"
+	          "auxiliary/MonadoView;")),
+	      removeFromWindow(
+	          classRef().getStaticMethod("removeFromWindow", "(Lorg/freedesktop/monado/auxiliary/MonadoView;)V")),
+	      getDisplayMetrics(classRef().getStaticMethod("getDisplayMetrics",
+	                                                   "(Landroid/content/Context;)Landroid/util/DisplayMetrics;")),
+	      getDisplayRefreshRate(
+	          classRef().getStaticMethod("getDisplayRefreshRate", "(Landroid/content/Context;)F")),
+	      getSupportedRefreshRates(
+	          classRef().getStaticMethod("getSupportedRefreshRates", "(Landroid/content/Context;)[F")),
+	      getNativePointer(classRef().getMethod("getNativePointer", "()J")),
+	      markAsDiscardedByNative(classRef().getMethod("markAsDiscardedByNative", "()V")),
+	      waitGetSurfaceHolder(classRef().getMethod("waitGetSurfaceHolder", "(I)Landroid/view/SurfaceHolder;")),
+	      getDisplayModeIdWidth(
+	          classRef().getStaticMethod("getDisplayModeIdWidth", "(Landroid/content/Context;II)I")),
+	      getDisplayModeIdHeight(
+	          classRef().getStaticMethod("getDisplayModeIdHeight", "(Landroid/content/Context;II)I"))
+	{}
+
+	ActivityLifecycleListener::Meta::Meta(jni::jclass clazz)
+	    : MetaBase(ActivityLifecycleListener::getTypeName(), clazz), init(classRef().getMethod("<init>", "(J)V")),
+	      registerCallback(classRef().getMethod("registerCallback", "(Landroid/app/Activity;)V")),
+	      unregisterCallback(classRef().getMethod("unregisterCallback", "(Landroid/app/Activity;)V"))
+	{}
+} // namespace org::freedesktop::monado::auxiliary
+} // namespace wrap

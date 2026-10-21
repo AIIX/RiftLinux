@@ -1,0 +1,180 @@
+{
+ "controller_type": "oculus_touch",
+ "description": "RiftLinux controller check: every Touch input",
+ "name": "RiftLinux controller check",
+ "bindings": {
+  "/actions/check": {
+   "sources": [
+    {
+     "path": "/user/hand/left/input/x",
+     "mode": "button",
+     "inputs": {
+      "click": {
+       "output": "/actions/check/in/left_x_click"
+      },
+      "touch": {
+       "output": "/actions/check/in/left_x_touch"
+      }
+     }
+    },
+    {
+     "path": "/user/hand/left/input/y",
+     "mode": "button",
+     "inputs": {
+      "click": {
+       "output": "/actions/check/in/left_y_click"
+      },
+      "touch": {
+       "output": "/actions/check/in/left_y_touch"
+      }
+     }
+    },
+    {
+     "path": "/user/hand/left/input/system",
+     "mode": "button",
+     "inputs": {
+      "click": {
+       "output": "/actions/check/in/left_menu_click"
+      }
+     }
+    },
+    {
+     "path": "/user/hand/left/input/trigger",
+     "mode": "trigger",
+     "inputs": {
+      "pull": {
+       "output": "/actions/check/in/left_trigger_value"
+      },
+      "click": {
+       "output": "/actions/check/in/left_trigger_click"
+      },
+      "touch": {
+       "output": "/actions/check/in/left_trigger_touch"
+      }
+     }
+    },
+    {
+     "path": "/user/hand/left/input/grip",
+     "mode": "trigger",
+     "inputs": {
+      "pull": {
+       "output": "/actions/check/in/left_grip_value"
+      },
+      "click": {
+       "output": "/actions/check/in/left_grip_click"
+      }
+     }
+    },
+    {
+     "path": "/user/hand/left/input/joystick",
+     "mode": "joystick",
+     "inputs": {
+      "position": {
+       "output": "/actions/check/in/left_stick"
+      },
+      "click": {
+       "output": "/actions/check/in/left_stick_click"
+      },
+      "touch": {
+       "output": "/actions/check/in/left_stick_touch"
+      }
+     }
+    },
+    {
+     "path": "/user/hand/left/input/thumbrest",
+     "mode": "button",
+     "inputs": {
+      "touch": {
+       "output": "/actions/check/in/left_thumbrest_touch"
+      }
+     }
+    },
+    {
+     "path": "/user/hand/right/input/a",
+     "mode": "button",
+     "inputs": {
+      "click": {
+       "output": "/actions/check/in/right_a_click"
+      },
+      "touch": {
+       "output": "/actions/check/in/right_a_touch"
+      }
+     }
+    },
+    {
+     "path": "/user/hand/right/input/b",
+     "mode": "button",
+     "inputs": {
+      "click": {
+       "output": "/actions/check/in/right_b_click"
+      },
+      "touch": {
+       "output": "/actions/check/in/right_b_touch"
+      }
+     }
+    },
+    {
+     "path": "/user/hand/right/input/trigger",
+     "mode": "trigger",
+     "inputs": {
+      "pull": {
+       "output": "/actions/check/in/right_trigger_value"
+      },
+      "click": {
+       "output": "/actions/check/in/right_trigger_click"
+      },
+      "touch": {
+       "output": "/actions/check/in/right_trigger_touch"
+      }
+     }
+    },
+    {
+     "path": "/user/hand/right/input/grip",
+     "mode": "trigger",
+     "inputs": {
+      "pull": {
+       "output": "/actions/check/in/right_grip_value"
+      },
+      "click": {
+       "output": "/actions/check/in/right_grip_click"
+      }
+     }
+    },
+    {
+     "path": "/user/hand/right/input/joystick",
+     "mode": "joystick",
+     "inputs": {
+      "position": {
+       "output": "/actions/check/in/right_stick"
+      },
+      "click": {
+       "output": "/actions/check/in/right_stick_click"
+      },
+      "touch": {
+       "output": "/actions/check/in/right_stick_touch"
+      }
+     }
+    },
+    {
+     "path": "/user/hand/right/input/thumbrest",
+     "mode": "button",
+     "inputs": {
+      "touch": {
+       "output": "/actions/check/in/right_thumbrest_touch"
+      }
+     }
+    }
+   ],
+   "skeleton": [
+    {
+     "output": "/actions/check/in/left_skeleton",
+     "path": "/user/hand/left/input/skeleton/left"
+    },
+    {
+     "output": "/actions/check/in/right_skeleton",
+     "path": "/user/hand/right/input/skeleton/right"
+    }
+   ]
+  }
+ }
+}

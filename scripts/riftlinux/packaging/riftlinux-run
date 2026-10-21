@@ -1,0 +1,113 @@
+#!/bin/sh
+# SPDX-FileCopyrightText: 2026 Aditya Mehra <aix.m@outlook.com>
+# SPDX-License-Identifier: BSL-1.0
+#
+# Runs an OpenXR application on the Rift CV1 with RiftLinux's own runtime, without SteamVR: starts the runtime when it
+# is not running (and stops it again when the application ends), and runs the application with XR_RUNTIME_JSON set.
+# Takes a program, an AppImage, a script or a .desktop launcher: the file managers' "Run with the Rift" (Dolphin) and
+# "Open With" (GNOME Files) use it. Without one it starts the runtime, as the app menu's "RiftLinux Runtime".
+# Usage: riftlinux-run [program-or-launcher [arguments]]
+D=${RIFTLINUX_NATIVE_DIR:-/usr/lib/riftlinux/native}
+# The way the kernel names the running program (it is found by that name): no doubled or trailing slashes, links followed.
+D=$(readlink -f "$D" 2>/dev/null || echo "$D")
+LOG="${XDG_CACHE_HOME:-$HOME/.cache}/riftlinux/runtime.log"
+mkdir -p "$(dirname "$LOG")" 2>/dev/null
+
+[ $# -eq 0 ] && exec riftlinux-runtime
+
+# Started from a remote (SSH) login: the desktop session's display and D-Bus, as the user's service manager has them;
+# the application needs them as the runtime does (WayVR shares the desktop through them). An SSH login's own display
+# (X forwarding, DISPLAY=localhost:10.0) is another computer's screen: replaced too. A session folder already set
+# stays (this and the runtime must agree on where its socket is).
+if { [ -n "$SSH_CONNECTION" ] || { [ -z "$WAYLAND_DISPLAY" ] && [ -z "$DISPLAY" ]; }; } &&
+	command -v systemctl >/dev/null 2>&1; then
+	ENV=$(systemctl --user show-environment 2>/dev/null)
+	# Only when a desktop session runs: its display replaces what the login has (none, or SSH's X forwarding).
+	case "$ENV" in
+	*WAYLAND_DISPLAY=* | *DISPLAY=*)
+		unset WAYLAND_DISPLAY DISPLAY
+		while IFS='=' read -r k v; do
+			case "$k" in
+			WAYLAND_DISPLAY | DISPLAY | XAUTHORITY | DBUS_SESSION_BUS_ADDRESS | XDG_SESSION_TYPE) export "$k=$v" ;;
+			XDG_RUNTIME_DIR) [ -n "$XDG_RUNTIME_DIR" ] || export "$k=$v" ;;
+			esac
+		done <<EOF
+$ENV
+EOF
+		;;
+	esac
+fi
+
+say() {
+	if [ -t 1 ]; then
+		echo "$1"
+	else
+		echo "$1" >&2
+		command -v notify-send >/dev/null 2>&1 && notify-send -a RiftLinux -i riftlinux "Run with the Rift" "$1" 2>/dev/null
+	fi
+	echo "$(date '+%F %T') $1" >>"$LOG" 2>/dev/null
+}
+
+TARGET=$1
+shift
+NAME=$(basename "$TARGET")
+DIR=
+case "$TARGET" in
+*.desktop)
+	# A launcher: its command (the field codes for files and URLs dropped) and working folder, as the desktop runs it.
+	EXEC=$(sed -n 's/^Exec=//p' "$TARGET" | head -n 1 | sed 's/ *%[fFuUdDnNickvm]//g; s/%%/%/g')
+	DIR=$(sed -n 's/^Path=//p' "$TARGET" | head -n 1)
+	NAME=$(sed -n 's/^Name=//p' "$TARGET" | head -n 1)
+	[ -n "$EXEC" ] || { say "$TARGET has no command to run."; exit 1; }
+	set -- sh -c "$EXEC"
+	;;
+*)
+	[ -f "$TARGET" ] || { say "$TARGET: no such file."; exit 1; }
+	[ -x "$TARGET" ] || { say "$NAME is not marked as a program (Properties, or chmod +x)."; exit 1; }
+	set -- "$TARGET" "$@"
+	;;
+esac
+
+# The runtime: started for this application when it is not running, and then stopped again after it.
+started=0
+if [ "$(riftlinux-runtime --status)" != "running" ]; then
+	SOCK="${XDG_RUNTIME_DIR:-$HOME/.cache}/monado_comp_ipc"
+	# A socket file left by an earlier run is no sign of this one: up once its socket is a new file.
+	OLD=$(stat -c %i "$SOCK" 2>/dev/null)
+	N=$(cat "$LOG" 2>/dev/null | wc -l)
+	riftlinux-runtime </dev/null >/dev/null 2>&1 &
+	RT=$!
+	up=0
+	i=0
+	while [ $i -lt 60 ] && kill -0 "$RT" 2>/dev/null; do
+		if [ "$(riftlinux-runtime --status)" = "running" ] && [ -S "$SOCK" ] &&
+			[ "$(stat -c %i "$SOCK" 2>/dev/null)" != "$OLD" ]; then
+			up=1
+			break
+		fi
+		sleep 0.5
+		i=$((i + 1))
+	done
+	if [ "$up" -eq 0 ]; then
+		# Why, from this run's part of the log: the service's first error, else the runtime's own last message
+		# (SteamVR running, ...).
+		WHY=$(tail -n +"$((N + 1))" "$LOG" 2>/dev/null | grep -a -m 1 "^ERROR" | sed 's/^ERROR \[[^]]*\] //')
+		[ -n "$WHY" ] || WHY=$(tail -n +"$((N + 1))" "$LOG" 2>/dev/null | grep -a "^[0-9][0-9][0-9][0-9]-" |
+			grep -a -v " starting$" | tail -n 1 | cut -d' ' -f3-)
+		kill -0 "$RT" 2>/dev/null && riftlinux-runtime --stop >/dev/null 2>&1
+		say "The RiftLinux runtime did not start: ${WHY:-see $LOG}"
+		exit 1
+	fi
+	started=1
+fi
+
+say "Running $NAME on the Rift."
+if [ -n "$DIR" ]; then
+	cd "$DIR" || true
+fi
+XR_RUNTIME_JSON="$D/openxr_riftlinux.json" "$@"
+RC=$?
+if [ "$started" -eq 1 ]; then
+	riftlinux-runtime --stop >/dev/null 2>&1
+fi
+exit "$RC"

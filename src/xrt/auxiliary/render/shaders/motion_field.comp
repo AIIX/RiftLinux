@@ -1,0 +1,52 @@
+// SPDX-FileCopyrightText: 2026 Aditya Mehra <aix.m@outlook.com>
+// SPDX-License-Identifier: BSL-1.0
+// Author: Aditya Mehra <aix.m@outlook.com>
+//
+// Motion smoothing: the motion field, one vector per cell (4x4 pixels of half size with NVIDIA's
+// optical flow, 8x8 from the block matcher), in pixels of half size, pointing from the newest frame to where its
+// content was in the previous one. Vectors under push.v0.x pixels are dropped (noise of a still scene), and with the
+// engine's cost the vector is scaled down where the match is unsure (cost over 8 toward none at 24): least damage
+// in an offline evaluation on recorded sessions.
+//
+// push.i0.x: 1 = from the optical flow buffer (signed 10.5 fixed point, x in the low half), 0 = from the block field;
+// push.i0.y: 1 = with the cost buffer (one byte per cell).
+
+#version 460
+#extension GL_GOOGLE_include_directive : require
+#include "motion.inc.glsl"
+
+layout(set = 0, binding = 4, rgba16f) uniform readonly restrict image2D blocks;
+layout(set = 0, binding = 5, rgba16f) uniform writeonly restrict image2D field;
+layout(set = 0, binding = 7, std430) readonly restrict buffer Flow
+{
+	uint flow[];
+};
+layout(set = 0, binding = 8, std430) readonly restrict buffer Cost
+{
+	uint cost[];
+};
+
+void
+main()
+{
+	ivec2 size = imageSize(field);
+	ivec2 g = ivec2(gl_GlobalInvocationID.xy);
+	if (any(greaterThanEqual(g, size))) {
+		return;
+	}
+	vec2 v;
+	if (push.i0.x != 0) {
+		uint w = flow[g.y * size.x + g.x];
+		v = vec2(float(int(w << 16) >> 16), float(int(w) >> 16)) / 32.0;
+	} else {
+		v = imageLoad(blocks, g).xy;
+	}
+	if (length(v) < push.v0.x) {
+		v = vec2(0.0);
+	} else if (push.i0.y != 0) {
+		const uint i = uint(g.y * size.x + g.x);
+		const float c = float((cost[i / 4u] >> (8u * (i % 4u))) & 0xffu);
+		v *= clamp(1.0 - (c - 8.0) / 16.0, 0.0, 1.0);
+	}
+	imageStore(field, g, vec4(v, 0.0, 1.0));
+}

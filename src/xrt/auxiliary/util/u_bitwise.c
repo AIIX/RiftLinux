@@ -1,0 +1,43 @@
+// Copyright 2019-2020, Collabora, Ltd.
+// SPDX-License-Identifier: BSL-1.0
+/*!
+ * @file
+ * @brief  Functions for manipulating tightly packed data as bits.
+ * @author Jakob Bornecrantz <jakob@collabora.com>
+ * @author Pete Black <pete.black@collabora.com>
+ * @ingroup aux_util
+ */
+#include "util/u_bitwise.h"
+
+#include <assert.h>
+#include <limits.h>
+
+int
+get_bit(const unsigned char *b, int num)
+{
+	int index = num / CHAR_BIT;
+	return (b[index] >> ((CHAR_BIT - 1) - (num % CHAR_BIT))) & 1;
+}
+
+int
+get_bits(const unsigned char *b, int start, int num)
+{
+	int ret = 0;
+	for (int i = 0; i < num; i++) {
+		ret <<= 1;
+		ret |= get_bit(b, start + i);
+	}
+	return ret;
+}
+
+int
+sign_extend_13(uint32_t i)
+{
+	assert((i & ~UINT32_C(0x1FFF)) == 0);
+
+	struct
+	{
+		int value : 13;
+	} data = {i & 0x1FFF};
+	return data.value;
+}

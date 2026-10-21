@@ -1,0 +1,33 @@
+// SPDX-FileCopyrightText: 2026 Aditya Mehra <aix.m@outlook.com>
+// SPDX-License-Identifier: BSL-1.0
+// Author: Aditya Mehra <aix.m@outlook.com>
+//
+// Motion smoothing: one pyramid level, half the size of its source (a 2x2 box through the bilinear
+// sampler). From the frame itself it encodes to sRGB (block matching compares encoded values, as the eye sees
+// differences) and marks every pixel valid; from a level it keeps colour and validity (alpha).
+//
+// push.v0: the source's normalised rect; push.i0.x: 1 = from the frame (encode, alpha 1).
+
+#version 460
+#extension GL_GOOGLE_include_directive : require
+#include "motion.inc.glsl"
+#include "srgb.inc.glsl"
+
+layout(set = 0, binding = 0) uniform sampler2D source;
+layout(set = 0, binding = 2, rgba8) uniform writeonly restrict image2D target;
+
+void main()
+{
+	ivec2 size = imageSize(target);
+	ivec2 xy = ivec2(gl_GlobalInvocationID.xy);
+	if (any(greaterThanEqual(xy, size))) {
+		return;
+	}
+
+	vec2 uv = push.v0.xy + (vec2(xy) + 0.5) / vec2(size) * push.v0.zw;
+	vec4 c = textureLod(source, uv, 0.0);
+	if (push.i0.x != 0) {
+		c = vec4(from_linear_to_srgb(clamp(c.rgb, 0.0, 1.0)), 1.0);
+	}
+	imageStore(target, xy, c);
+}

@@ -1,0 +1,85 @@
+// SPDX-FileCopyrightText: 2026 Aditya Mehra <aix.m@outlook.com>
+// SPDX-License-Identifier: BSL-1.0
+// Author: Aditya Mehra <aix.m@outlook.com>
+//
+// Motion smoothing: the motion per pixel of half size. Each pixel takes, of the vectors of the 3x3
+// field cells around it and the smooth one (bilinear between cell centres, what the in-between frame used before),
+// the one that matches best: the newest frame's brightness over a 3x3 patch against the previous frame's (turned)
+// where the vector points, plus push.v0.x per pixel of departure from the smooth vector (times the patch's 9). Where
+// moving and still things meet, the smooth vector smeared the motion a cell or two into the still side (lines bent
+// along the edge of a cockpit or a HUD); the chosen one keeps each side's own (pace test: the error along such an
+// edge halved). Vectors point from the newest frame to where its content was.
+//
+// push.i0.x: field cell size in half-size pixels.
+
+#version 460
+#extension GL_GOOGLE_include_directive : require
+#include "motion.inc.glsl"
+
+layout(set = 0, binding = 0) uniform sampler2D cur;
+layout(set = 0, binding = 1) uniform sampler2D ref;
+layout(set = 0, binding = 4, rgba16f) uniform readonly restrict image2D grid;
+layout(set = 0, binding = 5, rgba16f) uniform writeonly restrict image2D dense;
+
+float
+luma(vec3 c)
+{
+	return dot(clamp(c, 0.0, 1.0) * 255.0, vec3(54.0, 183.0, 19.0) / 256.0);
+}
+
+// The previous frame's brightness at q (half-size pixels); where it has nothing, the newest frame's (no motion).
+float
+ref_luma(vec2 q, vec2 inv)
+{
+	vec4 r = textureLod(ref, q * inv, 0.0);
+	return r.a < 0.5 ? luma(textureLod(cur, q * inv, 0.0).rgb) : luma(r.rgb);
+}
+
+void
+main()
+{
+	ivec2 size = imageSize(dense);
+	ivec2 xy = ivec2(gl_GlobalInvocationID.xy);
+	if (any(greaterThanEqual(xy, size))) {
+		return;
+	}
+	const ivec2 gsize = imageSize(grid);
+	const float cell = float(push.i0.x);
+	const float lambda9 = push.v0.x * 9.0;
+	const vec2 inv = 1.0 / vec2(size);
+	const vec2 p = vec2(xy) + 0.5;
+
+	// The smooth vector, as sampling the grid bilinearly gave it.
+	const vec2 g = p / cell - 0.5;
+	const ivec2 g0 = ivec2(floor(g));
+	const vec2 f = g - vec2(g0);
+	const vec2 v00 = imageLoad(grid, clamp(g0, ivec2(0), gsize - 1)).xy;
+	const vec2 v10 = imageLoad(grid, clamp(g0 + ivec2(1, 0), ivec2(0), gsize - 1)).xy;
+	const vec2 v01 = imageLoad(grid, clamp(g0 + ivec2(0, 1), ivec2(0), gsize - 1)).xy;
+	const vec2 v11 = imageLoad(grid, clamp(g0 + ivec2(1, 1), ivec2(0), gsize - 1)).xy;
+	const vec2 smooth_v = mix(mix(v00, v10, f.x), mix(v01, v11, f.x), f.y);
+
+	float c[9];
+	for (int k = 0; k < 9; k++) {
+		const vec2 o = vec2(float(k % 3 - 1), float(k / 3 - 1));
+		c[k] = luma(textureLod(cur, (p + o) * inv, 0.0).rgb);
+	}
+
+	vec2 best = smooth_v;
+	float best_cost = 1e30;
+	const ivec2 home = ivec2(floor(p / cell));
+	for (int n = -1; n < 9; n++) {
+		const vec2 v = n < 0 ? smooth_v
+		                     : imageLoad(grid, clamp(home + ivec2(n % 3 - 1, n / 3 - 1), ivec2(0), gsize - 1)).xy;
+		float cost = lambda9 * length(v - smooth_v);
+		for (int k = 0; k < 9; k++) {
+			const vec2 o = vec2(float(k % 3 - 1), float(k / 3 - 1));
+			cost += abs(c[k] - ref_luma(p + o + v, inv));
+		}
+		if (cost < best_cost) {
+			best_cost = cost;
+			best = v;
+		}
+	}
+	imageStore(dense, xy, vec4(best, 0.0, 1.0));
+}

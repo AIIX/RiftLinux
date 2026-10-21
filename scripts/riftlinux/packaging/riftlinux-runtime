@@ -1,0 +1,137 @@
+#!/bin/sh
+# SPDX-FileCopyrightText: 2026 Aditya Mehra <aix.m@outlook.com>
+# SPDX-License-Identifier: BSL-1.0
+#
+# Starts RiftLinux's own OpenXR runtime (monado-service) for OpenXR applications that run without SteamVR. It holds
+# the headset until it stops, so SteamVR must be closed meanwhile. Applications find it with
+#   XR_RUNTIME_JSON=/usr/lib/riftlinux/native/openxr_riftlinux.json <application>
+# or riftlinux-run <application>, which also starts and stops the runtime.
+# In a terminal, Enter or Ctrl+C stops it. Started without one (the app menu's "RiftLinux Runtime"), it says what it
+# does in desktop notifications and runs until "Stop RiftLinux Runtime" (riftlinux-runtime --stop).
+# Usage: riftlinux-runtime [--stop | --status]
+D=${RIFTLINUX_NATIVE_DIR:-/usr/lib/riftlinux/native}
+# The way the kernel names the running program (it is found by that name): no doubled or trailing slashes, links followed.
+D=$(readlink -f "$D" 2>/dev/null || echo "$D")
+LOG="${XDG_CACHE_HOME:-$HOME/.cache}/riftlinux/runtime.log"
+mkdir -p "$(dirname "$LOG")" 2>/dev/null
+
+# A message where it is seen: the terminal, or a desktop notification (and the error output); and the log.
+say() {
+	if [ -t 1 ]; then
+		echo "$1"
+	else
+		echo "$1" >&2
+		command -v notify-send >/dev/null 2>&1 && notify-send -a RiftLinux -i riftlinux "RiftLinux runtime" "$1" 2>/dev/null
+	fi
+	echo "$(date '+%F %T') $1" >>"$LOG" 2>/dev/null
+}
+
+# By the program each process runs: SteamVR's server renames itself ("1234: vrstar"), its name is no guide.
+pid_of() {
+	for p in /proc/[0-9]*; do
+		[ "$(readlink "$p/exe" 2>/dev/null)" = "$1" ] && { echo "${p#/proc/}"; return 0; }
+	done
+	return 1
+}
+steamvr_running() {
+	for p in /proc/[0-9]*; do
+		case "$(readlink "$p/exe" 2>/dev/null)" in
+		*/SteamVR/bin/linux64/vrserver | */SteamVR/bin/linux64/vrcompositor) return 0 ;;
+		esac
+	done
+	return 1
+}
+
+case "$1" in
+--stop)
+	P=$(pid_of "$D/monado-service") || { say "The RiftLinux runtime is not running."; exit 0; }
+	kill -INT "$P"
+	i=0
+	while kill -0 "$P" 2>/dev/null && [ $i -lt 20 ]; do sleep 0.5; i=$((i + 1)); done
+	kill -0 "$P" 2>/dev/null && kill -TERM "$P"
+	exit 0
+	;;
+--status)
+	pid_of "$D/monado-service" >/dev/null && echo "running" || echo "not running"
+	exit 0
+	;;
+esac
+
+if [ ! -x "$D/monado-service" ]; then
+	say "The RiftLinux runtime is not installed in $D."
+	exit 1
+fi
+if steamvr_running; then
+	say "SteamVR is running and holds the headset: close it first."
+	exit 1
+fi
+if pid_of "$D/monado-service" >/dev/null; then
+	say "The RiftLinux runtime is already running (or another Monado is)."
+	exit 0
+fi
+
+# Started from a remote (SSH) login: the desktop session's display and D-Bus, as the user's service manager has them.
+# Without them the runtime cannot ask the desktop for the headset (Wayland's lease), nor applications share a screen.
+# An SSH login's own display (X forwarding, DISPLAY=localhost:10.0) is another computer's screen: never the headset's.
+# A session folder already set stays (riftlinux-run and the runtime must agree on where its socket is).
+if { [ -n "$SSH_CONNECTION" ] || { [ -z "$WAYLAND_DISPLAY" ] && [ -z "$DISPLAY" ]; }; } &&
+	command -v systemctl >/dev/null 2>&1; then
+	ENV=$(systemctl --user show-environment 2>/dev/null)
+	# Only when a desktop session runs: its display replaces what the login has (none, or SSH's X forwarding).
+	case "$ENV" in
+	*WAYLAND_DISPLAY=* | *DISPLAY=*)
+		unset WAYLAND_DISPLAY DISPLAY
+		while IFS='=' read -r k v; do
+			case "$k" in
+			WAYLAND_DISPLAY | DISPLAY | XAUTHORITY | DBUS_SESSION_BUS_ADDRESS | XDG_SESSION_TYPE) export "$k=$v" ;;
+			XDG_RUNTIME_DIR) [ -n "$XDG_RUNTIME_DIR" ] || export "$k=$v" ;;
+			esac
+		done <<EOF
+$ENV
+EOF
+		;;
+	esac
+fi
+
+# Without a session folder (XDG_RUNTIME_DIR) the service and applications meet in the cache folder: it must exist.
+[ -n "$XDG_RUNTIME_DIR" ] || mkdir -p "${XDG_CACHE_HOME:-$HOME/.cache}"
+# One space shared by all applications, recentred on the user whenever the headset is put on, as in SteamVR.
+export XRT_PER_APP_LOCAL_SPACES="${XRT_PER_APP_LOCAL_SPACES:-0}"
+export IPC_RECENTER_ON_HEAD_DETECT="${IPC_RECENTER_ON_HEAD_DETECT:-1}"
+if [ -t 0 ]; then
+	echo "RiftLinux runtime: start OpenXR applications with XR_RUNTIME_JSON=$D/openxr_riftlinux.json; Enter stops it."
+	exec "$D/monado-service" "$@"
+fi
+
+# Without a terminal (the app menu, riftlinux-run): its input is empty and the service would stop at once on it.
+export XRT_NO_STDIN=1
+SOCK="${XDG_RUNTIME_DIR:-$HOME/.cache}/monado_comp_ipc"
+# A socket file left by an earlier run is no sign of this one: running once its socket is a new file.
+OLD=$(stat -c %i "$SOCK" 2>/dev/null)
+fresh() { [ -S "$SOCK" ] && [ "$(stat -c %i "$SOCK" 2>/dev/null)" != "$OLD" ]; }
+N=$(cat "$LOG" 2>/dev/null | wc -l)
+echo "$(date '+%F %T') starting" >>"$LOG" 2>/dev/null
+"$D/monado-service" "$@" >>"$LOG" 2>&1 &
+P=$!
+# Ending this script ends the service too: else it would keep holding the headset with nothing left to stop it.
+trap 'kill -INT "$P" 2>/dev/null' INT TERM HUP
+i=0
+while ! fresh && kill -0 "$P" 2>/dev/null && [ $i -lt 60 ]; do sleep 0.5; i=$((i + 1)); done
+if kill -0 "$P" 2>/dev/null && fresh; then
+	say "Running. OpenXR applications: right-click one, Run with the Rift. To end it: right-click RiftLinux Runtime, Stop."
+fi
+wait "$P"
+RC=$?
+# A signal to this script ends the wait early: wait again until the service has stopped.
+while kill -0 "$P" 2>/dev/null; do
+	wait "$P"
+	RC=$?
+done
+if [ "$RC" -eq 0 ]; then
+	say "Stopped."
+else
+	# The service's first error of this run says why.
+	WHY=$(tail -n +"$((N + 1))" "$LOG" 2>/dev/null | grep -a -m 1 "^ERROR" | sed 's/^ERROR \[[^]]*\] //')
+	say "Stopped with an error ($RC): ${WHY:-see $LOG}"
+fi
+exit "$RC"

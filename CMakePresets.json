@@ -1,0 +1,92 @@
+{
+    "version": 3,
+    "cmakeMinimumRequired": {
+        "major": 3,
+        "minor": 21,
+        "patch": 0
+    },
+    "configurePresets": [
+        {
+            "name": "default",
+            "inherits": "service-debug",
+            "displayName": "Default (same as service-debug)"
+        },
+        {
+            "name": ".base-ninja",
+            "generator": "Ninja",
+            "hidden": true,
+            "binaryDir": "${sourceDir}/build"
+        },
+        {
+            "name": "service-debug",
+            "displayName": "Debug service",
+            "inherits": ".base-ninja",
+            "cacheVariables": {
+                "CMAKE_BUILD_TYPE": "Debug",
+                "XRT_FEATURE_SERVICE": "ON"
+            }
+        },
+        {
+            "name": "service-debug-asan",
+            "displayName": "Debug service with sanitizers",
+            "inherits": "service-debug",
+            "cacheVariables": {
+                "SANITIZE_ADDRESS": "ON",
+                "SANITIZE_UNDEFINED": "ON"
+            }
+        },
+        {
+            "name": "inproc-debug",
+            "displayName": "Debug in-process",
+            "inherits": ".base-ninja",
+            "cacheVariables": {
+                "CMAKE_BUILD_TYPE": "Debug",
+                "XRT_FEATURE_SERVICE": "OFF"
+            }
+        },
+        {
+            "name": "service-release",
+            "displayName": "Release service",
+            "inherits": "service-debug",
+            "cacheVariables": {
+                "CMAKE_BUILD_TYPE": "Release",
+                "BUILD_DOC": "ON",
+                "BUILD_DOC_EXTRACT_ALL": "ON"
+            }
+        },
+        {
+            "name": "inproc-release",
+            "displayName": "Release in-process",
+            "inherits": "inproc-debug",
+            "cacheVariables": {
+                "CMAKE_BUILD_TYPE": "Release",
+                "BUILD_DOC": "ON",
+                "BUILD_DOC_EXTRACT_ALL": "ON"
+            }
+        },
+        {
+            "name": "service-relwithdebinfo",
+            "displayName": "RelWithDebInfo service",
+            "inherits": "service-debug",
+            "cacheVariables": {
+                "CMAKE_BUILD_TYPE": "RelWithDebInfo"
+            }
+        },
+        {
+            "name": "inproc-relwithdebinfo",
+            "displayName": "RelWithDebInfo in-process",
+            "inherits": "inproc-debug",
+            "cacheVariables": {
+                "CMAKE_BUILD_TYPE": "RelWithDebInfo"
+            }
+        }
+    ],
+    "buildPresets": [
+        {
+            "name": "default",
+            "displayName": "Build and install",
+            "configurePreset": "default",
+            "targets": "install"
+        }
+    ]
+}

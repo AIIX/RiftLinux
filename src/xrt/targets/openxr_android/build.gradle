@@ -1,0 +1,355 @@
+// Copyright 2020-2024, Collabora, Ltd.
+// SPDX-License-Identifier: BSL-1.0
+import groovy.xml.XmlUtil
+
+plugins {
+    id 'com.android.application'
+    id 'kotlin-android'
+
+    id 'com.mikepenz.aboutlibraries.plugin'
+
+    id "de.undercouch.download"
+
+    // Hilt dependency injection
+    id 'kotlin-kapt'
+    id 'dagger.hilt.android.plugin'
+
+    // Use spotless to format Java and Kotlin code
+    id 'com.diffplug.spotless'
+}
+
+spotless {
+    java {
+        target 'src/main/java/**/*.java'
+        // apply a specific flavor of google-java-format.
+        googleJavaFormat('1.18.1').aosp().reflowLongStrings()
+        // fix formatting of type annotations.
+        formatAnnotations()
+    }
+
+    kotlin {
+        target 'src/main/java/**/*.kt'
+        // Use ktfmt(https://github.com/facebook/ktfmt) as the default Kotlin formatter.
+        ktfmt("$ktfmtVersion").kotlinlangStyle()
+    }
+}
+
+def parseOpenXRVersion(def fn) {
+    def matches = file(fn).readLines().find {
+        it.contains('XR_CURRENT_API_VERSION')
+    } =~ ~/XR_MAKE_VERSION\(([^)]+)\)/
+    def components = matches[0][1].split(',').collect { it.replace(' ', '').trim() }
+    String.join('.', components)
+}
+
+project.ext.repoRoot = file('../../../../')
+
+project.ext.renameLicense = { String name ->
+    def lowerNoExtension = name.toLowerCase().replace(".txt", "")
+    def result = lowerNoExtension.replaceAll(~/[\-.]/, "_") + ".txt"
+    return result
+}
+
+project.ext.filterLicense = { String line ->
+    if (line.trim().isEmpty()) {
+        return '<br /><br />'
+    } else {
+        return XmlUtil.escapeXml(line)
+    }
+}
+
+project.ext.licenseDir = new File(project.buildDir, 'generated/licenses/main/res/raw')
+
+tasks.register('copyLicenses', Copy) {
+    from "${rootDir}/LICENSES/"
+    include 'BSL-1.0.txt'
+    rename(renameLicense)
+    into project.licenseDir
+    filter(filterLicense)
+}
+
+// Grab Eigen if we can't find it on the system.
+tasks.register('downloadEigen', Download) {
+    src "https://gitlab.com/libeigen/eigen/-/archive/${project.eigenFetchVersion}/eigen-${project.eigenFetchVersion}.tar.gz"
+    dest new File(project.buildDir, "intermediates/eigenDownload/eigen-${project.eigenFetchVersion}.tar.gz")
+}
+
+def eigenUnpackDir = new File(project.buildDir, 'intermediates/eigen')
+tasks.register('unpackEigen', Copy) {
+    dependsOn downloadEigen
+    from tarTree(downloadEigen.dest)
+    into eigenUnpackDir
+}
+
+def eigenBuildDir = new File(project.buildDir, 'intermediates/eigen-build')
+tasks.register('configureEigen', Exec) {
+    dependsOn unpackEigen
+
+    doFirst {
+        eigenBuildDir.mkdirs()
+    }
+
+    workingDir eigenBuildDir
+
+    def eigenSourceDir = new File(eigenUnpackDir, "eigen-${project.eigenFetchVersion}")
+
+    def cmakePath = "${android.sdkDirectory}/cmake/${project.cmake_version}/bin/cmake"
+
+    commandLine cmakePath, eigenSourceDir.absolutePath
+}
+
+if (!(new File(project.file(project.eigenCMakeDir), "Eigen3Config.cmake")).exists()) {
+    println "project.eigenCMakeDir not set or not valid, so downloading Eigen at build time"
+    project.ext.eigenCMakeDir = "${eigenBuildDir}"
+} else {
+    println "Using Eigen as specified/detected in project.eigenCMakeDir: ${project.eigenCMakeDir}"
+    downloadEigen.enabled = false
+    unpackEigen.enabled = false
+    configureEigen.enabled = false
+}
+
+// ***
+// Git version handling
+// ***
+
+// Supplied with major, minor, patch, commit count
+def versionCodeFormatPattern = "%02d%01d%01d%05d"
+
+// parsed using this regex
+def gitDescribePattern = ~/v(?<tag>(?<major>\d+)\.(?<minor>\d+)\.(?<patch>\d+))-(?<commits>\d+)-g(?<hash>[0-9a-f]+)/
+
+// Get the version code from git describe output
+def getVersionCode = { ->
+    try {
+        def stdout = new ByteArrayOutputStream()
+        exec {
+            commandLine 'git', 'describe', '--always', '--long', '--match', 'v*'
+            standardOutput = stdout
+            workingDir rootDir
+        }
+        def longOutput = stdout.toString().trim()
+        def matcher = longOutput =~ gitDescribePattern
+        if (!matcher.matches()) {
+            println "Could not find an annotated git tag matching the regex!"
+            return null
+        }
+        def codeAsString = String.format(versionCodeFormatPattern,
+            Integer.parseInt(matcher.group('major')),
+            Integer.parseInt(matcher.group('minor')),
+            Integer.parseInt(matcher.group('patch')),
+            Integer.parseInt(matcher.group('commits')))
+        return Integer.parseInt(codeAsString)
+    }
+    catch (ignored) {
+        return null;
+    }
+}
+
+// Get the version string from git describe output
+def getVersionString = { ->
+    try {
+        def stdout = new ByteArrayOutputStream()
+        exec {
+            commandLine 'git', 'describe', '--always', '--dirty', '--match', 'v*'
+            standardOutput = stdout
+            workingDir rootDir
+        }
+        return stdout.toString().trim()
+    }
+    catch (ignored) {
+        return null;
+    }
+}
+
+
+// Pass -PsharedStl=true on the gradle command line to build with the shared runtime library.
+// This has potential compatibility issues and should only be used if you're consuming another
+// library that exposes a C++ interface.
+project.ext.stl = "c++_static"
+if (project.hasProperty("sharedStl") && project.getProperty("sharedStl")) {
+    project.ext.stl = "c++_shared"
+    println "Using SHARED C++ standard library"
+}
+
+android {
+    compileSdk project.sharedCompileSdk
+    buildToolsVersion = buildToolsVersion
+
+    ndkVersion "${ndk_version}"
+
+    defaultConfig {
+        applicationId 'org.freedesktop.monado.openxr_runtime'
+        minSdkVersion project.sharedMinSdk
+        targetSdkVersion project.sharedTargetSdk
+
+        versionCode = getVersionCode()
+        versionName = getVersionString()
+
+        println versionName
+        println versionCode
+
+        resValue "string", "monado_lib_version", "${versionName}"
+
+        resValue "string", "library_openxrheaders_libraryVersion", parseOpenXRVersion("${rootDir}/src/external/openxr_includes/openxr/openxr.h")
+
+        externalNativeBuild {
+            cmake {
+                arguments "-DEigen3_DIR=${project.eigenCMakeDir}",
+                    "-DANDROID_PLATFORM=${project.sharedMinSdk}",
+                    "-DANDROID_STL=${project.stl}",
+                    "-DANDROID_ARM_NEON=TRUE"
+
+            }
+            if (project.pythonBinary != null) {
+                println "Path to Python 3 explicitly specified: ${project.pythonBinary}"
+                cmake.arguments "-DPYTHON_EXECUTABLE=${project.pythonBinary}"
+            }
+        }
+
+        // Be sure to copy over licenses formatted as required.
+        preBuild.dependsOn(copyLicenses)
+
+        // We also need the unpacked Eigen
+        preBuild.dependsOn(configureEigen)
+    }
+
+    buildTypes {
+        release {
+            minifyEnabled false
+            // Gradle plugin produces proguard-android-optimize.txt from @Keep annotations
+            proguardFiles getDefaultProguardFile('proguard-android-optimize.txt'), 'proguard-rules.pro'
+        }
+        debug {
+            minifyEnabled false
+            debuggable true
+            jniDebuggable true
+        }
+    }
+
+    externalNativeBuild {
+        cmake {
+            path "${rootDir}/CMakeLists.txt"
+            version "${cmake_version}"
+        }
+    }
+
+    // Base configuration closures for flavor reuse
+    def inProcessBaseConfig = { flavor, appName ->
+        flavor.dimension 'deployment'
+        flavor.applicationIdSuffix '.in_process'
+        flavor.externalNativeBuild.cmake.arguments += "-DXRT_FEATURE_SERVICE=OFF"
+        flavor.externalNativeBuild.cmake.targets "openxr_monado"
+        flavor.buildConfigField "boolean", "inProcess", "true"
+        flavor.resValue "string", "app_name", appName
+    }
+
+    def outOfProcessBaseConfig = { flavor, appName ->
+        flavor.dimension 'deployment'
+        flavor.applicationIdSuffix '.out_of_process'
+        flavor.externalNativeBuild.cmake.arguments += "-DXRT_FEATURE_SERVICE=ON"
+        flavor.externalNativeBuild.cmake.targets "openxr_monado", "monado-service"
+        flavor.buildConfigField "boolean", "inProcess", "false"
+        flavor.resValue "string", "app_name", appName
+    }
+
+    flavorDimensions = ['deployment']
+    productFlavors {
+        inProcess {
+            inProcessBaseConfig(it, "Monado In Process (Debugging)")
+        }
+        outOfProcess {
+            outOfProcessBaseConfig(it, "Monado XR")
+        }
+    }
+    hilt {
+        enableAggregatingTask = true
+    }
+    compileOptions {
+        sourceCompatibility JavaVersion.VERSION_17
+        targetCompatibility JavaVersion.VERSION_17
+    }
+    kotlinOptions {
+        jvmTarget = JavaVersion.VERSION_17
+    }
+    packagingOptions {
+        resources {
+            excludes += ['META-INF/*.kotlin_module']
+        }
+        jniLibs {
+            useLegacyPackaging true
+        }
+    }
+    namespace 'org.freedesktop.monado.openxr_runtime'
+    lint {
+        fatal 'StopShip'
+    }
+    buildFeatures {
+        buildConfig true
+    }
+}
+
+androidComponents {
+    onVariants(selector().withBuildType("debug")) {
+        packaging.jniLibs.keepDebugSymbols.add("**")
+    }
+}
+
+aboutLibraries {
+    // Full license text for license IDs mentioned here
+    // will be included, even if no detected dependency uses them.
+    additionalLicenses = [
+        "mit",
+        "mpl_2_0",
+        "bsl_1_0"
+    ]
+}
+
+dependencies {
+    implementation project(':src:xrt:auxiliary:cardboard')
+    implementation project(':src:xrt:auxiliary')
+    implementation project(':src:xrt:targets:android_common')
+    implementation "androidx.appcompat:appcompat:$androidxAppCompatVersion"
+    implementation "org.jetbrains.kotlin:kotlin-stdlib:$kotlinVersion"
+    implementation "androidx.constraintlayout:constraintlayout:$androidxConstraintLayoutVersion"
+    implementation "com.google.android.material:material:$materialVersion"
+
+    // Dependencies related only to AboutLibraries
+    implementation "com.mikepenz:aboutlibraries-core:${latestAboutLibsRelease}"
+    implementation "com.mikepenz:aboutlibraries:${latestAboutLibsRelease}"
+    implementation "androidx.cardview:cardview:$androidxCardViewVersion"
+    implementation "androidx.recyclerview:recyclerview:$androidxRecyclerViewVersion"
+
+
+    // for Hilt dependency injection
+    implementation "com.google.dagger:hilt-android:$hiltVersion"
+    kapt "com.google.dagger:hilt-compiler:$hiltVersion"
+
+}
+
+// Automatically add IPC dependency to all out-of-process flavors
+android.productFlavors.configureEach { flavor ->
+    if (flavor.name.startsWith("outOfProcess")) {
+        dependencies.add("${flavor.name}Implementation", project(':src:xrt:ipc'))
+    }
+}
+
+// For signing of release binaries - env var must contain an absolute path
+// CI always does this.
+def keystorePropertiesFilename = System.getenv("MONADO_KEYSTORE_PROPERTIES")
+if (keystorePropertiesFilename) {
+    def keystorePropertiesFile = file("${keystorePropertiesFilename}")
+    if (keystorePropertiesFile.exists()) {
+        println("Signing release artifacts for monado")
+        def keystoreProperties = new Properties()
+        keystoreProperties.load(new FileInputStream(keystorePropertiesFile))
+        android.signingConfigs {
+            release {
+                keyAlias keystoreProperties['keyAlias']
+                keyPassword keystoreProperties['keyPassword']
+                storeFile file("${project.repoRoot}/" + keystoreProperties['storeFile'])
+                storePassword keystoreProperties['storePassword']
+            }
+        }
+        android.buildTypes.release.signingConfig android.signingConfigs.release
+    }
+}

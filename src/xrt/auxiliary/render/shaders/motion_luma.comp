@@ -1,0 +1,56 @@
+// SPDX-FileCopyrightText: 2026 Aditya Mehra <aix.m@outlook.com>
+// SPDX-License-Identifier: BSL-1.0
+// Author: Aditya Mehra <aix.m@outlook.com>
+//
+// Motion smoothing: the newest frame and the previous one (turned to its pose) as 8-bit brightness, the
+// input of NVIDIA's optical flow engine (copied into its images from these buffers). Where the turned previous frame
+// has nothing (it did not cover that part of the view), the newest frame's brightness is used: no motion there.
+//
+// One invocation per 4 pixels of a row (one uint). push.i0.x: row pitch in uints.
+
+#version 460
+#extension GL_GOOGLE_include_directive : require
+#include "motion.inc.glsl"
+
+layout(set = 0, binding = 2, rgba8) uniform readonly restrict image2D cur;
+layout(set = 0, binding = 3, rgba8) uniform readonly restrict image2D ref;
+layout(set = 0, binding = 7, std430) writeonly restrict buffer LumaCur
+{
+	uint luma_cur[];
+};
+layout(set = 0, binding = 8, std430) writeonly restrict buffer LumaRef
+{
+	uint luma_ref[];
+};
+
+// From the 8-bit values, in integers: exactly as the evaluation's flow tool does it, so the motion scored
+// on recorded sessions is the motion the compositor gets.
+uint
+luma8(vec4 c)
+{
+	uvec3 b = uvec3(clamp(c.rgb, 0.0, 1.0) * 255.0 + 0.5);
+	return (b.r * 54u + b.g * 183u + b.b * 19u) >> 8;
+}
+
+void
+main()
+{
+	ivec2 size = imageSize(cur);
+	ivec2 g = ivec2(gl_GlobalInvocationID.xy);
+	if (g.x * 4 >= size.x || g.y >= size.y) {
+		return;
+	}
+	uint pc = 0u, pr = 0u;
+	for (int k = 0; k < 4; k++) {
+		ivec2 p = ivec2(min(g.x * 4 + k, size.x - 1), g.y);
+		vec4 c = imageLoad(cur, p);
+		vec4 r = imageLoad(ref, p);
+		uint lc = luma8(c);
+		uint lr = r.a < 0.5 ? lc : luma8(r);
+		pc |= lc << (8 * k);
+		pr |= lr << (8 * k);
+	}
+	const uint i = uint(g.y * push.i0.x + g.x);
+	luma_cur[i] = pc;
+	luma_ref[i] = pr;
+}

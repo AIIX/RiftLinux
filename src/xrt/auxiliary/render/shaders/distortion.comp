@@ -1,0 +1,224 @@
+// Copyright 2021-2022, Collabora Ltd.
+// SPDX-FileCopyrightText: 2026 Aditya Mehra <aix.m@outlook.com>
+// Author: Jakob Bornecrantz <jakob@collabora.com>
+// SPDX-License-Identifier: BSL-1.0
+
+#version 460
+#extension GL_GOOGLE_include_directive : require
+
+#include "srgb.inc.glsl"
+#include "auto_hdr.inc.glsl"
+
+
+// The size of the distortion texture dimensions in texels.
+layout(constant_id = 0) const int k_distortion_texel_count = 2;
+
+// Should we do timewarp.
+layout(constant_id = 1) const bool k_do_timewarp = false;
+
+// Number of views (1 = mono, 2 = stereo). Sized at pipeline creation.
+layout(constant_id = 2) const int k_view_count = 2;
+
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+
+layout(set = 0, binding = 0) uniform sampler2D source[k_view_count];
+layout(set = 0, binding = 1) uniform sampler2D distortion[3 * k_view_count];
+layout(set = 0, binding = 2) uniform writeonly restrict image2D target;
+// What each panel pixel was driven to in the last frame (RiftLinux; the output capture reads it).
+layout(set = 0, binding = 4, rgba16f) uniform restrict image2D previous;
+// HDR layers' brightness (RiftLinux), shared with the layer squasher (layer.comp): the fast path's layer
+// is measured here.
+layout(set = 0, binding = 5, std430) buffer restrict HdrStats
+{
+	uint bins[];
+} hdr_stats;
+layout(set = 0, binding = 3, std140) uniform restrict Config
+{
+	ivec4 views[2];
+	vec4 pre_transform[2];
+	vec4 post_transform[2];
+	mat4 transform_timewarp_scanout_begin[2];
+	mat4 transform_timewarp_scanout_end[2];
+	// Output processing (RiftLinux): x dither step (0 off), y black lift (0 off), z tone-map shoulder (0 off), w frame.
+	vec4 post0;
+	// Unused (overdrive, parked on riftlinux/overdrive-parked).
+	vec4 post1;
+	// Auto-HDR: x highlights, y shadows, z colour (0 each off), w the knee (OKLab lightness).
+	vec4 post2;
+	// The fast path's layer when it is HDR: as layer.comp's hdr_source and hdr_range; x 0 is SDR.
+	vec4 hdr_source;
+	vec4 hdr_range;
+}ubo;
+
+
+vec2 position_to_uv(ivec2 extent, uint ix, uint iy)
+{
+	// Turn the index into floating point.
+	vec2 xy = vec2(float(ix), float(iy));
+
+	// The inverse of the extent of the target image is the pixel size in [0 .. 1] space.
+	vec2 extent_pixel_size = vec2(1.0 / float(extent.x), 1.0 / float(extent.y));
+
+	// Per-target pixel we move the size of the pixels.
+	vec2 dist_uv = xy * extent_pixel_size;
+
+	// Emulate a triangle sample position by offset half target pixel size.
+	dist_uv = dist_uv + extent_pixel_size / 2.0;
+
+
+	// To correctly sample we need to put position (0, 0) in the
+	// middle of the (0, 0) texel in the distortion textures. That's why we
+	// offset with half the texel size, pushing all samples into the middle
+	// of each texels, a kin to a vertex buffer. We need to put uv coord
+	// (1, 1) in the middle of the last texel, that pixel is (size - 1)
+	// texels away from the first texel. So we need to scale [0 .. 1] to
+	// [0 .. size - 1].
+
+#define DIM (float(k_distortion_texel_count))
+#define STRETCH ((DIM - 1.0) / DIM)
+#define OFFSET (1.0 / (DIM * 2.0))
+
+	dist_uv = (dist_uv * STRETCH) + OFFSET;
+
+	return dist_uv;
+}
+
+vec2 transform_uv_subimage(vec2 uv, uint iz)
+{
+	vec2 values = uv;
+
+	// To deal with OpenGL flip and sub image view.
+	values.xy = values.xy * ubo.post_transform[iz].zw + ubo.post_transform[iz].xy;
+
+	// Ready to be used.
+	return values.xy;
+}
+
+vec2 transform_uv_timewarp(vec2 uv, uint iz)
+{
+	vec4 values = vec4(uv, -1, 1);
+
+	// From uv to tan angle (tangent space).
+	values.xy = values.xy * ubo.pre_transform[iz].zw + ubo.pre_transform[iz].xy;
+	values.y = -values.y; // Flip to OpenXR coordinate system.
+
+	// Timewarp including scanline timewarp for rolling refresh panels.
+	values = ubo.transform_timewarp_scanout_begin[iz] * values * (1 - uv.y) +
+	         ubo.transform_timewarp_scanout_end[iz] * values * uv.y;
+	values.xy = values.xy * (1.0 / max(values.w, 0.00001));
+
+	// From [-1, 1] to [0, 1]
+	values.xy = values.xy * 0.5 + 0.5;
+
+	// Done.
+	return values.xy;
+}
+
+vec2 transform_uv(vec2 uv, uint iz)
+{
+	if (k_do_timewarp) {
+		uv = transform_uv_timewarp(uv, iz);
+	}
+
+	return transform_uv_subimage(uv, iz);
+}
+
+/*
+ * Output processing (RiftLinux).
+ */
+
+// Soft shoulder from s up: values at or below s untouched, everything above eased into [s, 1). Only for content that
+// goes past the panel's white (float swapchains); with SDR content it would dim whites, so it is off unless set.
+vec3 tone_map(vec3 c, float s)
+{
+	if (s <= 0.0 || s >= 1.0) {
+		return c;
+	}
+	vec3 over = max(c - s, vec3(0.0));
+	vec3 eased = s + (1.0 - s) * (1.0 - exp(-over / (1.0 - s)));
+	return mix(c, eased, step(vec3(s), c));
+}
+
+// Interleaved gradient noise (Jimenez): blue-noise-like (no clumps), moved each frame by a golden-ratio step.
+float ign(vec2 pixel, float frame)
+{
+	pixel += 5.588238 * mod(frame, 64.0);
+	return fract(52.9829189 * fract(0.06711056 * pixel.x + 0.00583715 * pixel.y));
+}
+
+// Triangular dither of one output level (two blue-noise-like samples), the same for the three channels (no colour
+// noise), new every frame; faded out near black so an OLED's black stays black instead of sparkling.
+vec3 dither(vec3 c, ivec2 pixel, float step_size, float frame)
+{
+	if (step_size <= 0.0) {
+		return c;
+	}
+	float n = ign(vec2(pixel), frame) + ign(vec2(pixel) + vec2(37.0, 11.0), frame + 32.0) - 1.0;
+	float fade = clamp(max(c.r, max(c.g, c.b)) / (3.0 * step_size), 0.0, 1.0);
+	return clamp(c + n * step_size * fade, 0.0, 1.0);
+}
+
+void main()
+{
+	uint ix = gl_GlobalInvocationID.x;
+	uint iy = gl_GlobalInvocationID.y;
+	uint iz = gl_GlobalInvocationID.z;
+
+	ivec2 offset = ivec2(ubo.views[iz].xy);
+	ivec2 extent = ivec2(ubo.views[iz].zw);
+
+	if (ix >= extent.x || iy >= extent.y) {
+		return;
+	}
+
+	vec2 dist_uv = position_to_uv(extent, ix, iy);
+
+	vec2 r_uv = texture(distortion[k_view_count * 0 + iz], dist_uv).xy;
+	vec2 g_uv = texture(distortion[k_view_count * 1 + iz], dist_uv).xy;
+	vec2 b_uv = texture(distortion[k_view_count * 2 + iz], dist_uv).xy;
+
+	/*
+	 * Sample the source with distorted and chromatic-aberration corrected samples, each the same way the layer
+	 * squasher treats a pixel of an application's layer (RiftLinux), so the fast path shows what the
+	 * squasher's path shows, only sampled once:
+	 * - into the layer's own view (timewarp); outside the area the application drew, black (layer.comp
+	 *   do_projection_uv). SteamVR's images can be larger than the drawn area, past it they hold old frames: the
+	 *   fast path read them at the view's edges, which blinked;
+	 * - an HDR layer's values decoded and measured (its peak, the green sample: once a panel pixel) as the squasher
+	 *   does;
+	 * - Auto-HDR's lightness and colour on the sample in full colour (post2; zero after the squasher, which applied
+	 *   them per layer), before red, green and blue are taken from their three samples.
+	 */
+	vec2 uvs[3] = vec2[3](r_uv, g_uv, b_uv);
+	vec3 taps[3];
+	bool hdr = ubo.hdr_source.x > 0.5;
+	for (int k = 0; k < 3; k++) {
+		vec2 view_uv = k_do_timewarp ? transform_uv_timewarp(uvs[k], iz) : uvs[k];
+		bool inside = all(greaterThanEqual(view_uv, vec2(0.0))) && all(lessThan(view_uv, vec2(1.0)));
+		vec3 c = inside ? texture(source[iz], transform_uv_subimage(view_uv, iz)).rgb : vec3(0.0);
+		if (hdr) {
+			c = decode_hdr(c, ubo.hdr_source);
+			int slot = int(ubo.hdr_range.w) - 1;
+			float y = dot(c, vec3(0.2126, 0.7152, 0.0722));
+			if (k == 1 && inside && slot >= 0 && y > 1.0) {
+				uint bin = uint(min(floor(log2(y) * 4.0), 27.0));
+				atomicAdd(hdr_stats.bins[uint(slot) * 32u + bin], 1u);
+			}
+		}
+		taps[k] = auto_hdr_layer(c, ubo.post2, ubo.hdr_source, ubo.hdr_range);
+	}
+	vec4 colour = vec4(taps[0].r, taps[1].g, taps[2].b, 1);
+
+	// Then, as after the squasher: highlights past white eased in (float content only) and the panel's black level.
+	colour.rgb = auto_hdr(tone_map(colour.rgb, ubo.post0.z), vec4(0.0), ubo.post0.y);
+
+	// Do colour correction here since there are no automatic conversion in hardware available.
+	colour = vec4(from_linear_to_srgb(colour.rgb), 1);
+
+	// Encoded for the panel, kept for the output capture, then dithered to the link's levels.
+	ivec2 pixel = ivec2(offset.x + ix, offset.y + iy);
+	imageStore(previous, pixel, vec4(colour.rgb, 1.0));
+	colour.rgb = dither(colour.rgb, pixel, ubo.post0.x, ubo.post0.w);
+
+	imageStore(target, pixel, colour);
+}

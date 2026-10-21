@@ -1,0 +1,12 @@
+<resources>
+    <!--
+        Copyright 2020, Collabora, Ltd.
+        SPDX-License-Identifier: BSL-1.0
+    -->
+
+    <!-- app_name supplied by build system -->
+
+    <string name="powered_by_monado">An XR Runtime, powered by <a href="https://monado.dev">Monado</a></string>
+    <string name="monado_lib_version">0.0.0</string>
+
+</resources>

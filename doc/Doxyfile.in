@@ -1,0 +1,119 @@
+# Copyright 2018-2021, Collabora, Ltd. and the Monado contributors
+# SPDX-License-Identifier: BSL-1.0
+
+QUIET                  = YES
+PROJECT_NAME           = "Monado OpenXR Runtime"
+OUTPUT_DIRECTORY       = @CURBUILDDIR@/
+INPUT                  = \
+     @SRCDIR@/src/xrt \
+     @SRCDIR@/doc
+
+
+IMAGE_PATH             = @SRCDIR@/doc
+EXAMPLE_PATH           = @SRCDIR@/doc/mermaid
+
+USE_MDFILE_AS_MAINPAGE = @SRCDIR@/doc/mainpage.md
+
+RECURSIVE              = YES
+EXCLUDE                = @SRCDIR@/src/external \
+                         @SRCDIR@/doc/changes \
+                         @BUILDDIR@
+EXCLUDE_PATTERNS       = */build/*
+
+STRIP_FROM_PATH        = @SRCDIR@/src/xrt \
+                         @SRCDIR@/src/xrt/include \
+                         @SRCDIR@/doc
+
+
+PREDEFINED             = VK_USE_PLATFORM_XCB_KHR \
+                         VK_USE_PLATFORM_WAYLAND_KHR \
+                         VK_USE_PLATFORM_XLIB_XRANDR_EXT \
+                         XR_EXT_debug_utils \
+                         XR_KHR_convert_timespec_time \
+                         XR_KHR_opengl_enable \
+                         XR_KHR_vulkan_enable \
+                         XR_MND_headless \
+                         XR_USE_GRAPHICS_API_OPENGL \
+                         XR_USE_GRAPHICS_API_VULKAN \
+                         XR_USE_PLATFORM_XLIB \
+                         XR_USE_TIMESPEC \
+                         XRT_BUILD_DRIVER_REALSENSE \
+                         XRT_DOXYGEN \
+                         XRT_FEATURE_SERVICE \
+                         XRT_HAVE_JPEG \
+                         XRT_HAVE_LIBUDEV \
+                         XRT_HAVE_LIBUSB \
+                         XRT_HAVE_LIBUVC \
+                         XRT_HAVE_OPENCV \
+                         XRT_HAVE_SYSTEMD \
+                         XRT_HAVE_WAYLAND \
+                         XRT_HAVE_V4L2 \
+                         XRT_OS_LINUX \
+                         XRT_OS_UNIX \
+
+
+ALIASES                += TODO=todo
+ALIASES                += ep{1}="<b>\1</b>. \xrefitem entrypoints \"OpenXR Entry Point\" \"OpenXR Entry Points\" \1"
+ALIASES                += obj{1}="\xrefitem objects \"OpenXR Object\" \"OpenXR Objects\" \1"
+ALIASES                += mermaid{1}="@htmlonly <div class=\"mermaid\"> ^^ @endhtmlonly @htmlinclude \"\1.mmd\" @htmlonly ^^ </div> @endhtmlonly"
+
+SHOW_GROUPED_MEMB_INC  = YES
+STRIP_CODE_COMMENTS    = NO
+REFERENCED_BY_RELATION = YES
+REFERENCES_RELATION    = YES
+ALWAYS_DETAILED_SEC    = YES
+
+# Our common headers are too popular
+INCLUDED_BY_GRAPH = NO
+
+WARN_IF_UNDOCUMENTED   = @DOXYGEN_WARN_UNDOCUMENTED@
+EXTRACT_ALL            = @DOXYGEN_EXTRACT_ALL@
+HIDE_UNDOC_RELATIONS   = NO
+EXTRACT_STATIC         = YES
+
+MACRO_EXPANSION        = YES
+
+STRIP_FROM_INC_PATH    = \
+                         @SRCDIR@/src/xrt/include \
+                         @SRCDIR@/src/xrt/auxiliary \
+                         @SRCDIR@/src/xrt/compositor \
+                         @SRCDIR@/src/xrt/drivers \
+                         @SRCDIR@/src/xrt/state_trackers \
+                         @SRCDIR@/src/xrt/targets
+
+# Path to generated include files (for vk_helpers.h includes).
+INCLUDE_PATH           = @BUILDDIR@/src/xrt/auxiliary/vk
+
+# Needed to processes generated header files (for vk_helpers.h includes).
+EXTENSION_MAPPING      = .h.inc=C
+
+JAVADOC_AUTOBRIEF      = YES
+
+QT_AUTOBRIEF           = YES
+
+TAB_SIZE               = 8
+
+OPTIMIZE_OUTPUT_FOR_C  = YES
+
+BUILTIN_STL_SUPPORT    = YES
+
+CASE_SENSE_NAMES       = NO
+
+GENERATE_LATEX         = NO
+
+USE_MATHJAX            = YES
+
+# Doxygen Awesome theme settings
+GENERATE_TREEVIEW      = YES # required!
+DISABLE_INDEX          = NO
+FULL_SIDEBAR           = NO
+HTML_COLORSTYLE        = LIGHT # required with Doxygen >= 1.9.5
+HTML_HEADER            = @SRCDIR@/doc/header.html
+HTML_FOOTER            = @SRCDIR@/doc/footer.html
+HTML_EXTRA_STYLESHEET  = @SRCDIR@/doc/doxygen-awesome-css/doxygen-awesome.css
+HTML_EXTRA_FILES       = @SRCDIR@/doc/doxygen-awesome-css/doxygen-awesome-darkmode-toggle.js \
+                         @SRCDIR@/doc/doxygen-awesome-css/doxygen-awesome-fragment-copy-button.js \
+                         @SRCDIR@/doc/doxygen-awesome-css/doxygen-awesome-paragraph-link.js \
+                         @SRCDIR@/doc/doxygen-awesome-css/doxygen-awesome-interactive-toc.js \
+                         @SRCDIR@/doc/doxygen-awesome-css/doxygen-awesome-tabs.js \
+                         @SRCDIR@/src/external/mermaid/mermaid.min.js

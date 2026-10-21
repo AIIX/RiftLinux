@@ -1,0 +1,178 @@
+// SPDX-FileCopyrightText: 2026 Aditya Mehra <aix.m@outlook.com>
+// SPDX-License-Identifier: BSL-1.0
+// Author: Aditya Mehra <aix.m@outlook.com>
+//
+// Motion smoothing: block matching at one pyramid level, one workgroup per block of 8x8. Each block of
+// the new frame looks for where its content was in the previous frame (turned to the same pose): the offset with the
+// lowest cost, the mean colour difference plus a small charge per pixel of offset (flat areas keep no motion). At the
+// coarsest level all offsets within a radius; finer: around the coarser level's answer for this block and its four
+// neighbours (doubled), and around zero, each within a small radius.
+//
+// The block and the previous frame's window around each candidate are loaded into shared memory once; the 64
+// invocations then share the offsets and the best is reduced across them (lowest cost, ties to the first offset in
+// candidate, row, column order).
+//
+// Output per block: offset (x, y) in pixels of this level (from the new frame to the previous one), cost, 1.
+//
+// push.v0.x: charge per pixel of offset; push.i0.x: radius; push.i0.y: 1 = has a coarser level; push.i0.z: 1 = sub-pixel
+// answer (the finest level): a parabola through the costs at the best offset and its four neighbours, at most half a
+// pixel. Whole-pixel answers rounded a small apparent shift of a still scene up to a pixel (more than the field's
+// threshold) and moved its edges; real motion of 3.3 pixels came out as 3 or 4 (pace test).
+
+#version 460
+#extension GL_GOOGLE_include_directive : require
+#include "motion.inc.glsl"
+
+layout(set = 0, binding = 2, rgba8) uniform readonly restrict image2D cur;
+layout(set = 0, binding = 3, rgba8) uniform readonly restrict image2D ref;
+layout(set = 0, binding = 4, rgba16f) uniform readonly restrict image2D coarser;
+layout(set = 0, binding = 5, rgba16f) uniform writeonly restrict image2D field;
+
+// A pixel the previous frame did not show costs the most a difference can.
+const float k_invalid = 3.0;
+
+#define MAX_CANDS 6
+// Windows of (8 + 2 radius)^2 per candidate: 1 x 24^2 at the top (radius 8), 6 x 12^2 when refining (radius 2);
+// radius 3 when refining would still fit (6 x 14^2).
+#define MAX_WINDOW 1200
+
+shared vec3 s_cur[MOTION_BLOCK * MOTION_BLOCK];
+shared vec4 s_ref[MAX_WINDOW];
+shared ivec2 s_cands[MAX_CANDS];
+shared int s_count;
+shared float s_cost[64];
+shared int s_index[64];
+shared ivec2 s_best_v;
+shared float s_nb[4];
+
+void
+main()
+{
+	const ivec2 b = ivec2(gl_WorkGroupID.xy);
+	const int tid = int(gl_LocalInvocationIndex);
+	const ivec2 size = imageSize(cur);
+	const ivec2 b0 = b * MOTION_BLOCK;
+	const int radius = push.i0.x;
+	const int n = 2 * radius + 1;
+	const int win = MOTION_BLOCK + 2 * radius;
+	const int per = win * win;
+
+	if (tid == 0) {
+		int count = 0;
+		s_cands[count++] = ivec2(0);
+		if (push.i0.y != 0) {
+			ivec2 cblocks = imageSize(coarser);
+			ivec2 pb = b / 2;
+			const ivec2 around[5] = ivec2[5](ivec2(0, 0), ivec2(1, 0), ivec2(-1, 0), ivec2(0, 1), ivec2(0, -1));
+			for (int i = 0; i < 5; i++) {
+				ivec2 q = clamp(pb + around[i], ivec2(0), cblocks - 1);
+				ivec2 c = ivec2(round(imageLoad(coarser, q).xy)) * 2;
+				bool seen = false;
+				for (int j = 0; j < count; j++) {
+					seen = seen || s_cands[j] == c;
+				}
+				if (!seen) {
+					s_cands[count++] = c;
+				}
+			}
+		}
+		s_count = min(count, MAX_WINDOW / per);
+	}
+	s_cur[tid] = imageLoad(cur, b0 + ivec2(tid % MOTION_BLOCK, tid / MOTION_BLOCK)).rgb;
+	barrier();
+
+	const int count = s_count;
+	for (int i = tid; i < count * per; i += 64) {
+		const int c = i / per;
+		const int j = i - c * per;
+		const ivec2 q = b0 + s_cands[c] - ivec2(radius) + ivec2(j % win, j / win);
+		vec4 v = vec4(0.0);
+		if (all(greaterThanEqual(q, ivec2(0))) && all(lessThan(q, size))) {
+			v = imageLoad(ref, q);
+		}
+		s_ref[i] = v;
+	}
+	barrier();
+
+	float best = 1e30;
+	int best_k = 0x7fffffff;
+	const int total = count * n * n;
+	for (int k = tid; k < total; k += 64) {
+		const int c = k / (n * n);
+		const int o = k - c * n * n;
+		const int dy = o / n;
+		const int dx = o - dy * n;
+		const int base = c * per + dy * win + dx;
+		float s = 0.0;
+		for (int py = 0; py < MOTION_BLOCK; py++) {
+			for (int px = 0; px < MOTION_BLOCK; px++) {
+				vec4 r = s_ref[base + py * win + px];
+				s += r.a < 0.5 ? k_invalid : dot(abs(s_cur[py * MOTION_BLOCK + px] - r.rgb), vec3(1.0));
+			}
+		}
+		const ivec2 v = s_cands[c] + ivec2(dx - radius, dy - radius);
+		const float cost = s / float(MOTION_BLOCK * MOTION_BLOCK) + push.v0.x * length(vec2(v));
+		if (cost < best) {
+			best = cost;
+			best_k = k;
+		}
+	}
+	s_cost[tid] = best;
+	s_index[tid] = best_k;
+	barrier();
+
+	for (int stride = 32; stride > 0; stride >>= 1) {
+		if (tid < stride) {
+			const float oc = s_cost[tid + stride];
+			const int oi = s_index[tid + stride];
+			if (oc < s_cost[tid] || (oc == s_cost[tid] && oi < s_index[tid])) {
+				s_cost[tid] = oc;
+				s_index[tid] = oi;
+			}
+		}
+		barrier();
+	}
+
+	if (tid == 0) {
+		const int k = s_index[0];
+		const int c = k / (n * n);
+		const int o = k - c * n * n;
+		s_best_v = s_cands[c] + ivec2(o % n - radius, o / n - radius);
+	}
+	barrier();
+
+	// Sub-pixel: the raw costs one pixel left, right, up and down of the best offset, straight from the image.
+	if (push.i0.z != 0 && tid < 4) {
+		const ivec2 e[4] = ivec2[4](ivec2(-1, 0), ivec2(1, 0), ivec2(0, -1), ivec2(0, 1));
+		const ivec2 nv = s_best_v + e[tid];
+		float s = 0.0;
+		for (int py = 0; py < MOTION_BLOCK; py++) {
+			for (int px = 0; px < MOTION_BLOCK; px++) {
+				const ivec2 q = b0 + nv + ivec2(px, py);
+				vec4 r = vec4(0.0);
+				if (all(greaterThanEqual(q, ivec2(0))) && all(lessThan(q, size))) {
+					r = imageLoad(ref, q);
+				}
+				s += r.a < 0.5 ? k_invalid : dot(abs(s_cur[py * MOTION_BLOCK + px] - r.rgb), vec3(1.0));
+			}
+		}
+		s_nb[tid] = s / float(MOTION_BLOCK * MOTION_BLOCK);
+	}
+	barrier();
+
+	if (tid == 0) {
+		const ivec2 v = s_best_v;
+		vec2 vf = vec2(v);
+		if (push.i0.z != 0) {
+			const float c0 = s_cost[0] - push.v0.x * length(vec2(v));
+			for (int axis = 0; axis < 2; axis++) {
+				const float cm = s_nb[2 * axis];
+				const float cp = s_nb[2 * axis + 1];
+				const float den = cm - 2.0 * c0 + cp;
+				const float d = den > 1e-6 ? (cm - cp) / (2.0 * den) : 0.0;
+				vf[axis] += clamp(d, -0.5, 0.5);
+			}
+		}
+		imageStore(field, b, vec4(vf, s_cost[0], 1.0));
+	}
+}

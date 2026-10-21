@@ -1,0 +1,55 @@
+# SPDX-FileCopyrightText: 2026 Aditya Mehra <aix.m@outlook.com>
+# SPDX-License-Identifier: BSL-1.0
+
+# Bug reports: the form makes the fields required; this catches placeholder answers in the two that matter most
+# (the setup check and SteamVR's log), labels the issue needs-info and says what is missing.
+name: Issue requirements
+
+on:
+  issues:
+    types: [opened, edited]
+
+permissions:
+  issues: write
+
+jobs:
+  validate:
+    # Only in the main repository, not in forks.
+    if: github.repository == 'AIIX/RiftLinux' && contains(github.event.issue.labels.*.name, 'bug')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/github-script@v7
+        with:
+          script: |
+            const issue = context.payload.issue;
+            const body = issue.body || "";
+            function section(heading) {
+              const re = new RegExp("###\\s*" + heading + "[^\\n]*\\n+([\\s\\S]*?)(?:\\n###\\s|$)", "i");
+              const m = body.match(re);
+              return m ? m[1].trim() : "";
+            }
+            const empty = v => !v || v === "_No response_" || v.replace(/```\w*/g, "").trim().length < 40;
+            const problems = [];
+            if (empty(section("Output of riftlinux-setup --json check")))
+              problems.push("**The output of `riftlinux-setup --json check` is missing.** Run it and paste the whole output.");
+            if (empty(section("SteamVR's log")))
+              problems.push("**SteamVR's log is missing.** Attach `~/.local/share/Steam/logs/vrserver.txt` from the session with the problem, or paste the part around it.");
+            const steps = section("Steps to reproduce");
+            if (!steps || steps.length < 15 || steps === "_No response_")
+              problems.push("**The steps to reproduce are missing or too short.** Give exact, numbered steps.");
+
+            const marker = "<!-- riftlinux-issue-requirements -->";
+            const comments = await github.rest.issues.listComments({
+              ...context.repo, issue_number: issue.number, per_page: 100 });
+            const prev = comments.data.find(c => c.body && c.body.includes(marker));
+            if (problems.length) {
+              try { await github.rest.issues.addLabels({ ...context.repo, issue_number: issue.number, labels: ["needs-info"] }); } catch (e) {}
+              const msg = marker + "\n\nThanks for the report. Before it can be looked at, it needs:\n\n" +
+                problems.map(p => "- " + p).join("\n") + "\n\nPlease edit the issue to add them.";
+              if (prev) await github.rest.issues.updateComment({ ...context.repo, comment_id: prev.id, body: msg });
+              else await github.rest.issues.createComment({ ...context.repo, issue_number: issue.number, body: msg });
+            } else {
+              try { await github.rest.issues.removeLabel({ ...context.repo, issue_number: issue.number, name: "needs-info" }); } catch (e) {}
+              if (prev) await github.rest.issues.updateComment({ ...context.repo, comment_id: prev.id,
+                body: marker + "\n\nThanks: the setup check, the log and the steps are there." });
+            }

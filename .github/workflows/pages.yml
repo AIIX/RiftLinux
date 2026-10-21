@@ -1,0 +1,52 @@
+# SPDX-FileCopyrightText: 2026 Aditya Mehra <aix.m@outlook.com>
+# SPDX-License-Identifier: BSL-1.0
+
+# The project's website: the user guide (docs/) built with GitHub Pages' own Jekyll and published at
+# https://aiix.github.io/RiftLinux/ whenever it changes on main. scripts/riftlinux/docs-site.py prepares the pages
+# (titles, search descriptions, links); Jekyll adds the search metadata, the sitemap and robots.txt.
+name: Website
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "docs/**"
+      - "scripts/riftlinux/docs-site.py"
+      - ".github/workflows/pages.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+# One deployment at a time; a newer push waits for the one under way.
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+jobs:
+  build:
+    # Only in the main repository, not in forks.
+    if: github.repository == 'AIIX/RiftLinux'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Prepare the pages
+        run: python3 scripts/riftlinux/docs-site.py docs _site_src
+      - uses: actions/configure-pages@v5
+      - uses: actions/jekyll-build-pages@v1
+        with:
+          source: ./_site_src
+          destination: ./_site
+      - uses: actions/upload-pages-artifact@v3
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@v4

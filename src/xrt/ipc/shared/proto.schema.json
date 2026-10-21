@@ -1,0 +1,125 @@
+{
+    "$schema": "http://json-schema.org/draft-07/schema",
+    "$id": "http://gitlab.freedesktop.org/monado/monado/src/xrt/ipc/proto.schema.json",
+    "type": "object",
+    "title": "Protocol schema",
+    "description": "The root schema for an entire protocol.",
+    "definitions": {
+        "scalar": {
+            "$comment": "Must keep this list synchronized with the one in ipcproto/common.py",
+            "title": "Known scalar type",
+            "type": "string",
+            "enum": [
+                "uint32_t",
+                "int64_t",
+                "uint64_t",
+                "bool",
+                "float"
+            ]
+        },
+        "aggregate": {
+            "$comment": "Must keep this pattern synchronized with the one in ipcproto/common.py",
+            "title": "Struct or union type",
+            "type": "string",
+            "pattern": "(struct|union) (xrt|ipc)_[a-z_]+"
+        },
+        "scalar_enum": {
+            "$comment": "Must keep this list synchronized with the one in ipcproto/common.py",
+            "title": "Custom enum (scalar)",
+            "type": "string",
+            "pattern": "enum xrt_[a-z_]+"
+        },
+        "handle": {
+            "$comment": "Must keep this pattern synchronized with the one in ipcproto/common.py",
+            "title": "Native handle typedef",
+            "type": "string",
+            "pattern": "xrt_([a-z_]+)_handle_t"
+        },
+        "param": {
+            "type": "object",
+            "title": "Parameter",
+            "required": [
+                "name",
+                "type"
+            ],
+            "properties": {
+                "name": {
+                    "title": "Parameter name",
+                    "type": "string"
+                },
+                "type": {
+                    "title": "Parameter type",
+                    "anyOf": [
+                        {
+                            "$ref": "#/definitions/scalar"
+                        },
+                        {
+                            "$ref": "#/definitions/aggregate"
+                        },
+                        {
+                            "$ref": "#/definitions/scalar_enum"
+                        }
+                    ]
+                }
+            }
+        },
+        "param_list": {
+            "title": "Parameter list",
+            "type": "array",
+            "additionalItems": {
+                "$ref": "#/definitions/param"
+            }
+        }
+    },
+    "properties": {
+        "$schema": {
+            "type": "string"
+        }
+    },
+    "additionalProperties": {
+        "$id": "#/call",
+        "type": "object",
+        "title": "IPC Call",
+        "properties": {
+            "id": {
+                "type": "string",
+                "title": "Call ID",
+                "description": "If left unspecified or empty, the ID will be constructed by prepending IPC_ to the call name in all upper-case."
+            },
+            "out_handles": {
+                "$id": "#/call/properties/out_handles",
+                "type": "object",
+                "title": "Handles for call to return",
+                "required": [
+                    "type"
+                ],
+                "properties": {
+                    "type": {
+                        "$ref": "#/definitions/handle"
+                    }
+                }
+            },
+            "in_handles": {
+                "$id": "#/call/properties/in_handles",
+                "type": "object",
+                "title": "Handles supplied to call",
+                "required": [
+                    "type"
+                ],
+                "properties": {
+                    "type": {
+                        "$ref": "#/definitions/handle"
+                    }
+                }
+            },
+            "in": {
+                "title": "Input parameters",
+                "$ref": "#/definitions/param_list"
+            },
+            "out": {
+                "title": "Output parameters",
+                "$ref": "#/definitions/param_list"
+            }
+        }
+    }
+}
