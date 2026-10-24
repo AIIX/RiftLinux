@@ -819,8 +819,14 @@ direct_wayland_present(struct comp_target *ct,
 	 * lease ending. Out of date to the renderer, which then lets go of its images and waits for the target.
 	 */
 	if (ret == VK_ERROR_SURFACE_LOST_KHR || ret == VK_ERROR_UNKNOWN) {
+		/*
+		 * Expected: the CV1 drops its HDMI link whenever its display is turned off (not worn), and this is how
+		 * the compositor hears of it first. Taken again when the desktop offers the headset back.
+		 */
 		if (!w->lost) {
-			COMP_WARN(ct->c, "Presenting to the headset failed (%s): taking it again", vk_result_string(ret));
+			COMP_INFO(ct->c, "The headset's display went dark (%s, off when not worn, or unplugged): taken again "
+			          "when it is back",
+			          vk_result_string(ret));
 		}
 		w->lost = true;
 		return VK_ERROR_OUT_OF_DATE_KHR;

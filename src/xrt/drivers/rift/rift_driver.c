@@ -52,6 +52,7 @@
 #include "rift_internal.h"
 #include "rift_usb.h"
 #include "rift_radio.h"
+#include "rift_gamepad.h"
 
 
 /*
@@ -122,9 +123,11 @@ rift_custom_pattern_sequence_repeat(enum rift_custom_pattern_state state)
 /*
  * The CV1's panel stays lit once switched on, worn or not, and an OLED showing a still picture on a desk burns in: in
  * SteamVR the maintainer found it on with the headset off, and nothing in Monado or OpenHMD ever turned it off.
- * The Oculus runtime does; so does this, once the wear sensor has read "not worn" for a few seconds (lifting the headset
- * to adjust it doesn't blank it), and back on the moment it is worn. Audio and the LEDs (tracking) stay on. The HDMI link
- * stays up, SteamVR 2.17 in direct mode carried on through it.
+ * The Oculus runtime does; so does this, once the wear sensor has read "not worn" for a few seconds (lifting the
+ * headset to adjust it doesn't blank it), and back on the moment it is worn. Audio and the LEDs (tracking) stay on.
+ * With NVIDIA 580 the HDMI link stayed up and SteamVR 2.17's own compositor carried on through it; on KDE Plasma 6.8
+ * (Wayland) with NVIDIA 615 the headset leaves HDMI, and only Monado's compositor takes the display again when it is
+ * worn.
  */
 static void
 rift_cv1_update_display_power(struct rift_hmd *hmd, timepoint_ns now)
@@ -172,6 +175,104 @@ rift_cv1_update_display_power(struct rift_hmd *hmd, timepoint_ns now)
  * The gyro's own orientation (rift_hmd::gyro), one sample on: the turn in the headset's frame, nothing else. A gap of
  * more than 100 ms between samples is not integrated (the orientation guard's steering takes it up).
  */
+/*!
+ * Whether the headset moves as one on a head does (rift_hmd::head_motion), one gyro sample on. A wear sensor that
+ * misreads (it read 2-6 on a head, where it reads 84-90 when it sees the face) must not blank the display nor send
+ * SteamVR to standby: a head is never as still as a headset lying down. Sensor thread only.
+ */
+#define RIFT_HEAD_MOTION_BLOCK_NS (50 * U_TIME_1MS_IN_NS)
+#define RIFT_HEAD_MOTION_WINDOW_NS (U_TIME_1S_IN_NS)
+/*
+ * Worn while at least RIFT_HEAD_MOTION_NEED of the last RIFT_HEAD_MOTION_WINDOWS seconds moved more than
+ * RIFT_HEAD_MOTION_RANGE_RAD_S. A head held as still as it can be never read below 1.24 degrees a second; lying on a
+ * bed the headset read 0.29 (median) with bumps up to 9, and worn by any one second over 0.5, held for 10 s, it was
+ * worn two thirds of the time with nobody near it, so its display never went dark. Counted this way: the bed 12 % of a
+ * minute (only while it was shaken), the still head all of the time, and a worn session alike but for the seconds the
+ * headset was off the head.
+ */
+#define RIFT_HEAD_MOTION_RANGE_RAD_S (1.0f * (float)M_PI / 180.0f)
+#define RIFT_HEAD_MOTION_WINDOWS 10
+#define RIFT_HEAD_MOTION_NEED 5
+//! Worn by motion until the next window has been counted.
+#define RIFT_HEAD_MOTION_KEEP_NS ((int64_t)1500 * U_TIME_1MS_IN_NS)
+/*
+ * Only upright as on a head: within 60 degrees of gravity (worn 7-17 in a recording, lying on a desk 88-90). Lying,
+ * the headset still moved enough when touched or bumped to light the display every 20 s while nobody wore it.
+ */
+#define RIFT_HEAD_MOTION_UPRIGHT_COS 0.5f
+
+static struct xrt_vec3
+vec3_min(struct xrt_vec3 a, struct xrt_vec3 b)
+{
+	return (struct xrt_vec3){MIN(a.x, b.x), MIN(a.y, b.y), MIN(a.z, b.z)};
+}
+
+static struct xrt_vec3
+vec3_max(struct xrt_vec3 a, struct xrt_vec3 b)
+{
+	return (struct xrt_vec3){MAX(a.x, b.x), MAX(a.y, b.y), MAX(a.z, b.z)};
+}
+
+static void
+rift_head_motion_update(struct rift_hmd *hmd,
+                        int64_t timestamp_ns,
+                        const struct xrt_vec3 *gyro,
+                        const struct xrt_vec3 *accel)
+{
+	if (hmd->head_motion.window_start_ns == 0 || timestamp_ns < hmd->head_motion.block_start_ns) {
+		hmd->head_motion.window_start_ns = timestamp_ns;
+		hmd->head_motion.block_start_ns = timestamp_ns;
+		hmd->head_motion.block_count = 0;
+		hmd->head_motion.blocks = 0;
+		hmd->head_motion.block_sum = (struct xrt_vec3)XRT_VEC3_ZERO;
+		hmd->head_motion.accel_sum = (struct xrt_vec3)XRT_VEC3_ZERO;
+		hmd->head_motion.accel_count = 0;
+	}
+	hmd->head_motion.block_sum = m_vec3_add(hmd->head_motion.block_sum, *gyro);
+	hmd->head_motion.block_count++;
+	hmd->head_motion.accel_sum = m_vec3_add(hmd->head_motion.accel_sum, *accel);
+	hmd->head_motion.accel_count++;
+	if (timestamp_ns - hmd->head_motion.block_start_ns >= RIFT_HEAD_MOTION_BLOCK_NS) {
+		const struct xrt_vec3 mean =
+		    m_vec3_mul_scalar(hmd->head_motion.block_sum, 1.0f / (float)hmd->head_motion.block_count);
+		if (hmd->head_motion.blocks == 0) {
+			hmd->head_motion.block_min = mean;
+			hmd->head_motion.block_max = mean;
+		} else {
+			hmd->head_motion.block_min = vec3_min(hmd->head_motion.block_min, mean);
+			hmd->head_motion.block_max = vec3_max(hmd->head_motion.block_max, mean);
+		}
+		hmd->head_motion.blocks++;
+		hmd->head_motion.block_start_ns = timestamp_ns;
+		hmd->head_motion.block_count = 0;
+		hmd->head_motion.block_sum = (struct xrt_vec3)XRT_VEC3_ZERO;
+	}
+	if (timestamp_ns - hmd->head_motion.window_start_ns < RIFT_HEAD_MOTION_WINDOW_NS) {
+		return;
+	}
+	const struct xrt_vec3 down = m_vec3_mul_scalar(hmd->head_motion.accel_sum,
+	                                               1.0f / (float)MAX(hmd->head_motion.accel_count, 1u));
+	const bool upright = down.y > RIFT_HEAD_MOTION_UPRIGHT_COS * m_vec3_len(down);
+	if (!upright) {
+		// Not as on a head: worn by the sensor alone from now on.
+		hmd->head_motion.history = 0;
+		hmd->head_motion.moving_until_ns = 0;
+	} else if (hmd->head_motion.blocks >= 10) {
+		const struct xrt_vec3 range = m_vec3_sub(hmd->head_motion.block_max, hmd->head_motion.block_min);
+		const bool moved = range.x > RIFT_HEAD_MOTION_RANGE_RAD_S || range.y > RIFT_HEAD_MOTION_RANGE_RAD_S ||
+		                   range.z > RIFT_HEAD_MOTION_RANGE_RAD_S;
+		hmd->head_motion.history = (uint16_t)(((hmd->head_motion.history << 1) | (moved ? 1u : 0u)) &
+		                                      ((1u << RIFT_HEAD_MOTION_WINDOWS) - 1u));
+		if (__builtin_popcount(hmd->head_motion.history) >= RIFT_HEAD_MOTION_NEED) {
+			hmd->head_motion.moving_until_ns = timestamp_ns + RIFT_HEAD_MOTION_KEEP_NS;
+		}
+	}
+	hmd->head_motion.window_start_ns = timestamp_ns;
+	hmd->head_motion.blocks = 0;
+	hmd->head_motion.accel_sum = (struct xrt_vec3)XRT_VEC3_ZERO;
+	hmd->head_motion.accel_count = 0;
+}
+
 static void
 rift_gyro_update(struct rift_hmd *hmd, int64_t timestamp_ns, const struct xrt_vec3 *gyro)
 {
@@ -255,17 +356,37 @@ rift_sensor_thread_tick(struct rift_hmd *hmd)
 			/*
 			 * The wear sensor: 84-90 worn (on Windows, 77000 reports, Oculus' own capture), 2-6 lying
 			 * unworn (6 pointing at the ceiling, which the old threshold of 3 took as worn and kept the panel
-			 * lit: burn-in risk). Worn above 40, unworn below 20, unchanged in between.
+			 * lit: burn-in risk). A thicker face pad holds the face further from it and reads lower. Worn
+			 * above 30, unworn below 15, unchanged in between.
 			 */
 			const uint16_t wear = report.cv1.presence_sensor;
-			if (wear > 40) {
-				hmd->presence = true;
-			} else if (wear < 20) {
-				hmd->presence = false;
+			if (wear > 30) {
+				hmd->presence_sensor = true;
+			} else if (wear < 15) {
+				hmd->presence_sensor = false;
 			}
+			/*
+			 * Worn when the sensor says so, or while the headset moves as a head does: a sensor that misses the
+			 * face kept the display dark on a head and SteamVR in standby (no Home). A headset put down lies
+			 * still, so it still goes dark.
+			 */
+			const bool moving = recv_time_ns < hmd->head_motion.moving_until_ns;
+			if (moving && !hmd->presence_sensor && !hmd->head_motion.logged) {
+				hmd->head_motion.logged = true;
+				HMD_WARN(hmd,
+				         "The wear sensor reads %u (not worn) while the headset moves as on a head: taken as "
+				         "worn while it moves (the sensor's window may be covered or dirty).",
+				         wear);
+			}
+			hmd->presence = hmd->presence_sensor || moving;
 			rift_cv1_update_display_power(hmd, recv_time_ns);
 
-			// The back strap sits elsewhere off the head: the tracker measures it only while worn.
+			/*
+			 * The back strap sits elsewhere off the head: the tracker measures it only while worn, and told the
+			 * sensor's reading alone it never measured it with a sensor that misses the face, and lost the
+			 * headset whenever its back was to the sensors. Worn as the display has it: the sensor, or moving
+			 * as a head does (a strap swinging in a hand does not fit as one rigid part, and is not taken).
+			 */
 			if (hmd->use_constellation_poses && hmd->constellation_tracker != NULL &&
 			    hmd->presence_told != (hmd->presence ? 1 : 0)) {
 				hmd->presence_told = hmd->presence ? 1 : 0;
@@ -403,6 +524,9 @@ rift_sensor_thread_tick(struct rift_hmd *hmd)
 				// update the IMU for that sample
 				m_imu_3dof_update(&hmd->fusion, sample_local_timestamp_ns, &accel, &gyro);
 				rift_gyro_update(hmd, sample_local_timestamp_ns, &gyro);
+				if (hmd->variant == RIFT_VARIANT_CV1) {
+					rift_head_motion_update(hmd, sample_local_timestamp_ns, &gyro, &accel);
+				}
 
 				// Ensure these are monotonic. Sometimes due to the super fast IMU and clock jitter
 				// we might estimate samples out of order a bit.
@@ -565,6 +689,10 @@ rift_radio_thread(void *ptr)
 	}
 
 	os_thread_helper_unlock(&hmd->radio_state.thread);
+
+	// Nothing reports any more: the gamepad lets go of what the controllers held.
+	rift_gamepad_release(hmd->touch_gamepad, true);
+	rift_gamepad_release(hmd->touch_gamepad, false);
 
 	if (result < 0) {
 		HMD_ERROR(hmd, "Radio thread stopped on error %d, no Touch input until a restart", result);
@@ -1517,6 +1645,8 @@ rift_frame_node_destroy(struct xrt_frame_node *node)
 		if (hmd->radio_state.thread.initialized) {
 			os_thread_helper_destroy(&hmd->radio_state.thread);
 		}
+		// The radio thread, the only one that writes to it, is gone.
+		rift_gamepad_destroy(&hmd->touch_gamepad);
 
 		os_hid_destroy(hmd->radio_dev);
 	}
@@ -2005,6 +2135,8 @@ rift_devices_create(struct os_hid_device *hmd_dev,
 	hmd->device_count = 0;
 
 	if (hmd->radio_dev != NULL) {
+		hmd->touch_gamepad = rift_gamepad_create();
+
 		// Before the radio thread, so the controllers exist for applications even if they connect later.
 		result = rift_radio_create_touch_controllers(hmd);
 		if (result < 0) {
@@ -2156,6 +2288,7 @@ rift_add_to_constellation_tracker(struct rift_hmd *hmd, struct t_constellation_t
 	    .led_model = hmd->led_model,
 	    .tracking_source = &hmd->constellation_tracking_source,
 	    .loose_part = hmd->back_strap_model,
+	    .head = true,
 	};
 	// Where the strap sits is saved per headset.
 	u_truncate_snprintf(params.serial, sizeof(params.serial), "%s", hmd->base.serial);

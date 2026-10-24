@@ -1,4 +1,5 @@
 // Copyright 2019, Collabora, Ltd.
+// SPDX-FileCopyrightText: 2026 Aditya Mehra <aix.m@outlook.com>
 // SPDX-License-Identifier: BSL-1.0
 /*!
  * @file
@@ -76,7 +77,9 @@ p_udev_get_usb_hid_address(struct udev_device *raw_dev,
                            uint32_t bus_type,
                            uint8_t *out_dev_class,
                            uint16_t *out_usb_bus,
-                           uint16_t *out_usb_addr);
+                           uint16_t *out_usb_addr,
+                           uint16_t *out_usb_vendor,
+                           uint16_t *out_usb_product);
 
 static int
 p_udev_try_usb_relation_get_address(struct udev_device *raw_dev,
@@ -405,6 +408,8 @@ p_udev_enumerate_hidraw(struct prober *p, struct udev *udev)
 		uint8_t dev_class = 0;
 		uint16_t usb_bus = 0;
 		uint16_t usb_addr = 0;
+		uint16_t usb_vendor = 0;
+		uint16_t usb_product = 0;
 		uint32_t bus_type = 0;
 		uint64_t bluetooth_id = 0;
 		char product_name[P_PROBER_BLUETOOTH_PRODUCT_COUNT] = {0};
@@ -428,9 +433,22 @@ p_udev_enumerate_hidraw(struct prober *p, struct udev *udev)
 		}
 
 		// Get USB bus and address to de-duplicate devices.
-		ret = p_udev_get_usb_hid_address(raw_dev, bus_type, &dev_class, &usb_bus, &usb_addr);
+		ret = p_udev_get_usb_hid_address(raw_dev, bus_type, &dev_class, &usb_bus, &usb_addr, &usb_vendor,
+		                                 &usb_product);
 		if (ret != 0) {
 			P_ERROR(p, "Failed to get USB bus and addr.");
+			goto next;
+		}
+
+		/*
+		 * A HID device with ids other than its USB device's sits behind it: a wireless receiver's paired mouse or
+		 * keyboard (a Logitech receiver, 046d:c547, with its 046d:40b1). It is not that USB device, nor one of its
+		 * own at that address: taken for either, it was an error at every start and a second device at the
+		 * receiver's address.
+		 */
+		if (bus_type == HIDRAW_BUS_USB && (usb_vendor != vendor_id || usb_product != product_id)) {
+			P_DEBUG(p, "Skipping hidraw '%s' %04x:%04x, behind USB device %04x:%04x", dev_path, vendor_id,
+			        product_id, usb_vendor, usb_product);
 			goto next;
 		}
 
@@ -583,10 +601,10 @@ p_udev_get_usb_hid_address(struct udev_device *raw_dev,
                            uint32_t bus_type,
                            uint8_t *out_dev_class,
                            uint16_t *out_usb_bus,
-                           uint16_t *out_usb_addr)
+                           uint16_t *out_usb_addr,
+                           uint16_t *out_usb_vendor,
+                           uint16_t *out_usb_product)
 {
-	uint16_t unused_vendor;
-	uint16_t unused_product;
 	struct udev_device *usb_dev;
 
 	if (bus_type != HIDRAW_BUS_USB) {
@@ -600,7 +618,7 @@ p_udev_get_usb_hid_address(struct udev_device *raw_dev,
 		return -1;
 	}
 
-	return p_udev_get_usb_device_info(usb_dev, out_dev_class, &unused_vendor, &unused_product, out_usb_bus,
+	return p_udev_get_usb_device_info(usb_dev, out_dev_class, out_usb_vendor, out_usb_product, out_usb_bus,
 	                                  out_usb_addr);
 }
 

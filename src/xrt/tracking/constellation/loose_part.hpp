@@ -69,22 +69,32 @@ loose_part_fit(const std::vector<t_constellation_tracker_led> &part_leds,
                const xrt_pose *start,
                LoosePartFit &out);
 
-//! For an offset: how many of the part's LEDs are predicted visible in @p frames, and how many have a blob nearby.
+/*!
+ * For an offset: how many of the part's LEDs are predicted visible in @p frames, how many have a blob nearby, and
+ * how far those blobs are (median and 90th percentile, pixels; 0 when none).
+ */
 void
 loose_part_check(const std::vector<t_constellation_tracker_led> &part_leds,
                  const std::vector<const LoosePartFrame *> &frames,
                  const xrt_pose &offset,
                  float gate_px,
                  size_t &out_predicted,
-                 size_t &out_matched);
+                 size_t &out_matched,
+                 float *out_p50_px = nullptr,
+                 float *out_p90_px = nullptr);
 
 /*!
  * Measures a device's loose part from frames as they come, and keeps checking it once it is in use.
  *
  * Until an offset is in use: when enough frames are in, the two halves of them (every other frame) are fitted
  * separately, and the offset is accepted only when both fit tightly and agree; the final offset is then fitted on all
- * of them. Once in use: the newest frames are checked against it, and when its LEDs stop landing on blobs (the strap
- * was changed) it is measured again, or given up when that does not succeed.
+ * of them. A saved offset is used once the newest frames show its LEDs where it says (the strap moves when the
+ * headset is put on), or measured anew. Once in use: the newest frames are checked against it, and when its LEDs stop
+ * landing on blobs (the strap was changed) it is measured again, or given up when that does not succeed; while they
+ * land, it is measured again from where it is, and follows when it moved.
+ *
+ * Every frame's pose comes from the device's rigid LEDs alone: a pose that used the part's LEDs would have been bent
+ * to fit them where they are thought to be, and would always confirm that.
  *
  * Fitting runs on a worker thread, or in the caller's thread in deterministic mode (replays). The outcome is handed
  * to @ref on_result, from that thread: an offset to use, or none (stop using the part).
@@ -101,9 +111,9 @@ public:
 	LoosePartEstimator &
 	operator=(const LoosePartEstimator &) = delete;
 
-	//! The offset already in use (from a saved measurement): it is checked from here on instead of measured.
+	//! A saved measurement: used once the frames show the part there, else the part is measured anew.
 	void
-	setInUse(const xrt_pose &offset);
+	setSaved(const xrt_pose &offset);
 
 	void
 	addFrame(LoosePartFrame &&frame);
@@ -119,14 +129,28 @@ private:
 	run();
 	//! One measuring or checking pass over a copy of the frames; called without @ref lock held.
 	void
-	evaluate(std::vector<LoosePartFrame> frames, std::optional<xrt_pose> in_use);
+	evaluate(std::vector<LoosePartFrame> frames, std::optional<xrt_pose> in_use, std::optional<xrt_pose> saved);
+	//! Measures from a grid, or from @p start when given (an offset in use, followed where it moved).
 	bool
-	measure(const std::vector<const LoosePartFrame *> &frames, LoosePartFit &out, const char *&why);
+	measure(const std::vector<const LoosePartFrame *> &frames,
+	        LoosePartFit &out,
+	        const char *&why,
+	        const xrt_pose *start = nullptr);
 	bool
 	measureOnce(const std::vector<const LoosePartFrame *> &frames,
 	            size_t min_matches_per_half,
 	            LoosePartFit &out,
-	            const char *&why);
+	            const char *&why,
+	            const xrt_pose *start);
+	//! Checks @p offset on the newest frames (loose_part_check), for the debug output too; returns how many.
+	size_t
+	checkNewest(const std::vector<const LoosePartFrame *> &frames,
+	            const xrt_pose &offset,
+	            const char *what,
+	            size_t &predicted,
+	            size_t &matched,
+	            float &p50_px,
+	            float &p90_px);
 
 	const std::vector<t_constellation_tracker_led> part_leds;
 	const bool deterministic;
@@ -138,7 +162,10 @@ private:
 	//! Per camera, the device's pose in its last kept frame.
 	std::map<uint32_t, xrt_pose> last_kept;
 	size_t frames_since_evaluation{0};
+	//! The frames from a camera's own solve among @ref frames: enough of them measure the part on their own.
+	size_t own_frames{0};
 	std::optional<xrt_pose> in_use;
+	std::optional<xrt_pose> saved;
 	bool evaluate_requested{false};
 	bool stop{false};
 	std::thread worker;

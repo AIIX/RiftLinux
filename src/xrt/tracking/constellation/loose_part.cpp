@@ -13,6 +13,7 @@
 #include <Eigen/LU>
 
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -33,18 +34,26 @@ constexpr size_t kEvaluateEvery = 150;
 constexpr size_t kMaxFrames = 3000;
 //! Frames needed to measure: both halves need a few hundred.
 constexpr size_t kMinFramesToMeasure = 400;
-//! Both halves' offsets must agree this well, and each fit this tightly, to be accepted.
+/*!
+ * Both halves' offsets must agree this well, and each fit this tightly, to be accepted. The part's turn is the least
+ * held of its freedoms (it sits symmetric): 2 degrees move its LEDs about as far as 5 mm do, and in a session with a
+ * few turns the halves agreed within 2.8-3.5 mm and 1.1-1.4 degrees.
+ */
 constexpr double kHalvesAgreeM = 0.005;
-constexpr double kHalvesAgreeDeg = 1.0;
+constexpr double kHalvesAgreeDeg = 2.0;
 /*!
  * Frames paired across two cameras carry the cameras' placement error (0.7 degrees is several pixels at 3 m), so a
  * correct fit can be this loose; that both halves agree is what tells a right offset from a wrong one.
  */
 constexpr double kMaxP50Px = 1.6;
 constexpr size_t kMinMatchesPerHalf = 500;
-//! From a camera's own solves alone (exact frames): this many frames and matches per half suffice.
+/*!
+ * From a camera's own solves alone (exact frames): this many frames and matches per half suffice. What tells a right
+ * fit is that both halves agree (kHalvesAgreeM, kHalvesAgreeDeg): in a session with a few turns, halves of 147 and 129
+ * matches agreed within 2.8 mm and 1.1 degrees, at 0.21 and 0.26 px, and were turned down at 300.
+ */
 constexpr size_t kMinOwnFramesToMeasure = 200;
-constexpr size_t kMinMatchesPerHalfOwn = 300;
+constexpr size_t kMinMatchesPerHalfOwn = 120;
 //! On average at least this many of the part's LEDs per frame that has any: one blob a frame fits anything.
 constexpr double kMinMatchesPerFrame = 2.0;
 //! A camera's frame is only kept when the device moved this much since its last kept one: a device lying still gives
@@ -55,9 +64,20 @@ constexpr double kNewViewDeg = 3.0;
 constexpr size_t kCheckFrames = 300;
 constexpr size_t kMinPredictedForCheck = 150;
 constexpr double kMinShareInUse = 0.35;
-//! A new measurement replaces the one in use only when it moved at least this much.
+/*!
+ * A saved offset is used once this many of its LEDs were predicted in view, this share of them landed on a blob and
+ * those blobs sit this close. From poses of the rigid LEDs alone, a right one landed 75 to 100 % of them with a median
+ * of 0.2 to 1.2 px; wrong ones (moved 10 or 30 mm, or measured on another day) 7 to 47 % at 1.5 to 3.6 px.
+ */
+constexpr size_t kMinPredictedForSaved = 60;
+constexpr double kMinShareSaved = 0.6;
+constexpr double kMaxP50SavedPx = 1.6;
+/*!
+ * A new measurement replaces the one in use only when it moved at least this much. Its halves may be 2 degrees apart
+ * (kHalvesAgreeDeg): replaced on half a degree, noise would rebuild the model and rewrite the saved file over and over.
+ */
 constexpr double kReplaceM = 0.003;
-constexpr double kReplaceDeg = 0.5;
+constexpr double kReplaceDeg = 1.0;
 //! The grid: the part's tilt about the device's side axis, and up/down, forward/back.
 constexpr double kGridTiltDeg = 40.0;
 constexpr double kGridTiltStepDeg = 5.0;
@@ -428,12 +448,28 @@ loose_part_check(const std::vector<t_constellation_tracker_led> &part_leds,
                  const xrt_pose &offset,
                  float gate_px,
                  size_t &out_predicted,
-                 size_t &out_matched)
+                 size_t &out_matched,
+                 float *out_p50_px,
+                 float *out_p90_px)
 {
 	const std::vector<Frame> f = frames_of(frames);
 	std::vector<Match> matches;
 	associate(f, all_of(f.size()), leds_of(part_leds), from_pose(offset), gate_px, matches, &out_predicted);
 	out_matched = matches.size();
+	if (out_p50_px != nullptr || out_p90_px != nullptr) {
+		std::vector<double> d;
+		d.reserve(matches.size());
+		for (const auto &m : matches) {
+			d.push_back(m.dist);
+		}
+		std::sort(d.begin(), d.end());
+		if (out_p50_px != nullptr) {
+			*out_p50_px = d.empty() ? 0.0f : (float)d[d.size() / 2];
+		}
+		if (out_p90_px != nullptr) {
+			*out_p90_px = d.empty() ? 0.0f : (float)d[(d.size() * 9) / 10];
+		}
+	}
 }
 
 LoosePartEstimator::LoosePartEstimator(std::vector<t_constellation_tracker_led> part_leds_cv,
@@ -459,10 +495,10 @@ LoosePartEstimator::~LoosePartEstimator()
 }
 
 void
-LoosePartEstimator::setInUse(const xrt_pose &offset)
+LoosePartEstimator::setSaved(const xrt_pose &offset)
 {
 	std::unique_lock<std::mutex> l(this->lock);
-	this->in_use = offset;
+	this->saved = offset;
 }
 
 size_t
@@ -479,9 +515,27 @@ LoosePartEstimator::inUse()
 	return this->in_use.has_value();
 }
 
+static bool
+debug_attempts();
+
 void
 LoosePartEstimator::addFrame(LoosePartFrame &&frame)
 {
+	// What became of the frames offered, for the debug output: (own, from another camera) x (kept, facing away, seen).
+	static std::atomic<size_t> offered{0};
+	static std::array<std::atomic<size_t>, 6> fate{};
+	const size_t kind = frame.own ? 0 : 3;
+	const auto counted = [&](size_t what) {
+		fate[kind + what]++;
+		if (debug_attempts() && ++offered % 500 == 0) {
+			fprintf(stderr,
+			        "loose part: %zu frames offered: own kept %zu, facing away %zu, same view %zu; from another "
+			        "camera kept %zu, facing away %zu, same view %zu; %zu kept now\n",
+			        offered.load(), fate[0].load(), fate[1].load(), fate[2].load(), fate[3].load(), fate[4].load(),
+			        fate[5].load(), this->frameCount());
+		}
+	};
+
 	// Only frames in which some of the part may face the camera: a front camera sees the device's front all the
 	// time, and those frames would crowd out the ones that matter. Generous, the part may sit tens of degrees off
 	// its factory place.
@@ -496,6 +550,7 @@ LoosePartEstimator::addFrame(LoosePartFrame &&frame)
 		}
 	}
 	if (!facing) {
+		counted(1);
 		return;
 	}
 
@@ -505,23 +560,34 @@ LoosePartEstimator::addFrame(LoosePartFrame &&frame)
 		if (it != this->last_kept.end()) {
 			const Rt last = from_pose(it->second);
 			if ((last.t - cd.t).norm() < kNewViewM && angle_deg(last.R, cd.R) < kNewViewDeg) {
+				l.unlock();
+				counted(2);
 				return;
 			}
 		}
 		this->last_kept[frame.camera] = frame.Tcv_cam_device;
 	}
+	counted(0);
 
 	std::vector<LoosePartFrame> copy;
 	std::optional<xrt_pose> use;
+	std::optional<xrt_pose> saved_offset;
 	{
 		std::unique_lock<std::mutex> l(this->lock);
+		this->own_frames += frame.own ? 1 : 0;
 		this->frames.push_back(std::move(frame));
 		while (this->frames.size() > kMaxFrames) {
+			this->own_frames -= this->frames.front().own ? 1 : 0;
 			this->frames.pop_front();
 		}
 		this->frames_since_evaluation++;
+		/*
+		 * Due also once the frames from a camera's own solve would do on their own: a session that turned around a few
+		 * times had 342 of them, more than measure() needs, but 365 frames in all, and was never measured.
+		 */
 		const bool due = this->frames_since_evaluation >= kEvaluateEvery &&
-		                 (this->in_use.has_value() || this->frames.size() >= kMinFramesToMeasure);
+		                 (this->in_use.has_value() || this->saved.has_value() ||
+		                  this->frames.size() >= kMinFramesToMeasure || this->own_frames >= kMinOwnFramesToMeasure);
 		if (!due) {
 			return;
 		}
@@ -534,8 +600,9 @@ LoosePartEstimator::addFrame(LoosePartFrame &&frame)
 		}
 		copy.assign(this->frames.begin(), this->frames.end());
 		use = this->in_use;
+		saved_offset = this->saved;
 	}
-	this->evaluate(std::move(copy), use);
+	this->evaluate(std::move(copy), use, saved_offset);
 }
 
 void
@@ -544,6 +611,7 @@ LoosePartEstimator::run()
 	for (;;) {
 		std::vector<LoosePartFrame> copy;
 		std::optional<xrt_pose> use;
+		std::optional<xrt_pose> saved_offset;
 		{
 			std::unique_lock<std::mutex> l(this->lock);
 			this->cond.wait(l, [this] { return this->stop || this->evaluate_requested; });
@@ -553,8 +621,9 @@ LoosePartEstimator::run()
 			this->evaluate_requested = false;
 			copy.assign(this->frames.begin(), this->frames.end());
 			use = this->in_use;
+			saved_offset = this->saved;
 		}
-		this->evaluate(std::move(copy), use);
+		this->evaluate(std::move(copy), use, saved_offset);
 	}
 }
 
@@ -576,13 +645,21 @@ debug_fit(const char *what, const LoosePartFit &f)
 		return;
 	}
 	const Rt rt = from_pose(f.offset);
-	fprintf(stderr, "loose part: %s: %zu frames, %zu matched (%zu frames with any), p50 %.2f px, p90 %.2f px, %.1f mm, %.1f deg\n",
+	const Eigen::AngleAxisd aa(rt.R);
+	const Vector3d r = aa.axis() * aa.angle() * (180.0 / M_PI);
+	fprintf(stderr,
+	        "loose part: %s: %zu frames, %zu matched (%zu frames with any), p50 %.2f px, p90 %.2f px, %.1f mm, %.1f deg "
+	        "(t %.1f %.1f %.1f mm, r %.1f %.1f %.1f deg)\n",
 	        what, f.frames, f.matches, f.frames_matched, (double)f.p50_px, (double)f.p90_px, rt.t.norm() * 1000.0,
-	        angle_deg(Matrix3d::Identity(), rt.R));
+	        angle_deg(Matrix3d::Identity(), rt.R), rt.t.x() * 1000.0, rt.t.y() * 1000.0, rt.t.z() * 1000.0, r.x(), r.y(),
+	        r.z());
 }
 
 bool
-LoosePartEstimator::measure(const std::vector<const LoosePartFrame *> &frames, LoosePartFit &out, const char *&why)
+LoosePartEstimator::measure(const std::vector<const LoosePartFrame *> &frames,
+                            LoosePartFit &out,
+                            const char *&why,
+                            const xrt_pose *start)
 {
 	// The exact frames alone when there are enough of them: frames through two cameras carry their placement error.
 	std::vector<const LoosePartFrame *> own;
@@ -594,7 +671,7 @@ LoosePartEstimator::measure(const std::vector<const LoosePartFrame *> &frames, L
 	bool ok = false;
 	const char *which = "all frames";
 	if (own.size() >= kMinOwnFramesToMeasure) {
-		ok = this->measureOnce(own, kMinMatchesPerHalfOwn, out, why);
+		ok = this->measureOnce(own, kMinMatchesPerHalfOwn, out, why, start);
 		which = "the frames from a camera's own solve";
 		if (debug_attempts()) {
 			fprintf(stderr, "loose part: attempt on %zu of %zu frames (own solve): %s\n", own.size(), frames.size(),
@@ -602,7 +679,7 @@ LoosePartEstimator::measure(const std::vector<const LoosePartFrame *> &frames, L
 		}
 	}
 	if (!ok) {
-		ok = this->measureOnce(frames, kMinMatchesPerHalf, out, why);
+		ok = this->measureOnce(frames, kMinMatchesPerHalf, out, why, start);
 		which = "all frames";
 		if (debug_attempts()) {
 			fprintf(stderr, "loose part: attempt on %zu frames: %s\n", frames.size(), ok ? "accepted" : why);
@@ -616,7 +693,8 @@ bool
 LoosePartEstimator::measureOnce(const std::vector<const LoosePartFrame *> &frames,
                                 size_t min_matches_per_half,
                                 LoosePartFit &out,
-                                const char *&why)
+                                const char *&why,
+                                const xrt_pose *start)
 {
 	if (frames.size() < kMinFramesToMeasure / 2) {
 		why = "not enough frames";
@@ -632,7 +710,7 @@ LoosePartEstimator::measureOnce(const std::vector<const LoosePartFrame *> &frame
 		((z & 1) == 0 ? a : b).push_back(frames[i]);
 	}
 	LoosePartFit fa, fb;
-	if (!loose_part_fit(this->part_leds, a, nullptr, fa) || !loose_part_fit(this->part_leds, b, nullptr, fb)) {
+	if (!loose_part_fit(this->part_leds, a, start, fa) || !loose_part_fit(this->part_leds, b, start, fb)) {
 		why = "no fit";
 		return false;
 	}
@@ -660,8 +738,35 @@ LoosePartEstimator::measureOnce(const std::vector<const LoosePartFrame *> &frame
 	return true;
 }
 
+size_t
+LoosePartEstimator::checkNewest(const std::vector<const LoosePartFrame *> &frames,
+                                const xrt_pose &offset,
+                                const char *what,
+                                size_t &predicted,
+                                size_t &matched,
+                                float &p50_px,
+                                float &p90_px)
+{
+	const size_t n = std::min(kCheckFrames, frames.size());
+	const std::vector<const LoosePartFrame *> newest(frames.end() - (std::ptrdiff_t)n, frames.end());
+	loose_part_check(this->part_leds, newest, offset, 4.0f, predicted, matched, &p50_px, &p90_px);
+	if (debug_attempts()) {
+		size_t own = 0;
+		for (const LoosePartFrame *f : newest) {
+			own += f->own ? 1 : 0;
+		}
+		fprintf(stderr,
+		        "loose part: check of the %s offset on %zu frames (%zu own): %zu of %zu predicted LEDs on a blob, "
+		        "p50 %.2f px, p90 %.2f px\n",
+		        what, newest.size(), own, matched, predicted, (double)p50_px, (double)p90_px);
+	}
+	return n;
+}
+
 void
-LoosePartEstimator::evaluate(std::vector<LoosePartFrame> frames, std::optional<xrt_pose> use)
+LoosePartEstimator::evaluate(std::vector<LoosePartFrame> frames,
+                             std::optional<xrt_pose> use,
+                             std::optional<xrt_pose> saved_offset)
 {
 	std::vector<const LoosePartFrame *> ptrs;
 	ptrs.reserve(frames.size());
@@ -670,12 +775,42 @@ LoosePartEstimator::evaluate(std::vector<LoosePartFrame> frames, std::optional<x
 	}
 
 	if (!use.has_value()) {
+		// A saved measurement: used once the newest frames show its LEDs where it says, else measured anew.
+		if (saved_offset.has_value()) {
+			size_t predicted = 0, matched = 0;
+			float p50_px = 0.0f, p90_px = 0.0f;
+			const size_t n =
+			    this->checkNewest(ptrs, saved_offset.value(), "saved", predicted, matched, p50_px, p90_px);
+			if (predicted >= kMinPredictedForSaved) {
+				const bool holds = (double)matched >= kMinShareSaved * (double)predicted &&
+				                   (double)p50_px <= kMaxP50SavedPx;
+				{
+					std::unique_lock<std::mutex> l(this->lock);
+					this->saved.reset();
+					if (holds) {
+						this->in_use = saved_offset;
+					}
+				}
+				if (holds) {
+					LoosePartFit seen;
+					seen.offset = saved_offset.value();
+					seen.frames = n;
+					seen.matches = matched;
+					seen.p50_px = p50_px;
+					seen.p90_px = p90_px;
+					this->on_result(seen, "as measured before, seen there again");
+					return;
+				}
+				this->on_result(std::nullopt, "not where it was measured before; measuring it again");
+			}
+		}
 		LoosePartFit fitted;
 		const char *why = nullptr;
 		if (this->measure(ptrs, fitted, why)) {
 			{
 				std::unique_lock<std::mutex> l(this->lock);
 				this->in_use = fitted.offset;
+				this->saved.reset();
 			}
 			this->on_result(fitted, "measured");
 		}
@@ -683,21 +818,36 @@ LoosePartEstimator::evaluate(std::vector<LoosePartFrame> frames, std::optional<x
 	}
 
 	// In use: do its LEDs still land on blobs in the newest frames?
-	const size_t n = std::min(kCheckFrames, ptrs.size());
-	const std::vector<const LoosePartFrame *> newest(ptrs.end() - (std::ptrdiff_t)n, ptrs.end());
 	size_t predicted = 0, matched = 0;
-	loose_part_check(this->part_leds, newest, use.value(), 4.0f, predicted, matched);
-	if (debug_attempts()) {
-		fprintf(stderr, "loose part: check on %zu frames: %zu of %zu predicted LEDs on a blob\n", newest.size(), matched,
-		        predicted);
-	}
+	float p50_px = 0.0f, p90_px = 0.0f;
+	this->checkNewest(ptrs, use.value(), "in use", predicted, matched, p50_px, p90_px);
+	const size_t m = std::min<size_t>(ptrs.size(), 4 * kCheckFrames);
+	const std::vector<const LoosePartFrame *> recent(ptrs.end() - (std::ptrdiff_t)m, ptrs.end());
 	if (predicted < kMinPredictedForCheck || (double)matched >= kMinShareInUse * (double)predicted) {
+		/*
+		 * Still there, or not seen enough to tell: measured again from where it is, and followed when it moved
+		 * (a strap pulled tighter moves it by millimetres, which its LEDs' share alone doesn't show).
+		 */
+		LoosePartFit fitted;
+		const char *why = nullptr;
+		const xrt_pose start = use.value();
+		if (ptrs.size() >= kMinFramesToMeasure && this->measure(recent, fitted, why, &start)) {
+			const Rt old_rt = from_pose(start), new_rt = from_pose(fitted.offset);
+			if ((old_rt.t - new_rt.t).norm() >= kReplaceM || angle_deg(old_rt.R, new_rt.R) >= kReplaceDeg) {
+				{
+					std::unique_lock<std::mutex> l(this->lock);
+					this->in_use = fitted.offset;
+					this->frames.clear();
+					this->own_frames = 0;
+					this->last_kept.clear();
+				}
+				this->on_result(fitted, "measured again where it sits now");
+			}
+		}
 		return;
 	}
 
 	// Moved: measure again on the frames since, or stop using it.
-	const size_t m = std::min<size_t>(ptrs.size(), 4 * kCheckFrames);
-	const std::vector<const LoosePartFrame *> recent(ptrs.end() - (std::ptrdiff_t)m, ptrs.end());
 	LoosePartFit fitted;
 	const char *why = nullptr;
 	if (this->measure(recent, fitted, why)) {
@@ -709,6 +859,7 @@ LoosePartEstimator::evaluate(std::vector<LoosePartFrame> frames, std::optional<x
 			std::unique_lock<std::mutex> l(this->lock);
 			this->in_use = fitted.offset;
 			this->frames.clear();
+			this->own_frames = 0;
 			this->last_kept.clear();
 		}
 		this->on_result(fitted, "measured again: its LEDs no longer landed where expected");
@@ -718,6 +869,7 @@ LoosePartEstimator::evaluate(std::vector<LoosePartFrame> frames, std::optional<x
 		std::unique_lock<std::mutex> l(this->lock);
 		this->in_use.reset();
 		this->frames.clear();
+		this->own_frames = 0;
 		this->last_kept.clear();
 	}
 	this->on_result(std::nullopt, "its LEDs no longer land where expected; measuring it again");

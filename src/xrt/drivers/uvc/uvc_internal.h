@@ -1,6 +1,7 @@
 // Copyright 2017, Philipp Zabel
 // Copyright 2019-2021, Jan Schmidt
 // Copyright 2025-2026, Beyley Cardellio
+// SPDX-FileCopyrightText: 2026 Aditya Mehra <aix.m@outlook.com>
 // SPDX-License-Identifier: BSL-1.0
 /*!
  * @file
@@ -56,6 +57,13 @@ struct uvc_fs
 	size_t frame_collected;
 	//! true if we're skipping the current frame
 	bool skip_frame;
+
+	/*!
+	 * Whether the stream has reached its first new frame since it started, and the frame id it started in. Streaming
+	 * starts in the middle of one of the sensor's frames: up to the next it is the tail of a frame never seen whole.
+	 */
+	bool synced;
+	int start_frame_id;
 	//! The current sequence ID of this stream.
 	uint64_t sequence_id;
 
@@ -78,4 +86,16 @@ struct uvc_fs
 
 	void *get_frame_timestamp_user_data;
 	get_frame_timestamp_t get_frame_timestamp;
+
+	/*!
+	 * To tell a stalled stream apart: when the last whole frame came, and the packets since, how many of them
+	 * carried image data (none: the sensor stopped exposing; no packets at all: the USB transfers stopped).
+	 */
+	timepoint_ns last_frame_ns;
+	timepoint_ns stall_logged_ns;
+	uint64_t packets_since_frame;
+	uint64_t data_packets_since_frame;
+	//! The counts above as the frame being collected started: what came in between, without that frame.
+	uint64_t gap_packets;
+	uint64_t gap_data_packets;
 };

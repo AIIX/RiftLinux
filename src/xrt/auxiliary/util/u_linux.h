@@ -1,4 +1,5 @@
 // Copyright 2023, Collabora, Ltd.
+// SPDX-FileCopyrightText: 2026 Aditya Mehra <aix.m@outlook.com>
 // SPDX-License-Identifier: BSL-1.0
 /*!
  * @file
@@ -34,6 +35,20 @@ extern "C" {
  */
 bool
 u_linux_try_to_set_realtime_priority_on_thread(enum u_logging_level log_level, const char *name);
+
+/*!
+ * Moves this thread out of a background scheduling class (SCHED_IDLE or SCHED_BATCH) that its launcher handed down,
+ * into the normal one; threads it creates afterwards inherit that. Call it before creating threads.
+ *
+ * @param log_level Logging level to control chattiness.
+ * @param name      Thread name to be used in logging, can be NULL.
+ *
+ * @return          false when the thread stays in a background class.
+ *
+ * @ingroup aux_util
+ */
+bool
+u_linux_leave_background_scheduling(enum u_logging_level log_level, const char *name);
 
 
 #ifdef __cplusplus

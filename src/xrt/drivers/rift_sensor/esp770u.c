@@ -1,6 +1,7 @@
 // Copyright 2017, Philipp Zabel
 // Copyright 2025, Jan Schmidt
 // Copyright 2025-2026, Beyley Cardellio
+// SPDX-FileCopyrightText: 2026 Aditya Mehra <aix.m@outlook.com>
 // SPDX-License-Identifier: BSL-1.0
 /*!
  * @file
@@ -168,16 +169,22 @@ radio_write(libusb_device_handle *devhandle, const uint8_t *buf, size_t len)
 		return ret;
 	}
 
-	// Expect zeros
-	for (i = 2; i < 126; i++) {
+	/*
+	 * The reply echoes the command's first two bytes. A command whose first byte's low nibble is 1 is a query, and
+	 * its reply carries data (the Oculus runtime's 01 01 to 31 01 read the sensor firmware's build date this way); a
+	 * setting's reply is zeros after the echo, as the Oculus runtime's own captured replies are.
+	 */
+	const bool query = (buf[0] & 0x0f) == 0x01;
+	for (i = 2; i < 126 && !query; i++) {
 		if (data[i]) {
-			U_LOG_W("Unexpected byte (%02x at %02x):", data[i], (uint8_t)i);
+			U_LOG_W("Sensor radio: unexpected byte %02x at %u in the reply to %02x %02x", data[i], (unsigned)i,
+			        buf[0], buf[1]);
 			break;
 		}
 	}
 
 	if (data[0] != buf[0] || data[1] != buf[1]) {
-		U_LOG_W("Unexpected read (%02x %02x):", buf[0], buf[1]);
+		U_LOG_W("Sensor radio: the reply to %02x %02x echoes %02x %02x", buf[0], buf[1], data[0], data[1]);
 		for (i = 0; i < 127; i++) {
 			U_LOG_D("%02x ", data[i]);
 		}
@@ -188,7 +195,7 @@ radio_write(libusb_device_handle *devhandle, const uint8_t *buf, size_t len)
 		checksum += data[i];
 	}
 	if (checksum) {
-		U_LOG_W("Checksum mismatch: %02x", checksum);
+		U_LOG_W("Sensor radio: checksum mismatch %02x in the reply to %02x %02x", checksum, buf[0], buf[1]);
 		for (i = 0; i < 127; i++) {
 			U_LOG_D("%02x ", data[i]);
 		}
@@ -556,11 +563,11 @@ rift_sensor_esp770u_init_jpeg(libusb_device_handle *devhandle)
 	/*
 	 * Extra 64-byte fw writes, not sent for now - doesn't seem to matter:
 	 *        Data Fragment: 1681030100012ed10040000000000000
-	 *        Data Fragment: 070707070707070707070707070707070707070707070707070707070707070707070707…
+	 *        Data Fragment: 070707070707070707070707070707070707070707070707070707070707070707070707...
 	 *        Data Fragment: 16020100000000000000000000000000
 	 *        Data Fragment: 16
 	 *        Data Fragment: 1781030100012f160040000000000000
-	 *        Data Fragment: 010101010101010101010101010101010101010101010101010101010101010101010101…
+	 *        Data Fragment: 010101010101010101010101010101010101010101010101010101010101010101010101...
 	 *        Data Fragment: 17020100000000000000000000000000
 	 *        Data Fragment: 17
 	 */

@@ -155,6 +155,11 @@ Copyright: 2026, Aditya Mehra <aix.m@outlook.com>
 License: BSL-1.0
 Comment: RiftLinux: headset notice panels, Rift tab and test images (made by scripts/riftlinux/make_notice_images.py), the input check's action manifest, documentation images.
 
+Files: docs/google7eef3be274127c5d.html
+Copyright: 2026, Aditya Mehra <aix.m@outlook.com>
+License: BSL-1.0
+Comment: Google Search Console's ownership check for the user guide's website; must stay published.
+
 Files: llms.txt
 Copyright: 2026, Aditya Mehra <aix.m@outlook.com>
 License: CC-BY-4.0

@@ -1,4 +1,5 @@
 // Copyright 2026, Beyley Cardellio
+// SPDX-FileCopyrightText: 2026 Aditya Mehra <aix.m@outlook.com>
 // SPDX-License-Identifier: BSL-1.0
 /*!
  * @file
@@ -120,6 +121,7 @@ quaternionJetToSO3Jacobian(const Quaternion<ceres::Jet<double, N>> &q_jet, int p
  * @param[in]  corrected_gyro  Bias-corrected gyroscope reading.
  * @param[in]  accel_scale     The accelerometer scale.
  * @param      dt              Delta time
+ * @param      accel_noise_scale How much noisier than kAccelNoiseDensity the accelerometer is taken to be.
  * @param[out] covariance      Out covariance matrix
  */
 static void
@@ -128,6 +130,7 @@ propagateCovariance(const Quaterniond &Q_start_cur,
                     const Vector3d &corrected_gyro,
                     const Vector3d &accel_scale,
                     double dt,
+                    double accel_noise_scale,
                     PreintegrationCovarianceMatrix &covariance)
 {
 	if (dt <= 0.0) {
@@ -170,7 +173,8 @@ propagateCovariance(const Quaterniond &Q_start_cur,
 	 */
 	Matrix<double, 6, 6> noise = Matrix<double, 6, 6>::Zero();
 	noise.block<3, 3>(0, 0) = Matrix3d::Identity() * (kGyroNoiseDensity * kGyroNoiseDensity / dt);
-	noise.block<3, 3>(3, 3) = Matrix3d::Identity() * (kAccelNoiseDensity * kAccelNoiseDensity / dt);
+	const double accel_noise = kAccelNoiseDensity * accel_noise_scale;
+	noise.block<3, 3>(3, 3) = Matrix3d::Identity() * (accel_noise * accel_noise / dt);
 
 	covariance = A * covariance * A.transpose() + B * noise * B.transpose();
 }
@@ -184,6 +188,7 @@ integrateSingleSample(const xrt_imu_sample &sample,
                       Quaternion<ImuBiasJet> &Q_start_cur,
                       Vector3<ImuBiasJet> &delta_velocity,
                       Vector3<ImuBiasJet> &delta_position,
+                      double accel_noise_scale,
                       PreintegrationCovarianceMatrix &covariance)
 {
 	// Convert the sample to a Jet type
@@ -204,12 +209,13 @@ integrateSingleSample(const xrt_imu_sample &sample,
 		const Quaterniond real_Q_start_cur = {Q_start_cur.w().a, Q_start_cur.x().a, //
 		                                      Q_start_cur.y().a, Q_start_cur.z().a};
 
-		propagateCovariance(real_Q_start_cur, //
-		                    real_accel,       //
-		                    real_gyro,        //
-		                    real_scale,       //
-		                    dt,               //
-		                    covariance);      //
+		propagateCovariance(real_Q_start_cur,  //
+		                    real_accel,        //
+		                    real_gyro,         //
+		                    real_scale,        //
+		                    dt,                //
+		                    accel_noise_scale, //
+		                    covariance);       //
 	}
 
 	// Rotate accel into starting frame, since it's in IMU frame when passed to us.
@@ -375,7 +381,8 @@ preintegrate(const std::span<const xrt_imu_sample> &imu_samples,
              const xrt_imu_sample &first_sample_after_end_time,
              const ImuBias<ImuBiasJet> &imu_bias,
              timepoint_ns start_time_ns,
-             timepoint_ns end_time_ns)
+             timepoint_ns end_time_ns,
+             double accel_noise_scale)
 {
 	assert(imu_samples.size() >= 1);
 
@@ -402,7 +409,7 @@ preintegrate(const std::span<const xrt_imu_sample> &imu_samples,
 		double dt = static_cast<double>(first_sample.timestamp_ns - start_time_ns) * 1e-9;
 
 		integrateSingleSample(first_sample, dt, accel_bias, gyro_bias, accel_scale, Q_start_cur, delta_velocity,
-		                      delta_position, covariance);
+		                      delta_position, accel_noise_scale, covariance);
 	}
 
 	// Integrate all samples in the sliding window.
@@ -413,7 +420,7 @@ preintegrate(const std::span<const xrt_imu_sample> &imu_samples,
 		double dt = static_cast<double>(next_sample.timestamp_ns - sample.timestamp_ns) * 1e-9;
 
 		integrateSingleSample(next_sample, dt, accel_bias, gyro_bias, accel_scale, Q_start_cur, delta_velocity,
-		                      delta_position, covariance);
+		                      delta_position, accel_noise_scale, covariance);
 	}
 
 	// Integrate the last sample to end time, if necessary.
@@ -421,7 +428,7 @@ preintegrate(const std::span<const xrt_imu_sample> &imu_samples,
 		double dt = static_cast<double>(end_time_ns - last_sample.timestamp_ns) * 1e-9;
 
 		integrateSingleSample(first_sample_after_end_time, dt, accel_bias, gyro_bias, accel_scale, Q_start_cur,
-		                      delta_velocity, delta_position, covariance);
+		                      delta_velocity, delta_position, accel_noise_scale, covariance);
 	}
 
 	// Extract out the jacobians from Jet states.
@@ -453,7 +460,7 @@ preintegrate(const std::span<const xrt_imu_sample> &imu_samples,
 	    .J_p_bg = J_p.block<3, 3>(0, ImuBias<double>::kGyroBiasIndex),
 	};
 
-	// Sigma = L L^T, so the whitener is L^-1 — a triangular solve, not an inverse.
+	// Sigma = L L^T, so the whitener is L^-1, a triangular solve, not an inverse.
 	Eigen::LLT<PreintegrationCovarianceMatrix> llt(covariance);
 	if (llt.info() != Eigen::Success) {
 		/*

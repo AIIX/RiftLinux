@@ -10,8 +10,11 @@
 
 #include "xrt/xrt_byte_order.h"
 
+#include "os/os_time.h"
+
 #include "util/u_debug.h"
 #include "util/u_logging.h"
+#include "util/u_time.h"
 #include "util/u_var.h"
 #include "util/u_linux.h"
 #include "util/u_trace_marker.h"
@@ -510,11 +513,23 @@ rift_sensor_usb_thread_run(void *user_ptr)
 	int ticks = 0;
 #endif
 
+	timepoint_ns stall_checked_ns = 0;
 	while (os_thread_helper_is_running_locked(&context->usb_thread) && result >= 0) {
 		os_thread_helper_unlock(&context->usb_thread);
 
 		result = libusb_handle_events_timeout_completed(context->usb_ctx,
 		                                                &(struct timeval){.tv_sec = 0, .tv_usec = 1000}, NULL);
+
+		// Now and then: a sensor whose pictures stopped is told while it lasts, also when no transfer comes back.
+		const timepoint_ns now_ns = os_monotonic_get_ns();
+		if (now_ns - stall_checked_ns > 100 * U_TIME_1MS_IN_NS) {
+			stall_checked_ns = now_ns;
+			for (uint32_t i = 0; i < context->sensor_count; i++) {
+				if (context->sensors[i].frame_server != NULL) {
+					uvc_fs_check_stall(context->sensors[i].frame_server);
+				}
+			}
+		}
 
 		// if timeout, ignore and just loop again to check if we should exit, otherwise handle the error
 		if (result == LIBUSB_ERROR_TIMEOUT) {

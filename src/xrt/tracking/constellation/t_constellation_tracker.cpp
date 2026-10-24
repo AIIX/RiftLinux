@@ -174,6 +174,23 @@ DEBUG_GET_ONCE_FLOAT_OPTION(constellation_tracker_rig_watch_mm, "CONSTELLATION_T
  * its view by up to a metre: the HMD is always about as far away.
  */
 #define CT_RIG_WATCH_PLACE_PAIRS 150
+/*
+ * Only new views of a device, and windows over which it moved around: a headset lying still in view of two sensors
+ * gave the watch the same view frame after frame, with the same depth error (two front sensors put a headset lying
+ * still 85 mm apart, worn 4-26 mm), and the watch took that for a sensor moved along its view: it placed one again
+ * 269 mm off and saved that, and the next start placed it back. A frame is compared when the device's fused pose moved
+ * CT_RIG_WATCH_NEW_VIEW_M or turned CT_RIG_WATCH_NEW_VIEW_DEG since the frame the watch last compared: a camera's own
+ * solves of a headset lying still wander by up to 15 mm and 4 degrees, its fused pose stays put (a recording lying on a
+ * bed: 3 new views in 53 s; worn sessions 4-17 per second). A window counts when the device also moved
+ * CT_RIG_WATCH_REACH_M or turned CT_RIG_WATCH_REACH_DEG from its first view in it (every 200-pair window of worn
+ * sessions did, 72-99 % of the 20-pair ones); one that didn't is dropped and changes no strikes. Placing a camera found
+ * moved takes every pair: from new views only, a moved sensor of a two-sensor session never settled (spread 38-59 mm)
+ * and stayed left out.
+ */
+#define CT_RIG_WATCH_NEW_VIEW_M 0.01f
+#define CT_RIG_WATCH_NEW_VIEW_DEG 1.0f
+#define CT_RIG_WATCH_REACH_M 0.05f
+#define CT_RIG_WATCH_REACH_DEG 10.0f
 #define CT_RIG_WATCH_REFINE_PAIRS 1500
 //! Placed only when its candidate poses agree: median absolute deviation per axis, and of the rotation. Over the
 //! 1500 pairs of the second placement the device moves around more, and so do the candidates.
@@ -961,7 +978,12 @@ Camera::bindingPrior(Device *device,
 		}
 		out_pos_tolerance = &tracker->prior_tolerance_pos;
 	} else {
-		if (tracker->held_prior_ns <= 0 || since_solve_ns > tracker->held_prior_ns) {
+		/*
+		 * A headset's held prior (see SensorFusion::getTrackedPose) binds no longer than a tracked one: the head it
+		 * sits on walks away from where it was lost.
+		 */
+		const timepoint_ns binds_ns = device->params.head ? tracker->prior_fresh_ns : tracker->held_prior_ns;
+		if (binds_ns <= 0 || since_solve_ns > binds_ns) {
 			return false;
 		}
 		out_pos_tolerance = &tracker->held_prior_tolerance_pos;
@@ -1185,7 +1207,8 @@ bool
 Camera::tryDevicePoseShifted(Device *device,
                              CameraSample &sample,
                              DeviceState &device_state,
-                             const std::optional<xrt_space_relation> &Tcv_cam_device_prior)
+                             const std::optional<xrt_space_relation> &Tcv_cam_device_prior,
+                             SolveSource source)
 {
 	/*
 	 * Off by default: replaying two worn sessions, it got more of the controllers in one (left 68 -> 84 %, right 29
@@ -1259,8 +1282,52 @@ Camera::tryDevicePoseShifted(Device *device,
 	shifted.position.x += mx * prior.position.z / static_cast<float>(this->model.calib_pinhole.fx);
 	shifted.position.y += my * prior.position.z / static_cast<float>(this->model.calib_pinhole.fy);
 
-	return this->tryDevicePose(device, sample, device_state, Tcv_cam_device_prior, shifted,
-	                           SolveSource::FastPredictedShifted);
+	return this->tryDevicePose(device, sample, device_state, Tcv_cam_device_prior, shifted, source);
+}
+
+/*
+ * A headset no sensor sees is held turning about the neck (SensorFusion::getTrackedPose), and that is where the fast
+ * paths look for it. Turned in the hands, or about itself as it is put on, it stays where it was instead: a 50 degree
+ * turn carried the held pose 13 cm off the headset, whose 5-6 LEDs in view are too few for a search without a prior,
+ * and it was not found again for as long as it stayed so. Where it was last seen, turned as it is held, is tried too.
+ */
+#define CT_HELD_STILL_MIN_APART_M 0.02f
+
+bool
+Camera::tryDevicePoseHeldStill(Device *device,
+                               CameraSample &sample,
+                               DeviceState &device_state,
+                               const std::optional<xrt_pose> &Tcv_cam_world)
+{
+	if (!device->params.head || device_state.prior_position_tracked || !Tcv_cam_world.has_value() ||
+	    !device_state.Tcv_cam_device_predicted.has_value() || !device_state.Txr_world_device_prior.has_value()) {
+		return false;
+	}
+
+	xrt_pose Txr_world_device = device_state.Txr_world_device_prior.value();
+	{
+		std::unique_lock<os::Mutex> lock(device->data_lock);
+		const auto &last = device->locked_data.last_known_pose;
+		if (!last.has_value()) {
+			return false;
+		}
+		Txr_world_device.position = last->Txr_world_device.position;
+	}
+	if (m_vec3_len(Txr_world_device.position - device_state.Txr_world_device_prior->position) <
+	    CT_HELD_STILL_MIN_APART_M) {
+		return false;
+	}
+
+	xrt_pose Tcv_world_device;
+	math_pose_convert_from_opencv(&Txr_world_device, &Tcv_world_device);
+
+	std::optional<xrt_space_relation> Tcv_cam_device_held = device_state.Tcv_cam_device_predicted;
+	math_pose_transform(&Tcv_cam_world.value(), &Tcv_world_device, &Tcv_cam_device_held->pose);
+
+	return this->tryDevicePose(device, sample, device_state, Tcv_cam_device_held, Tcv_cam_device_held->pose,
+	                           SolveSource::FastHeldStill) ||
+	       this->tryDevicePoseShifted(device, sample, device_state, Tcv_cam_device_held,
+	                                  SolveSource::FastHeldStill);
 }
 
 /*
@@ -1994,6 +2061,11 @@ Camera::processSampleFast(CameraSample &sample)
 			continue;
 		}
 
+		if (this->tryDevicePoseHeldStill(device, sample, device_state, Tcv_cam_world)) {
+			CT_DEBUG(tracker, "Fast processing for device %d succeeded where it was last seen", device->id);
+			continue;
+		}
+
 		if (Tcv_cam_device_predicted.has_value() &&
 		    this->tryDevicePoseFewLeds(device, sample, device_state, Tcv_cam_device_predicted)) {
 			CT_DEBUG(tracker, "Fast processing for device %d succeeded from a few LEDs", device->id);
@@ -2179,8 +2251,11 @@ Camera::feedRigWatch(Device *device,
 		}
 	}
 
-	this->tracker->watchRig(device->id, mosaic->index, this->index, sample.timestamp_ns, Txr_world_cam, Txr_cam_device,
-	                        tilt_deg, fusion_deg);
+	const bool fused_valid = (fused.relation_flags & XRT_SPACE_RELATION_POSITION_VALID_BIT) != 0 &&
+	                         (fused.relation_flags & XRT_SPACE_RELATION_ORIENTATION_VALID_BIT) != 0;
+	this->tracker->watchRig(device->id, mosaic->index, this->index, sample.timestamp_ns, Txr_world_cam,
+	                        Txr_cam_device, tilt_deg, fusion_deg,
+	                        fused_valid ? std::optional<xrt_pose>(fused.pose) : std::nullopt);
 }
 
 /*
@@ -2281,12 +2356,20 @@ Camera::probeForRigWatch(CameraSample &sample, Device *device)
 	}
 	pose_metrics_evaluate_pose(&score, &Tcv_cam_device, probe.blobs, probe.blob_count, &device->params.led_model,
 	                           device->id, &this->model, NULL);
-	const float rms_px = score.matched_blobs > 0 ? sqrtf(score.reprojection_error / score.matched_blobs) : 0.0f;
-	if (score.matched_blobs >= CT_RIG_WATCH_MIN_LEDS && rms_px <= CT_RIG_WATCH_MAX_RMS_PX) {
-		this->rig_watch_probe_found = Tcv_cam_device;
+	float rms_px = score.matched_blobs > 0 ? sqrtf(score.reprojection_error / score.matched_blobs) : 0.0f;
+	uint32_t matched = score.matched_blobs;
+	// As a solve's: the watch learns from the rigid LEDs alone.
+	xrt_pose Tcv_cam_rigid = Tcv_cam_device;
+	if (device->partBlobs(probe.blobs, probe.blob_count) > 0 &&
+	    !device->rigidPose(*tracker, this->model, probe.blobs, probe.blob_count, Tcv_cam_device, Tcv_cam_rigid,
+	                       matched, rms_px)) {
+		return;
+	}
+	if (matched >= CT_RIG_WATCH_MIN_LEDS && rms_px <= CT_RIG_WATCH_MAX_RMS_PX) {
+		this->rig_watch_probe_found = Tcv_cam_rigid;
 		this->rig_watch_probe_found_ns = sample.timestamp_ns;
 	}
-	this->feedRigWatch(device, sample, Tcv_cam_device, score.matched_blobs, rms_px);
+	this->feedRigWatch(device, sample, Tcv_cam_rigid, matched, rms_px);
 }
 
 bool
@@ -2429,12 +2512,27 @@ Camera::pushPose(CameraSample &camera_sample,
 	}
 
 	/*
+	 * What the cameras' placement and the room learn from a solve comes from the rigid LEDs alone: a loose part's
+	 * LEDs sit where the part was last measured, and a solve that used them bends by as much as that is off. A
+	 * measurement from another day had a camera placed again 6 cm from where it stood.
+	 */
+	xrt_pose Tcv_cam_rigid = Tcv_cam_device;
+	uint32_t rigid_matched = score.matched_blobs;
+	float rigid_rms_px = rms_px;
+	const bool used_part = fits && device->partBlobs(camera_sample.blobs, camera_sample.blob_count) > 0;
+	const bool rigid_ok = !used_part || device->rigidPose(*tracker, this->model, camera_sample.blobs,
+	                                                      camera_sample.blob_count, Tcv_cam_device, Tcv_cam_rigid,
+	                                                      rigid_matched, rigid_rms_px);
+
+	/*
 	 * The moved-camera watch sees every solve that fits, before the gravity and prior checks: a moved camera's solves
 	 * are the ones they turn away. It only reads (the IMU's down, the fusion's pose) until a camera is found moved.
 	 */
 	bool left_out = false;
 	if (fits && debug_get_bool_option_constellation_tracker_rig_watch()) {
-		this->feedRigWatch(device, camera_sample, Tcv_cam_device, score.matched_blobs, rms_px);
+		if (rigid_ok) {
+			this->feedRigWatch(device, camera_sample, Tcv_cam_rigid, rigid_matched, rigid_rms_px);
+		}
 		std::shared_ptr<CameraMosaic> watch_mosaic = this->mosaic.lock();
 		left_out = watch_mosaic && tracker->rigWatchLeavesOut(watch_mosaic->index, this->index);
 	}
@@ -2491,12 +2589,15 @@ Camera::pushPose(CameraSample &camera_sample,
 	// For the moved-camera watch's probe: this camera still finds this device.
 	this->rig_watch_seen_ns[device->id % XRT_CONSTELLATION_MAX_DEVICES].store(camera_sample.timestamp_ns);
 
-	// For a loose part: where the device is, from its rigid LEDs.
-	if (device->loose_part && rms_px <= CT_RIG_WATCH_MAX_RMS_PX &&
-	    device->rigidBlobs(camera_sample) >= CT_RIG_WATCH_MIN_LEDS) {
+	/*
+	 * For a loose part: where the device is, from its rigid LEDs. Never from a solve that used the part's: one bent
+	 * to fit them where they were measured always finds them there, and a part that moved would pass every check.
+	 */
+	if (device->loose_part && rigid_ok && rigid_rms_px <= CT_RIG_WATCH_MAX_RMS_PX &&
+	    (used_part ? rigid_matched : device->rigidBlobs(camera_sample)) >= CT_RIG_WATCH_MIN_LEDS) {
 		if (std::shared_ptr<CameraMosaic> part_mosaic = this->mosaic.lock()) {
 			device->loosePartSolve(static_cast<uint32_t>(part_mosaic->index * XRT_TRACKING_MAX_CAMS + this->index),
-			                       camera_sample, this->model, Tcv_cam_device);
+			                       camera_sample, this->model, Tcv_cam_rigid);
 		}
 	}
 
@@ -2756,12 +2857,15 @@ Device::Device(ConstellationTracker *tracker,
 	this->params.led_model.leds = nullptr;
 	this->params.led_model.led_count = 0;
 
-	// Measured before on this device: in the model at once, checked from the first frames on.
+	/*
+	 * Measured before on this device: in the model once the first frames show its LEDs there. The strap moves when
+	 * the headset is put on, and a part in the model where it no longer sits bends the solves that use it.
+	 */
 	std::optional<xrt_pose> saved;
 	if (!this->loose_part->serial.empty() && debug_get_bool_option_constellation_tracker_loose_part_saved()) {
 		saved = tracker->loadLoosePart(this->loose_part->serial);
 	}
-	this->buildLedModel(saved);
+	this->buildLedModel(std::nullopt);
 
 	LoosePartState *state = this->loose_part.get();
 	state->estimator = std::make_unique<LoosePartEstimator>(
@@ -2776,11 +2880,11 @@ Device::Device(ConstellationTracker *tracker,
 		    tracker->loose_part_pending.store(true);
 	    });
 	if (saved.has_value()) {
-		state->estimator->setInUse(saved.value());
+		state->estimator->setSaved(saved.value());
 	}
 	CT_INFO(tracker, "Device %d has %zu LEDs on an adjustable part (%s): %s.", id, state->part_leds.size(),
 	        state->serial.empty() ? "no serial" : state->serial.c_str(),
-	        saved.has_value() ? "in the model as measured before, checked again" : "measured once it is seen");
+	        saved.has_value() ? "measured before, used once it is seen there again" : "measured once it is seen");
 }
 
 void
@@ -2823,14 +2927,91 @@ Device::rigidBlobs(const CameraSample &sample) const
 		if (b.matched_device_id != this->id) {
 			continue;
 		}
-		if (this->loose_part && b.matched_device_led_id >= 0 &&
-		    (size_t)b.matched_device_led_id < this->loose_part->is_part_led.size() &&
-		    this->loose_part->is_part_led[(size_t)b.matched_device_led_id]) {
+		if (this->isPartLed(b.matched_device_led_id)) {
 			continue;
 		}
 		n++;
 	}
 	return n;
+}
+
+bool
+Device::isPartLed(t_constellation_led_id_it led_id) const
+{
+	return this->loose_part && led_id >= 0 && (size_t)led_id < this->loose_part->is_part_led.size() &&
+	       this->loose_part->is_part_led[(size_t)led_id];
+}
+
+uint32_t
+Device::partBlobs(const t_blob *blobs, uint32_t blob_count) const
+{
+	uint32_t n = 0;
+	for (uint32_t i = 0; i < blob_count; i++) {
+		if (blobs[i].matched_device_id == this->id && this->isPartLed(blobs[i].matched_device_led_id)) {
+			n++;
+		}
+	}
+	return n;
+}
+
+bool
+Device::rigidPose(const ConstellationTracker &tracker,
+                  const camera_model &model,
+                  const t_blob *blobs,
+                  uint32_t blob_count,
+                  const xrt_pose &Tcv_cam_device,
+                  xrt_pose &out_pose,
+                  uint32_t &out_matched,
+                  float &out_rms_px)
+{
+	std::vector<t_blob> rigid(blobs, blobs + blob_count);
+	for (t_blob &b : rigid) {
+		if (b.matched_device_id == this->id && this->isPartLed(b.matched_device_led_id)) {
+			b.matched_device_id = XRT_CONSTELLATION_INVALID_DEVICE_ID;
+			b.matched_device_led_id = XRT_CONSTELLATION_INVALID_LED_ID;
+		}
+	}
+	RawPoseCovarianceMatrix covariance;
+	if (!optimizePose(tracker.log_level, tracker.deterministic, model, Tcv_cam_device, rigid.data(),
+	                  static_cast<uint32_t>(rigid.size()), &this->params.led_model, this->id, out_pose, covariance)) {
+		return false;
+	}
+
+	// How well it fits the rigid LEDs it kept, the way a solve's own fit is told.
+	double squared_px = 0.0;
+	uint32_t matched = 0;
+	for (const t_blob &b : rigid) {
+		if (b.matched_device_id != this->id) {
+			continue;
+		}
+		const t_constellation_tracker_led *led = nullptr;
+		for (size_t i = 0; i < this->params.led_model.led_count; i++) {
+			if (this->params.led_model.leds[i].id == b.matched_device_led_id) {
+				led = &this->params.led_model.leds[i];
+				break;
+			}
+		}
+		if (led == nullptr) {
+			continue;
+		}
+		xrt_vec3 p;
+		math_quat_rotate_vec3(&out_pose.orientation, &led->position, &p);
+		p = m_vec3_add(p, out_pose.position);
+		float x, y;
+		if (p.z <= 0.0f || !t_camera_models_project(&model.calib_pinhole, p.x, p.y, p.z, &x, &y)) {
+			continue;
+		}
+		const double dx = x - b.center_undistorted.x;
+		const double dy = y - b.center_undistorted.y;
+		squared_px += dx * dx + dy * dy;
+		matched++;
+	}
+	if (matched == 0) {
+		return false;
+	}
+	out_matched = matched;
+	out_rms_px = sqrtf(static_cast<float>(squared_px / matched));
+	return true;
 }
 
 namespace {
@@ -2843,9 +3024,7 @@ loose_part_blobs(const Device &device, const CameraSample &sample)
 	for (uint32_t i = 0; i < sample.blob_count; i++) {
 		const t_blob &b = sample.blobs[i];
 		const bool unclaimed = b.matched_device_id == XRT_CONSTELLATION_INVALID_DEVICE_ID;
-		const bool part = b.matched_device_id == device.id && b.matched_device_led_id >= 0 &&
-		                  (size_t)b.matched_device_led_id < device.loose_part->is_part_led.size() &&
-		                  device.loose_part->is_part_led[(size_t)b.matched_device_led_id];
+		const bool part = b.matched_device_id == device.id && device.isPartLed(b.matched_device_led_id);
 		if (unclaimed || part) {
 			out.push_back(b.center_undistorted);
 		}
@@ -4104,6 +4283,22 @@ rig_watch_direction_deg(const ConstellationTracker::RigWatchSolve &solve, const 
 	return RAD_TO_DEG(acosf(CLAMP(m_vec3_dot(in_cam, solve.Txr_cam_device.position) / lengths, -1.0f, 1.0f)));
 }
 
+//! How far @p to is turned from @p from, degrees.
+static float
+rig_watch_turned_deg(const xrt_pose &from, const xrt_pose &to)
+{
+	xrt_quat delta;
+	math_quat_unrotate(&from.orientation, &to.orientation, &delta);
+	return RAD_TO_DEG(2.0f * acosf(CLAMP(fabsf(delta.w), 0.0f, 1.0f)));
+}
+
+//! Whether @p to moved at least @p min_m or turned at least @p min_deg from @p from.
+static bool
+rig_watch_moved(const xrt_pose &from, const xrt_pose &to, float min_m, float min_deg)
+{
+	return m_vec3_len(to.position - from.position) >= min_m || rig_watch_turned_deg(from, to) >= min_deg;
+}
+
 static float
 rig_watch_median(std::vector<float> values)
 {
@@ -4173,7 +4368,8 @@ ConstellationTracker::watchRig(t_constellation_device_id_t device_id,
                                const xrt_pose &Txr_world_cam,
                                const xrt_pose &Txr_cam_device,
                                float tilt_deg,
-                               float fusion_deg)
+                               float fusion_deg,
+                               const std::optional<xrt_pose> &Txr_world_device_fused)
 {
 	const CameraKey self{mosaic_idx, camera_idx};
 	const RigWatchSolve solve{timestamp_ns, Txr_world_cam, Txr_cam_device};
@@ -4220,6 +4416,28 @@ ConstellationTracker::watchRig(t_constellation_device_id_t device_id,
 		};
 		keep_recent(w.tilt[{device_id, mosaic_idx, camera_idx}], tilt_deg);
 		keep_recent(w.fusion[{device_id, mosaic_idx, camera_idx}], fusion_deg);
+
+		// A new view (CT_RIG_WATCH_NEW_VIEW_M): the frame last compared, or the fused pose away from it.
+		bool new_view = false;
+		if (Txr_world_device_fused.has_value()) {
+			const auto it = w.view.find(device_id);
+			new_view = it == w.view.end() || it->second.first == timestamp_ns ||
+			           rig_watch_moved(it->second.second, Txr_world_device_fused.value(),
+			                           CT_RIG_WATCH_NEW_VIEW_M, CT_RIG_WATCH_NEW_VIEW_DEG);
+		}
+		// How far the device moved over a window, from the first view in it (CT_RIG_WATCH_REACH_M).
+		auto extend = [&](RigWatchReach &reach, bool starts) {
+			const xrt_pose &view = Txr_world_device_fused.value();
+			if (starts) {
+				reach = RigWatchReach{view, 0.0f, 0.0f};
+				return;
+			}
+			reach.m = std::max(reach.m, m_vec3_len(view.position - reach.first.position));
+			reach.deg = std::max(reach.deg, rig_watch_turned_deg(reach.first, view));
+		};
+		auto moved_around = [](const RigWatchReach &reach) {
+			return reach.m >= CT_RIG_WATCH_REACH_M || reach.deg >= CT_RIG_WATCH_REACH_DEG;
+		};
 
 		for (const auto &[key, other] : w.last) {
 			const auto &[other_device, other_mosaic, other_camera] = key;
@@ -4288,6 +4506,12 @@ ConstellationTracker::watchRig(t_constellation_device_id_t device_id,
 				}
 			}
 
+			// Only new views are compared; placing a camera again, above, takes every pair.
+			if (!new_view) {
+				continue;
+			}
+			w.view[device_id] = {timestamp_ns, Txr_world_device_fused.value()};
+
 			/*
 			 * Watching: the larger of each camera's own direction to the device against where the other
 			 * camera's solve of the same frame puts it, through the rig.
@@ -4305,8 +4529,13 @@ ConstellationTracker::watchRig(t_constellation_device_id_t device_id,
 			bool on_direction = true;
 
 			std::vector<float> &window = w.window[pair];
+			RigWatchReach &reach = w.reach[pair];
+			extend(reach, window.empty());
 			window.push_back(deg);
-			if (window.size() >= CT_RIG_WATCH_WINDOW) {
+			if (window.size() >= CT_RIG_WATCH_WINDOW && !moved_around(reach)) {
+				// The same few views of a device lying still: they tell nothing (CT_RIG_WATCH_REACH_M).
+				window.clear();
+			} else if (window.size() >= CT_RIG_WATCH_WINDOW) {
 				const float median_deg = rig_watch_median(window);
 				window.clear();
 				w.last_median[pair] = {timestamp_ns, median_deg};
@@ -4324,9 +4553,13 @@ ConstellationTracker::watchRig(t_constellation_device_id_t device_id,
 
 			// How far apart they put the device, for a camera moved along its view.
 			std::vector<xrt_vec3> &apart = w.apart[pair];
+			RigWatchReach &apart_reach = w.apart_reach[pair];
+			extend(apart_reach, apart.empty());
 			apart.push_back(self < other_key ? Txr_world_device_other.position - Txr_world_device_self.position
 			                                 : Txr_world_device_self.position - Txr_world_device_other.position);
-			if (apart.size() >= CT_RIG_WATCH_APART_WINDOW) {
+			if (apart.size() >= CT_RIG_WATCH_APART_WINDOW && !moved_around(apart_reach)) {
+				apart.clear();
+			} else if (apart.size() >= CT_RIG_WATCH_APART_WINDOW) {
 				std::vector<float> axis[3];
 				for (const xrt_vec3 &v : apart) {
 					axis[0].push_back(v.x);
@@ -5259,6 +5492,7 @@ ConstellationTracker::addDevice(t_constellation_tracker_device_params *params, t
 	new_device->sensor_fusion =
 	    std::make_unique<sensor_fusion::SensorFusion>(id, new_device->search_model->led_model);
 	new_device->sensor_fusion->deterministic = this->deterministic;
+	new_device->sensor_fusion->head = params->head;
 
 	for (auto &mosaic : this->mosaics) {
 		for (auto &camera : mosaic->cameras) {
@@ -5510,9 +5744,24 @@ constellation_tracker_camera_push_blobs(t_blob_sink *tbs, t_blob_observation *tb
 	// Frames come in at the sensor's rate, a gap means they were late or lost before reaching the tracker.
 	const timepoint_ns now_ns = os_monotonic_get_ns();
 	const timepoint_ns last_ns = camera->last_push_ns.exchange(now_ns);
+	if (last_ns == 0) {
+		camera->first_push_ns.store(now_ns);
+	}
 	if (last_ns != 0 && now_ns - last_ns > 30 * U_TIME_1MS_IN_NS) {
-		CT_WARN(tracker, "Camera %zu: no frame arrived for %.1f ms, until %" PRIi64 " (frame at %" PRIi64 ").",
-		        camera->index, time_ns_to_ms_f(now_ns - last_ns), now_ns, tbo->timestamp_ns);
+		/*
+		 * Once, at its start: a sensor set to take its exposures in step with the headset's LEDs re-times its frames,
+		 * and one or two are lost (the Oculus runtime's own capture shows the same, 48 ms, at that step). Anything
+		 * longer, later, or a second time is frames lost on the way.
+		 */
+		const timepoint_ns first_ns = camera->first_push_ns.load();
+		const bool at_start = now_ns - first_ns < static_cast<timepoint_ns>(3) * U_TIME_1S_IN_NS;
+		if (at_start && now_ns - last_ns <= 150 * U_TIME_1MS_IN_NS && !camera->start_gap_seen.exchange(true)) {
+			CT_INFO(tracker, "Camera %zu: %.1f ms between frames as it starts taking them in step with the headset.",
+			        camera->index, time_ns_to_ms_f(now_ns - last_ns));
+		} else {
+			CT_WARN(tracker, "Camera %zu: no frame arrived for %.1f ms, until %" PRIi64 " (frame at %" PRIi64 ").",
+			        camera->index, time_ns_to_ms_f(now_ns - last_ns), now_ns, tbo->timestamp_ns);
+		}
 	}
 
 	// The sensors' state for status views, about once a second (one camera's thread does it).

@@ -725,6 +725,8 @@ struct rift_touch_controller_input_state
 	struct xrt_vec2 stick;
 	uint8_t haptic_counter;
 	float cap_stick;
+	//! The thumb on the stick, from cap_stick with hysteresis, see rift_touch_stick_touched.
+	bool stick_touched;
 	float cap_b_y;
 	float cap_a_x;
 	float cap_trigger;
@@ -1071,6 +1073,8 @@ struct rift_hmd
 
 	struct os_hid_device *hmd_dev;
 	struct os_hid_device *radio_dev;
+	//! Both Touch controllers as a gamepad for desktop programs, under RiftLinux's own runtime only (rift_gamepad.h).
+	struct rift_gamepad *touch_gamepad;
 
 	struct os_thread_helper sensor_thread;
 
@@ -1117,7 +1121,34 @@ struct rift_hmd
 	float default_icd;
 	float icd_override_m;
 
+	//! Worn: by the wear sensor, or moving as a head does (rift_head_motion_update); what the display and apps follow.
 	bool presence;
+	//! CV1: worn by the wear sensor alone; what the tracker is told (the back strap is measured only while worn).
+	bool presence_sensor;
+
+	/*!
+	 * CV1: whether the headset moves as one on a head does, from the gyro: the means of its 50 ms blocks over a
+	 * second span 1.35-2.2 degrees a second on a head held as still as it can be, 0.19-0.36 lying on a desk. Read in
+	 * the sensor thread only.
+	 */
+	struct
+	{
+		int64_t window_start_ns;
+		int64_t block_start_ns;
+		uint32_t block_count;
+		uint32_t blocks;
+		struct xrt_vec3 block_sum;
+		struct xrt_vec3 block_min;
+		struct xrt_vec3 block_max;
+		//! The accelerometer over the window: worn, gravity is within 7-17 degrees of the headset's up.
+		struct xrt_vec3 accel_sum;
+		uint32_t accel_count;
+		//! The last windows, newest in bit 0: whether each moved as a head does.
+		uint16_t history;
+		//! Moving like a head until then.
+		int64_t moving_until_ns;
+		bool logged;
+	} head_motion;
 
 	//! CV1: whether the panel is on, see rift_cv1_update_display_power.
 	bool display_on;
@@ -1272,6 +1303,70 @@ rift_min_mid_max_range_to_float(uint16_t range[3], uint16_t value)
 	} else {
 		return 0.5f - ((float)value - range[1]) / (range[2] - range[1]) * 0.5f;
 	}
+}
+
+/*!
+ * A Touch stick's axis from its factory calibration: 0 within its dead zone, where the stick rests, then from 0 at the
+ * dead zone's edge to 1 at the end of its range. Scaled from the range's middle instead, a stick resting just outside
+ * its dead zone read 0.05-0.10, mostly forward (the dead zones sit 3-16 counts off the ranges' middles: a right stick
+ * at rest flickered between 0 and +0.07), and games that walk where you look kept walking.
+ */
+static inline float
+rift_touch_stick_axis(uint16_t raw, const uint16_t range[2], const uint16_t dead[2])
+{
+	if (raw > dead[1]) {
+		const float span = (float)range[1] - (float)dead[1];
+		return span > 0.0f ? fminf(((float)raw - (float)dead[1]) / span, 1.0f) : 0.0f;
+	}
+	if (raw < dead[0]) {
+		const float span = (float)dead[0] - (float)range[0];
+		return span > 0.0f ? -fminf(((float)dead[0] - (float)raw) / span, 1.0f) : 0.0f;
+	}
+	return 0.0f;
+}
+
+/*!
+ * Worn sticks rest past their factory dead zone: a right Touch's at rest read +0.02 steadily, and a game that walks
+ * you where you look, with no dead zone of its own, walked you slowly on. So a round dead zone on top: zero below
+ * RIFT_TOUCH_STICK_DEAD_ZONE, then from zero at its edge to one at full push.
+ */
+#define RIFT_TOUCH_STICK_DEAD_ZONE 0.10f
+
+static inline struct xrt_vec2
+rift_touch_stick_dead_zone(struct xrt_vec2 stick)
+{
+	struct xrt_vec2 out = {0.0f, 0.0f};
+	const float length = sqrtf(stick.x * stick.x + stick.y * stick.y);
+	if (length <= RIFT_TOUCH_STICK_DEAD_ZONE) {
+		return out;
+	}
+	const float scaled = fminf((length - RIFT_TOUCH_STICK_DEAD_ZONE) / (1.0f - RIFT_TOUCH_STICK_DEAD_ZONE), 1.0f);
+	out.x = stick.x / length * scaled;
+	out.y = stick.y / length * scaled;
+	return out;
+}
+
+/*!
+ * The thumb on a Touch's stick, from its capacitive sensor: a thumb pushing a left Touch's stick read 0.34-0.62 of
+ * the factory touch level (0.00-0.10 untouched), so the stick counted as untouched while pushed in 98 % of a game's
+ * samples, and a game that moves you only while the stick is touched (SteamVR's legacy input makes it a touchpad's
+ * touch) stopped moving you. Touched from half the factory level, untouched again below a third of it, and a pushed
+ * stick always counts as touched.
+ */
+#define RIFT_TOUCH_STICK_TOUCH_ON 0.50f
+#define RIFT_TOUCH_STICK_TOUCH_OFF 0.35f
+
+static inline bool
+rift_touch_stick_touched(bool was_touched, float cap_stick)
+{
+	return cap_stick >= (was_touched ? RIFT_TOUCH_STICK_TOUCH_OFF : RIFT_TOUCH_STICK_TOUCH_ON);
+}
+
+//! The thumb on the stick, by its sensor or because the stick is pushed (out of its dead zones).
+static inline bool
+rift_touch_stick_in_use(const struct rift_touch_controller_input_state *state)
+{
+	return state->stick_touched || state->stick.x != 0.0f || state->stick.y != 0.0f;
 }
 
 bool

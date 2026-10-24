@@ -20,6 +20,7 @@
 #include "util/u_hand_tracking.h"
 
 #include "rift_internal.h"
+#include "rift_gamepad.h"
 #include "rift_radio.h"
 #include "rift_bindings.h"
 #include "rift_usb.h"
@@ -59,10 +60,24 @@ rift_update_input(struct xrt_device *device, size_t index, union xrt_input_value
 #define RIFT_TOUCH_DEAD_RECKON_MAX_DISTANCE_M 0.3f
 
 /*!
- * A hold starts where the app last saw the controller rather than at its last solve, so it stops without jumping back,
- * unless the two are further apart than this.
+ * Found again after a hold, the app gets the sensor fusion's pose once it is this close to the solve that found it.
  */
 #define RIFT_TOUCH_APP_HOLD_MAX_OFFSET_M 0.15f
+
+/*!
+ * How far from its last solve the app may see a controller: as far as a hand gets, this plus this speed times the
+ * time since the solve. Right after a solve the fusion carried controllers 0.3-1.5 m off within 150 ms (velocities of
+ * up to 10 m/s from poor solves), unchecked until then, and the app showed them there until the hold put them back:
+ * the controllers jumped. Replayed on two sessions, the jumps over 150 mm went from 30 to 2.
+ */
+#define RIFT_TOUCH_APP_REACH_M 0.10f
+#define RIFT_TOUCH_APP_REACH_SPEED_M_S 3.0f
+
+/*!
+ * A hold starts where the app last saw the controller rather than at its last solve, so it stops without jumping back,
+ * unless the two are further apart than a hand gets by the end of RIFT_TOUCH_POSITION_HOLD_NS.
+ */
+#define RIFT_TOUCH_APP_HOLD_FROM_SHOWN_M 0.55f
 
 /*!
  * For this long after its last solve, a lost controller's held pose is the constellation tracker's prior: where it was
@@ -117,6 +132,19 @@ touch_get_fused_relation(struct rift_touch_controller *controller,
 	    XRT_SPACE_RELATION_POSITION_VALID_BIT | XRT_SPACE_RELATION_ORIENTATION_VALID_BIT;
 	if ((relation.relation_flags & needed) != needed) {
 		return false;
+	}
+
+	// Never further from the last solve than a hand gets (the app's pose only; the prior is the tracker's own).
+	if (!for_prior) {
+		os_mutex_lock(&controller->pose_hold.mutex);
+		const bool have_solved = controller->pose_hold.have;
+		const struct xrt_vec3 last_solved = controller->pose_hold.position;
+		os_mutex_unlock(&controller->pose_hold.mutex);
+		const float reach_m =
+		    RIFT_TOUCH_APP_REACH_M + RIFT_TOUCH_APP_REACH_SPEED_M_S * (float)age_ns / (float)U_TIME_1S_IN_NS;
+		if (have_solved && m_vec3_len(m_vec3_sub(relation.pose.position, last_solved)) > reach_m) {
+			return false;
+		}
 	}
 
 	// Carried on past RIFT_TOUCH_POSITION_HOLD_NS only while it looks like a hand moving, not a fusion running off.
@@ -224,7 +252,22 @@ touch_get_app_relation(struct rift_touch_controller *controller, int64_t at_ns, 
 	os_mutex_unlock(&controller->input.mutex);
 
 	struct xrt_space_relation fused;
-	if (touch_get_fused_relation(controller, at_ns, false, &fused)) {
+	bool use_fused = touch_get_fused_relation(controller, at_ns, false, &fused);
+	if (use_fused) {
+		/*
+		 * Seen again after a hold, the sensor fusion had not taken in the new solve yet: still carried on from the
+		 * last one by the IMU, it stood 1.2 and 1.8 m from where the sensors saw the controller, and the app jumped
+		 * there for a moment and back. Held until the fusion agrees with the solve, then it slides in.
+		 */
+		os_mutex_lock(&controller->pose_hold.mutex);
+		if (controller->pose_hold.app_was_held && controller->pose_hold.have &&
+		    m_vec3_len(m_vec3_sub(fused.pose.position, controller->pose_hold.position)) >
+		        RIFT_TOUCH_APP_HOLD_MAX_OFFSET_M) {
+			use_fused = false;
+		}
+		os_mutex_unlock(&controller->pose_hold.mutex);
+	}
+	if (use_fused) {
 		os_mutex_lock(&controller->pose_hold.mutex);
 		if (controller->pose_hold.app_was_held) {
 			controller->pose_hold.app_was_held = false;
@@ -262,7 +305,7 @@ touch_get_app_relation(struct rift_touch_controller *controller, int64_t at_ns, 
 		const struct xrt_vec3 shown = controller->pose_hold.app_tracked_position;
 		controller->pose_hold.app_hold_position =
 		    controller->pose_hold.have_app_tracked &&
-		            m_vec3_len(m_vec3_sub(shown, solved)) <= RIFT_TOUCH_APP_HOLD_MAX_OFFSET_M
+		            m_vec3_len(m_vec3_sub(shown, solved)) <= RIFT_TOUCH_APP_HOLD_FROM_SHOWN_M
 		        ? shown
 		        : solved;
 	}
@@ -427,7 +470,7 @@ rift_touch_controller_update_inputs(struct xrt_device *xdev)
 	rift_update_input(&controller->base, RIFT_TOUCH_CONTROLLER_INPUT_TRIGGER_TOUCH,
 	                  (union xrt_input_value){.boolean = input_state.cap_trigger >= 1}, update_ns);
 	rift_update_input(&controller->base, RIFT_TOUCH_CONTROLLER_INPUT_THUMBSTICK_TOUCH,
-	                  (union xrt_input_value){.boolean = input_state.cap_stick >= 1}, update_ns);
+	                  (union xrt_input_value){.boolean = rift_touch_stick_in_use(&input_state)}, update_ns);
 	rift_update_input(&controller->base, RIFT_TOUCH_CONTROLLER_INPUT_THUMBREST_TOUCH,
 	                  (union xrt_input_value){.boolean = input_state.cap_thumbrest >= 1}, update_ns);
 
@@ -466,7 +509,7 @@ rift_touch_controller_get_hand_tracking(struct xrt_device *xdev,
 	const float trigger = CLAMP(state.trigger, 0.0f, 1.0f);
 	const float grip = CLAMP(state.grip, 0.0f, 1.0f);
 	const bool thumb_down =
-	    state.cap_a_x >= 1 || state.cap_b_y >= 1 || state.cap_stick >= 1 || state.cap_thumbrest >= 1;
+	    state.cap_a_x >= 1 || state.cap_b_y >= 1 || rift_touch_stick_in_use(&state) || state.cap_thumbrest >= 1;
 	const struct u_hand_tracking_curl_values values = {
 	    .little = grip,
 	    .ring = grip,
@@ -1432,17 +1475,10 @@ rift_touch_controller_handle_radio_input_report(struct rift_hmd *hmd,
 	float trigger = rift_min_mid_max_range_to_float(c->trigger_range, (float)raw_trigger);
 	float grip = rift_min_mid_max_range_to_float(c->middle_range, (float)raw_grip);
 
-	struct xrt_vec2 joy;
-	if (raw_stick_x >= c->joy_x_dead[0] && raw_stick_x <= c->joy_x_dead[1] && raw_stick_y >= c->joy_y_dead[0] &&
-	    raw_stick_y <= c->joy_y_dead[1]) {
-		joy.x = 0.0f;
-		joy.y = 0.0f;
-	} else {
-		joy.x =
-		    ((float)raw_stick_x - c->joy_x_range[0]) / (c->joy_x_range[1] - c->joy_x_range[0]) * 2.0f - 1.0f;
-		joy.y =
-		    ((float)raw_stick_y - c->joy_y_range[0]) / (c->joy_y_range[1] - c->joy_y_range[0]) * 2.0f - 1.0f;
-	}
+	struct xrt_vec2 joy = rift_touch_stick_dead_zone((struct xrt_vec2){
+	    .x = rift_touch_stick_axis(raw_stick_x, c->joy_x_range, c->joy_x_dead),
+	    .y = rift_touch_stick_axis(raw_stick_y, c->joy_y_range, c->joy_y_dead),
+	});
 
 	struct xrt_vec3 raw_accel = {
 	    MATH_GRAVITY_M_S2 / 2048.0 * (float)message.touch.accel[0],
@@ -1530,10 +1566,18 @@ rift_touch_controller_handle_radio_input_report(struct rift_hmd *hmd,
 	controller->input.state.trigger = trigger;
 	controller->input.state.grip = grip;
 	controller->input.state.stick = joy;
+	// The two Touch controllers only (a paired tracked object reports through here too).
+	if (controller->device_type == RIFT_RADIO_DEVICE_LEFT_TOUCH ||
+	    controller->device_type == RIFT_RADIO_DEVICE_RIGHT_TOUCH) {
+		rift_gamepad_update(hmd->touch_gamepad, controller->device_type == RIFT_RADIO_DEVICE_LEFT_TOUCH,
+		                    &controller->input.state);
+	}
 
 	switch (message.touch.adc_channel) {
 	case RIFT_TOUCH_CONTROLLER_ADC_STICK:
 		controller->input.state.cap_stick = rift_min_mid_max_cap(c, 0, (float)message.touch.adc_value);
+		controller->input.state.stick_touched =
+		    rift_touch_stick_touched(controller->input.state.stick_touched, controller->input.state.cap_stick);
 		break;
 	case RIFT_TOUCH_CONTROLLER_ADC_A_X:
 		controller->input.state.cap_a_x = rift_min_mid_max_cap(c, 3, (float)message.touch.adc_value);
@@ -1813,6 +1857,11 @@ rift_radio_update_touch_haptics(struct rift_hmd *hmd, enum rift_radio_device_typ
 		controller->radio_data.silent = silent;
 		HMD_WARN(hmd, "Touch controller %d %s.", controller->device_type,
 		         silent ? "stopped reporting over the radio" : "reports over the radio again");
+		// Its buttons let go on the gamepad, rather than held for as long as it is gone.
+		if (silent && (controller->device_type == RIFT_RADIO_DEVICE_LEFT_TOUCH ||
+		               controller->device_type == RIFT_RADIO_DEVICE_RIGHT_TOUCH)) {
+			rift_gamepad_release(hmd->touch_gamepad, controller->device_type == RIFT_RADIO_DEVICE_LEFT_TOUCH);
+		}
 	}
 
 	if (last_ns == 0 || now - last_ns > RIFT_TOUCH_GONE_NS) {

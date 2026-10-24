@@ -1,6 +1,7 @@
 // Copyright 2017, Philipp Zabel
 // Copyright 2019-2021, Jan Schmidt
 // Copyright 2025-2026, Beyley Cardellio
+// SPDX-FileCopyrightText: 2026 Aditya Mehra <aix.m@outlook.com>
 // SPDX-License-Identifier: BSL-1.0
 /*!
  * @file
@@ -11,7 +12,9 @@
  * @ingroup drv_uvc
  */
 
+#include "os/os_time.h"
 #include "util/u_debug.h"
+#include "util/u_logging.h"
 
 #include "math/m_api.h"
 
@@ -70,6 +73,26 @@ uvc_stream_release_frame(struct xrt_frame *frame)
 	os_mutex_unlock(&stream->frames_lock);
 }
 
+/*
+ * RIFT_LOG_USB: every UVC control transfer (the sensor's setup, its radio bridge and image sensor registers) with its
+ * bytes, to compare with what the Oculus runtime sends (scripts/riftlinux/usbpcap_setup.py on a Windows capture).
+ */
+DEBUG_GET_ONCE_BOOL_OPTION(uvc_log_usb, "RIFT_LOG_USB", false)
+
+static void
+uvc_log_usb(libusb_device_handle *dev, const char *what, uint8_t entity, uint8_t selector, const void *data, int len)
+{
+	if (!debug_get_bool_option_uvc_log_usb() || len < 0) {
+		return;
+	}
+	char hex[3 * 72 + 1] = {0};
+	for (int i = 0; i < len && i < 72; i++) {
+		snprintf(hex + 3 * i, 4, "%02x ", ((const uint8_t *)data)[i]);
+	}
+	U_LOG_RAW("UVC_USB %.4f dev %u %s entity %u selector %u %d B: %s", (double)os_monotonic_get_ns() / 1e9,
+	          libusb_get_device_address(libusb_get_device(dev)), what, entity, selector, len, hex);
+}
+
 int
 uvc_set_cur(libusb_device_handle *dev,
             uint8_t usb_interface,
@@ -86,6 +109,7 @@ uvc_set_cur(libusb_device_handle *dev,
 	int ret;
 
 	ret = libusb_control_transfer(dev, bmRequestType, bRequest, wValue, wIndex, data, data_length, timeout);
+	uvc_log_usb(dev, ret < 0 ? "SET-FAILED" : "SET", entity, selector, data, data_length);
 	if (ret < 0) {
 		U_LOG_IFL_E(U_LOGGING_ERROR, "Failed to set transfer SET CUR %u %u: %d %s", entity, selector, ret,
 		            strerror(errno));
@@ -109,6 +133,7 @@ uvc_get_cur(libusb_device_handle *dev,
 	int ret;
 
 	ret = libusb_control_transfer(dev, bmRequestType, bRequest, wValue, wIndex, data, data_length, timeout);
+	uvc_log_usb(dev, ret < 0 ? "GET-FAILED" : "GET", entity, selector, data, ret < 0 ? 0 : ret);
 	if (ret < 0) {
 		U_LOG_IFL_E(U_LOGGING_ERROR, "Failed to transfer GET CUR %u %u: %d %s", entity, selector, ret,
 		            strerror(errno));
@@ -158,13 +183,30 @@ process_payload(struct uvc_fs *stream, unsigned char *payload, size_t len)
 		return;
 	}
 
+	/*
+	 * Until the first new frame: the tail of the one the stream started in, never seen whole. Counted, it was a
+	 * short frame dropped and a timestamp change inside it at every start.
+	 */
+	if (!stream->synced) {
+		if (stream->start_frame_id < 0) {
+			stream->start_frame_id = frame_id;
+			return;
+		}
+		if (frame_id == stream->start_frame_id) {
+			return;
+		}
+		stream->synced = true;
+		stream->frame_id = !frame_id;
+		stream->frame_collected = 0;
+	}
+
 	if (have_pts) {
 		pts = __le32_to_cpu(h->dwPresentationTime);
 		// Skip this warning for JPEG, where we only output when we see the frame change:
 		if (stream->frame_collected != 0 && pts != stream->cur_pts &&
 		    stream->parameters.format != XRT_FORMAT_MJPEG) {
-			UVC_WARN(stream, "UVC PTS changed in-frame at %zu bytes. Lost %u hz", stream->frame_collected,
-			         (pts - stream->cur_pts) * 1000);
+			UVC_WARN(stream, "UVC PTS changed in-frame at %zu bytes (%u to %u): part of a frame was lost",
+			         stream->frame_collected, stream->cur_pts, pts);
 			stream->cur_pts = pts;
 		}
 	}
@@ -197,6 +239,9 @@ process_payload(struct uvc_fs *stream, unsigned char *payload, size_t len)
 		stream->cur_pts = pts;
 		stream->frame_collected = 0;
 		stream->skip_frame = false;
+		// This packet carries image data and was counted already: what came before it was the gap.
+		stream->gap_packets = stream->packets_since_frame - 1;
+		stream->gap_data_packets = stream->data_packets_since_frame - 1;
 
 		if (stream->cur_frame == NULL) {
 			if (stream->skip_frame_start == 0) {
@@ -278,6 +323,21 @@ process_payload(struct uvc_fs *stream, unsigned char *payload, size_t len)
 
 	if (stream->frame_collected == stream->frame_size || is_eof) {
 		stream->cur_frame->size = stream->frame_collected;
+		const timepoint_ns now_ns = os_monotonic_get_ns();
+		if (stream->stall_logged_ns != 0 || (stream->last_frame_ns != 0 &&
+		                                     now_ns - stream->last_frame_ns > 250 * U_TIME_1MS_IN_NS)) {
+			UVC_WARN(stream,
+			         "UVC device %u: images again after %.1f s (%" PRIu64 " packets in between, %" PRIu64
+			         " with image data)",
+			         libusb_get_device_address(libusb_get_device(stream->devh)),
+			         time_ns_to_s(now_ns - stream->last_frame_ns), stream->gap_packets, stream->gap_data_packets);
+			stream->stall_logged_ns = 0;
+		}
+		stream->last_frame_ns = now_ns;
+		stream->packets_since_frame = 0;
+		stream->data_packets_since_frame = 0;
+		stream->gap_packets = 0;
+		stream->gap_data_packets = 0;
 		if (stream->sink) {
 			xrt_sink_push_frame(stream->sink, stream->cur_frame);
 		}
@@ -291,6 +351,21 @@ process_payload(struct uvc_fs *stream, unsigned char *payload, size_t len)
 	if (is_eof) {
 		stream->frame_collected = 0;
 	}
+}
+
+void
+uvc_fs_check_stall(struct xrt_fs *fs)
+{
+	struct uvc_fs *stream = uvc_fs(fs);
+	const timepoint_ns now_ns = os_monotonic_get_ns();
+	if (!stream->is_running || stream->last_frame_ns == 0 || stream->stall_logged_ns != 0 ||
+	    now_ns - stream->last_frame_ns <= U_TIME_1S_IN_NS) {
+		return;
+	}
+	UVC_WARN(stream, "UVC device %u: no image for %.1f s (%" PRIu64 " packets since, %" PRIu64 " with image data)",
+	         libusb_get_device_address(libusb_get_device(stream->devh)), time_ns_to_s(now_ns - stream->last_frame_ns),
+	         stream->packets_since_frame, stream->data_packets_since_frame);
+	stream->stall_logged_ns = now_ns;
 }
 
 void
@@ -330,6 +405,10 @@ iso_transfer_cb(struct libusb_transfer *transfer)
 
 		payload = libusb_get_iso_packet_buffer_simple(transfer, i);
 		payload_len = transfer->iso_packet_desc[i].actual_length;
+		stream->packets_since_frame++;
+		if (payload_len > 12) {
+			stream->data_packets_since_frame++;
+		}
 		process_payload(stream, payload, payload_len);
 	}
 
@@ -463,6 +542,15 @@ uvc_fs_stream_start(struct xrt_fs *xfs,
 
 	stream->is_running = true;
 	stream->cur_frame = NULL; // we use NULL to mean "no frame yet"
+	stream->synced = false;
+	stream->start_frame_id = -1;
+	stream->frame_collected = 0;
+	stream->last_frame_ns = 0;
+	stream->stall_logged_ns = 0;
+	stream->packets_since_frame = 0;
+	stream->data_packets_since_frame = 0;
+	stream->gap_packets = 0;
+	stream->gap_data_packets = 0;
 
 	// Allocate frames and put on the free list
 	stream->alloced_frames = calloc(min_frames, sizeof(struct xrt_frame));

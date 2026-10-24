@@ -558,7 +558,10 @@ vblank_event_func(struct comp_target *ct, int64_t *out_timestamp_ns)
 		valid = true;
 
 	} else if (ret == VK_TIMEOUT) {
-		COMP_WARN(ct->c, "vkWaitForFences: VK_TIMEOUT");
+		// The display went away while waiting (its output given up meanwhile, RiftLinux): no event comes from it.
+		if (cts->display != VK_NULL_HANDLE) {
+			COMP_WARN(ct->c, "vkWaitForFences: VK_TIMEOUT");
+		}
 	} else {
 		COMP_ERROR(ct->c, "vkWaitForFences: %s", vk_result_string(ret));
 	}

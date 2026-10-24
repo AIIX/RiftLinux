@@ -8,7 +8,9 @@
 # or riftlinux-run <application>, which also starts and stops the runtime.
 # In a terminal, Enter or Ctrl+C stops it. Started without one (the app menu's "RiftLinux Runtime"), it says what it
 # does in desktop notifications and runs until "Stop RiftLinux Runtime" (riftlinux-runtime --stop).
-# Usage: riftlinux-runtime [--stop | --status]
+# With --gamepad the Touch controllers are also a gamepad for desktop programs while it runs (Plasma Bigscreen and
+# others through SDL); without it, none appears.
+# Usage: riftlinux-runtime [--gamepad] [--stop | --status]
 D=${RIFTLINUX_NATIVE_DIR:-/usr/lib/riftlinux/native}
 # The way the kernel names the running program (it is found by that name): no doubled or trailing slashes, links followed.
 D=$(readlink -f "$D" 2>/dev/null || echo "$D")
@@ -42,6 +44,11 @@ steamvr_running() {
 	return 1
 }
 
+if [ "$1" = "--gamepad" ]; then
+	export RIFT_TOUCH_GAMEPAD=1
+	shift
+fi
+
 case "$1" in
 --stop)
 	P=$(pid_of "$D/monado-service") || { say "The RiftLinux runtime is not running."; exit 0; }
@@ -68,6 +75,25 @@ fi
 if pid_of "$D/monado-service" >/dev/null; then
 	say "The RiftLinux runtime is already running (or another Monado is)."
 	exit 0
+fi
+
+# Started from a remote (SSH) login, or in a background CPU class handed down by its launcher (CachyOS runs sshd as
+# background work, "sched": "idle", and everything started over SSH inherits it: the sensors then lose frames whenever
+# the graphics driver is busy, and real-time is refused): it runs as the user's own service instead, started by the
+# user's service manager as a desktop launch is, in the normal class and with real-time from RealtimeKit. Ctrl+C and
+# the end of the login stop it, as before. RiftLinux's and the runtime's settings in the environment go with it.
+POLICY=$(sed 's/^.*) //' /proc/$$/stat 2>/dev/null | cut -d' ' -f39)
+if [ -z "$RIFTLINUX_AS_SERVICE" ] && { [ -n "$SSH_CONNECTION" ] || [ "$POLICY" = 3 ] || [ "$POLICY" = 5 ]; } &&
+	command -v systemd-run >/dev/null 2>&1 && systemctl --user show-environment >/dev/null 2>&1; then
+	set -- -E RIFTLINUX_AS_SERVICE=1 -E RIFTLINUX_NATIVE_DIR="$D" -- "$(readlink -f "$0")" "$@"
+	for k in $(env | sed -n 's/^\(\(XRT\|RIFT\|RIFTLINUX\|CONSTELLATION\|T_CONSTELLATION\|IPC\|OXR\|U\|VK\|XR\)_[A-Za-z0-9_]*\)=.*/\1/p'); do
+		set -- -E "$k" "$@"
+	done
+	[ -n "$SSH_CONNECTION" ] && set -- -E SSH_CONNECTION "$@"
+	UNIT="riftlinux-runtime-$$"
+	trap 'systemctl --user stop "$UNIT" 2>/dev/null' INT TERM HUP
+	systemd-run --user --wait --pipe --collect --quiet --unit="$UNIT" "$@"
+	exit $?
 fi
 
 # Started from a remote (SSH) login: the desktop session's display and D-Bus, as the user's service manager has them.

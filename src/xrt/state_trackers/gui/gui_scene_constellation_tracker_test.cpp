@@ -161,6 +161,7 @@ public: // Methods
 			    .imu_sink = nullptr,
 			    .loose_part = {},
 			    .serial = {},
+			    .head = false,
 			};
 
 			this->tracker->addDevice(&device_params, &stub_device);

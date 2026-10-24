@@ -117,6 +117,8 @@ enum class SolveSource : uint8_t
 	FastPredictedShifted = 5,
 	//! Fast thread, the prior's orientation kept and only its position solved, from as few as 2 LEDs.
 	FastFewLeds = 6,
+	//! Fast thread, a headset no sensor sees: where it was last seen, turned as it is held, see tryDevicePoseHeldStill.
+	FastHeldStill = 7,
 };
 
 struct FoundDevicePose
@@ -364,6 +366,9 @@ public: // Fields
 
 	//! When the last blob observation arrived, monotonic, to warn about gaps in delivery.
 	std::atomic<int64_t> last_push_ns{0};
+	//! When this camera's first frame arrived, and whether its one gap at the start (see push_blobs) was seen.
+	std::atomic<int64_t> first_push_ns{0};
+	std::atomic<bool> start_gap_seen{false};
 
 	//! Samples dropped because the fast or the slow thread was still busy with the previous one.
 	RateLimitedCount dropped_fast_samples{};
@@ -427,7 +432,18 @@ public: // Methods (t_constellation_tracker.cpp)
 	tryDevicePoseShifted(Device *device,
 	                     CameraSample &sample,
 	                     DeviceState &device_state,
-	                     const std::optional<xrt_space_relation> &Tcv_cam_device_prior);
+	                     const std::optional<xrt_space_relation> &Tcv_cam_device_prior,
+	                     SolveSource source = SolveSource::FastPredictedShifted);
+
+	/*!
+	 * A headset no sensor sees, held turning about the neck: the place it was last seen, with the held orientation,
+	 * tried as a prior of its own, as is and shifted, see the implementation.
+	 */
+	bool
+	tryDevicePoseHeldStill(Device *device,
+	                       CameraSample &sample,
+	                       DeviceState &device_state,
+	                       const std::optional<xrt_pose> &Tcv_cam_world);
 
 	//! Keeps a fresh prior's orientation and solves only its position, from 2 or 3 LEDs, see the implementation.
 	bool
@@ -487,8 +503,8 @@ public: // Methods (t_constellation_tracker.cpp)
 	 * within @ref ConstellationTracker::prior_fresh_ns of the device's last solve, to @ref
 	 * ConstellationTracker::prior_tolerance_pos; one with only its orientation tracked and its position held,
 	 * within
-	 * @ref ConstellationTracker::held_prior_ns, to @ref ConstellationTracker::held_prior_tolerance_pos. Both to
-	 * @ref ConstellationTracker::prior_tolerance_rot.
+	 * @ref ConstellationTracker::held_prior_ns (a headset's within @ref ConstellationTracker::prior_fresh_ns), to
+	 * @ref ConstellationTracker::held_prior_tolerance_pos. Both to @ref ConstellationTracker::prior_tolerance_rot.
 	 */
 	bool
 	bindingPrior(Device *device,
@@ -790,6 +806,29 @@ public: // Methods
 	uint32_t
 	rigidBlobs(const CameraSample &sample) const;
 
+	//! Whether @p led_id is one of the loose part's LEDs.
+	bool
+	isPartLed(t_constellation_led_id_it led_id) const;
+
+	//! Blobs these blobs have on the loose part's LEDs.
+	uint32_t
+	partBlobs(const t_blob *blobs, uint32_t blob_count) const;
+
+	/*!
+	 * For a solve that used the loose part's LEDs: the pose from the rigid LEDs alone, with how many of them it keeps
+	 * and how well it fits them. The part's LEDs sit where the part was last measured, and a solve bends by as much as
+	 * that is off. False when the rigid LEDs alone give no pose.
+	 */
+	bool
+	rigidPose(const ConstellationTracker &tracker,
+	          const camera_model &model,
+	          const t_blob *blobs,
+	          uint32_t blob_count,
+	          const xrt_pose &Tcv_cam_device,
+	          xrt_pose &out_pose,
+	          uint32_t &out_matched,
+	          float &out_rms_px);
+
 	/*!
 	 * For the loose part: a camera sample that sees at most a couple of the rigid LEDs, its other blobs (unclaimed,
 	 * or claimed by the part's LEDs). Paired with a solve of the same exposure from another camera.
@@ -914,6 +953,13 @@ public: // Fields
 	};
 	//! A camera as (mosaic index, camera index).
 	using CameraKey = std::pair<size_t, size_t>;
+	//! How far a device moved over a window of the moved-camera watch: from its first view, metres and degrees.
+	struct RigWatchReach
+	{
+		xrt_pose first{};
+		float m{0.0f};
+		float deg{0.0f};
+	};
 	/*!
 	 * Moved-camera watch, see @ref watchRig: per pair of cameras the directions to a device each disagrees on, and
 	 * the camera left out while it is placed again.
@@ -923,8 +969,14 @@ public: // Fields
 		os::Mutex lock{};
 		//! The latest solve of each device by each camera.
 		std::map<std::tuple<t_constellation_device_id_t, size_t, size_t>, RigWatchSolve> last;
+		//! Per device, the frame the watch last compared and the device's fused pose in it, see
+		//! CT_RIG_WATCH_NEW_VIEW_M: only new views of a device are compared.
+		std::map<t_constellation_device_id_t, std::pair<timepoint_ns, xrt_pose>> view;
 		//! Per pair of cameras (lower first): the current window of disagreements, degrees, and windows over.
 		std::map<std::pair<CameraKey, CameraKey>, std::vector<float>> window;
+		//! Per pair, how far the device moved in its current window and apart window, see CT_RIG_WATCH_REACH_M.
+		std::map<std::pair<CameraKey, CameraKey>, RigWatchReach> reach;
+		std::map<std::pair<CameraKey, CameraKey>, RigWatchReach> apart_reach;
 		std::map<std::pair<CameraKey, CameraKey>, uint32_t> strikes;
 		//! Per pair, the last window's median and when: with three or more cameras, the vote (see watchRig).
 		std::map<std::pair<CameraKey, CameraKey>, std::pair<timepoint_ns, float>> last_median;
@@ -1146,6 +1198,7 @@ public: // Methods
 	 * @param tilt_deg how far the solve tilts the device from its IMU's down, negative when unknown.
 	 * @param fusion_deg how far the solve's direction to the device is from the device's fused position, negative
 	 *                   when unknown.
+	 * @param Txr_world_device_fused the device's fused pose at the solve's frame, when it has one.
 	 */
 	void
 	watchRig(t_constellation_device_id_t device_id,
@@ -1155,7 +1208,8 @@ public: // Methods
 	         const xrt_pose &Txr_world_cam,
 	         const xrt_pose &Txr_cam_device,
 	         float tilt_deg,
-	         float fusion_deg);
+	         float fusion_deg,
+	         const std::optional<xrt_pose> &Txr_world_device_fused);
 
 	//! Whether the moved-camera watch leaves this camera's solves out, until it has been placed again.
 	bool

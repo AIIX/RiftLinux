@@ -27,6 +27,7 @@
 #include <cstddef>
 #include <cstring>
 #include <memory>
+#include <mutex>
 #include <string>
 #include <vector>
 #include <type_traits>
@@ -479,10 +480,90 @@ public: // Fields
 	bool busy{false};
 
 	/*!
+	 * The pose applications get while a device worn on the head has gone unseen for longer than the hold time, see
+	 * @ref getTrackedPose: held where the last solve had been carried to, turning about the neck with the orientation,
+	 * which the gyro alone turns on. A newer solve ends it, unless it came alone. It has a lock of its own,
+	 * applications ask from several threads.
+	 */
+	struct UnseenHold
+	{
+		std::mutex mutex;
+		//! The solve this hold carries on from, 0 while there is none, -1 for the fusion having started over.
+		timepoint_ns solve_time_ns{0};
+		//! The newest IMU sample turned into @ref Q_world_device.
+		timepoint_ns anchor_ns{0};
+		//! In the OpenCV world, of the IMU, as the solve and its IMU samples are.
+		Eigen::Vector3d T_world_device{Eigen::Vector3d::Zero()};
+		Eigen::Quaterniond Q_world_device{Eigen::Quaterniond::Identity()};
+		/*!
+		 * The neck the device turns about while held: where it stays in the world, and the device's position from
+		 * it in the IMU's frame (the position handed out is pivot + Q_world_device * lever).
+		 */
+		Eigen::Vector3d pivot{Eigen::Vector3d::Zero()};
+		Eigen::Vector3d lever{Eigen::Vector3d::Zero()};
+
+		//! The latest solve the queries have seen, and the one before it: a solve that comes alone is told apart.
+		timepoint_ns seen_latest_ns{0};
+		timepoint_ns seen_prev_ns{0};
+		/*!
+		 * The newest solve the tracker handed over, as it handed it (OpenCV world, of the model), before the
+		 * fusion folded it in: a device is unseen only past this, and a hold while the fusion starts over follows it.
+		 */
+		timepoint_ns pushed_ns{0};
+		Eigen::Vector3d pushed_T{Eigen::Vector3d::Zero()};
+		Eigen::Quaterniond pushed_Q_model{Eigen::Quaterniond::Identity()};
+		//! When the pose the hold stands on was taken.
+		timepoint_ns base_ns{0};
+		//! Applications were handed the held pose last time they asked.
+		bool app_holding{false};
+		//! The last hold said in the log, and the holds since then not said.
+		timepoint_ns logged_ns{0};
+		uint32_t unlogged{0};
+		//! The last gyro reading with the bias taken out, in the IMU's frame.
+		Eigen::Vector3d gyro{Eigen::Vector3d::Zero()};
+		//! The bias taken out: the last solve's, until the gyro has been read lying still.
+		Eigen::Vector3d gyro_bias{Eigen::Vector3d::Zero()};
+		//! The last solve's bias when the hold started, for the log.
+		Eigen::Vector3d start_gyro_bias{Eigen::Vector3d::Zero()};
+
+		//! The last pose handed out from a solve, and its IMU -> model rotation: a fusion that starts over has
+		//! no solve, the hold carries on from here then.
+		bool have_last{false};
+		timepoint_ns last_ns{0};
+		Eigen::Vector3d last_T_world_device{Eigen::Vector3d::Zero()};
+		Eigen::Quaterniond last_Q_world_device{Eigen::Quaterniond::Identity()};
+		Eigen::Vector3d last_gyro_bias{Eigen::Vector3d::Zero()};
+		xrt_quat last_Qcv_imu_model = XRT_QUAT_IDENTITY;
+
+		//! What the gyro read lying still, kept for later holds, and when; 0 while never.
+		Eigen::Vector3d rest_bias{Eigen::Vector3d::Zero()};
+		timepoint_ns rest_bias_ns{0};
+
+		//! The window the lying-still test sums over, and its short blocks' means.
+		timepoint_ns rest_start_ns{0};
+		uint32_t rest_count{0};
+		Eigen::Vector3d rest_gyro_sum{Eigen::Vector3d::Zero()};
+		double rest_accel_sum{0.0};
+		double rest_accel_sq{0.0};
+		timepoint_ns rest_block_start_ns{0};
+		uint32_t rest_block_count{0};
+		uint32_t rest_blocks{0};
+		Eigen::Vector3d rest_block_sum{Eigen::Vector3d::Zero()};
+		Eigen::Vector3d rest_block_min{Eigen::Vector3d::Zero()};
+		Eigen::Vector3d rest_block_max{Eigen::Vector3d::Zero()};
+	} unseen_hold;
+
+	/*!
 	 * Set for replays: a keyframe waiting for the rest of its exposure waits for the next sample, however long that
 	 * takes, rather than for a wall clock deadline, so that a replay's solves do not depend on how fast it runs.
 	 */
 	bool deterministic{false};
+
+	//! The device is worn on the head, see t_constellation_tracker_device_params::head: only its pose is held.
+	bool head{false};
+
+	//! When the IMU biases were last said in the log.
+	timepoint_ns bias_logged_ns{0};
 
 	/*!
 	 * Set when a tick had to park a preintegration purely because the IMU had not reached the end of its interval
@@ -506,6 +587,9 @@ public: // Fields
 
 	//! How many times the window was dropped on @ref requestReset.
 	uint64_t num_resets_requested{0};
+
+	//! How many times a headset seen again after a gap its IMU samples do not bridge started the window over.
+	uint64_t num_gap_restarts{0};
 
 	//! The active Ceres problem.
 	struct SensorFusionProblem *problem{nullptr};
@@ -566,6 +650,10 @@ private: // Methods
 	//! Triggers the sensor fusion to reset it's state
 	void
 	resetLocked();
+
+	//! Drops the window and the device's solve, keeping its biases and IMU samples (requestReset, gap restarts).
+	void
+	dropWindowLocked();
 
 public: // Methods
 	SensorFusion(t_constellation_device_id_t id, const t_constellation_tracker_led_model *led_model);
@@ -636,12 +724,20 @@ public: // Methods
 	void
 	pushImuSample(const xrt_imu_sample &sample);
 
-	//! Provides the latest unpredicted device pose for the requested timestamp.
+	/*!
+	 * Provides the latest unpredicted device pose for the requested timestamp.
+	 *
+	 * @param for_app The pose applications get rather than the one the tracker searches with: the latest solve's
+	 *                correction blended in, and once the device has gone unseen for a while, its position held and
+	 *                no longer reported as tracked. The tracker's own gets the held pose of a headset too, once it
+	 *                has gone unseen for longer than its IMU samples bridge, and while the fusion starts over from a
+	 *                solve it was just handed.
+	 */
 	void
 	getTrackedPose(timepoint_ns requested_time_ns,
 	               timepoint_ns &out_time_ns,
 	               xrt_space_relation &out_relation,
-	               bool blended = false);
+	               bool for_app = false);
 
 	/*!
 	 * Waits until the fusion thread has folded in, and solved over, every camera sample pushed so far. For

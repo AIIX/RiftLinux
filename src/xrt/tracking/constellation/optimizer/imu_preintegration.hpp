@@ -1,4 +1,5 @@
 // Copyright 2026, Beyley Cardellio
+// SPDX-FileCopyrightText: 2026 Aditya Mehra <aix.m@outlook.com>
 // SPDX-License-Identifier: BSL-1.0
 /*!
  * @file
@@ -111,7 +112,7 @@ typedef ceres::Jet<double, static_cast<int>(ImuBiasStateIndex::NumIndices)> ImuB
 template <typename T> struct ImuBias
 {
 	static_assert(!std::is_const_v<T>,
-	              "block scalar must not be const — did a `T*` overload deduce T = const double?");
+	              "block scalar must not be const: did a `T*` overload deduce T = const double?");
 
 	static constexpr int kNumParameters = static_cast<int>(ImuBiasStateIndex::NumIndices);
 
@@ -259,13 +260,15 @@ struct PreintegratedImuSamples
  * @param imu_bias The Jet-seeded IMU biases
  * @param start_time_ns The start time of the preintegration
  * @param end_time_ns The end time of the preintegration
+ * @param accel_noise_scale How much noisier than kAccelNoiseDensity the accelerometer is taken to be
  */
 PreintegratedImuSamples
 preintegrate(const std::span<const xrt_imu_sample> &imu_samples,
              const xrt_imu_sample &first_sample_after_end_time,
              const ImuBias<ImuBiasJet> &imu_bias,
              timepoint_ns start_time_ns,
-             timepoint_ns end_time_ns);
+             timepoint_ns end_time_ns,
+             double accel_noise_scale = 1.0);
 
 
 /*

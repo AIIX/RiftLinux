@@ -20,14 +20,15 @@
 #include <sched.h>
 #include <stdio.h>
 
-#ifdef XRT_HAVE_DBUS
-#include <dbus/dbus.h>
 #include <errno.h>
-#include <signal.h>
 #include <stdatomic.h>
 #include <string.h>
 #include <sys/resource.h>
 #include <sys/syscall.h>
+
+#ifdef XRT_HAVE_DBUS
+#include <dbus/dbus.h>
+#include <signal.h>
 #endif
 
 #define LOG_D(...) U_LOG_IFL_D(log_level, __VA_ARGS__)
@@ -92,6 +93,46 @@ print_thread_info(struct u_pp_delegate dg, enum u_logging_level log_level, pthre
 	u_pp(dg, "policy: '%s', priority: '%i'", policy_to_string(policy), params.sched_priority);
 }
 
+
+/*
+ * RiftLinux: a thread in a background class (SCHED_IDLE or SCHED_BATCH) gets the CPU only when nothing else wants it,
+ * and may not be made real-time from there. A launcher can hand it down: on CachyOS, ananicy-cpp runs sshd as
+ * background work ("sched": "idle"), so everything started over SSH ran idle, and the sensors' USB thread lost frames
+ * whenever the graphics driver was busy (0.2-1.9 s at a time). Leaving it takes a nice value inside the login's
+ * RLIMIT_NICE; ananicy-cpp's own nice for monado-service (-12) may be beyond it, so the nice goes to the most favoured
+ * value allowed first. With RLIMIT_NICE 0 (most distributions' default) a background thread cannot leave at all.
+ */
+static bool
+leave_background_class(enum u_logging_level log_level, const char *name, bool *out_was_background)
+{
+	const int policy = sched_getscheduler(0) & ~SCHED_RESET_ON_FORK;
+	*out_was_background = policy == SCHED_IDLE || policy == SCHED_BATCH;
+	if (!*out_was_background) {
+		return true;
+	}
+
+	const pid_t tid = (pid_t)syscall(SYS_gettid);
+	struct rlimit rl;
+	if (getrlimit(RLIMIT_NICE, &rl) == 0 && rl.rlim_cur != RLIM_INFINITY && rl.rlim_cur <= 40) {
+		const int most_favoured = 20 - (int)rl.rlim_cur;
+		errno = 0;
+		const int nice_now = getpriority(PRIO_PROCESS, (id_t)tid);
+		if (errno == 0 && nice_now < most_favoured) {
+			setpriority(PRIO_PROCESS, (id_t)tid, most_favoured);
+		}
+	}
+
+	struct sched_param params = {.sched_priority = 0};
+	const int ret = pthread_setschedparam(pthread_self(), SCHED_OTHER, &params);
+	if (ret != 0) {
+		LOG_W("Thread '%s' runs in %s, the CPU's leftovers only, and may not leave it (%s): start it from the "
+		      "desktop, not from a background session",
+		      name, policy_to_string(policy), strerror(ret));
+		return false;
+	}
+	LOG_I("Thread '%s' was started in %s by its launcher: now normal (SCHED_OTHER)", name, policy_to_string(policy));
+	return true;
+}
 
 #ifdef XRT_HAVE_DBUS
 /*
@@ -281,6 +322,10 @@ u_linux_try_to_set_realtime_priority_on_thread(enum u_logging_level log_level, c
 		print_thread_info(dg, log_level, this_thread);
 	}
 
+	// Out of a background class first (RiftLinux): from there the kernel refuses real-time.
+	bool was_background = false;
+	leave_background_class(log_level, name, &was_background);
+
 	// Get the maximum on this platform.
 	params.sched_priority = sched_get_priority_max(SCHED_FIFO);
 
@@ -339,4 +384,16 @@ u_linux_try_to_set_realtime_priority_on_thread(enum u_logging_level log_level, c
 	}
 
 	return ret == 0;
+}
+
+bool
+u_linux_leave_background_scheduling(enum u_logging_level log_level, const char *name)
+{
+	char str[NAME_LENGTH];
+	if (name == NULL) {
+		get_name(str, ARRAY_SIZE(str));
+		name = str;
+	}
+	bool was_background = false;
+	return leave_background_class(log_level, name, &was_background);
 }

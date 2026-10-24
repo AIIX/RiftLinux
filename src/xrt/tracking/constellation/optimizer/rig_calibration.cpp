@@ -1279,7 +1279,8 @@ RigCalibration::pushCameraSample(ConstellationTracker *tracker, const CameraSamp
 
 		for (uint32_t j = 0; j < sample.blob_count; j++) {
 			const auto &blob = sample.blobs[j];
-			if (blob.matched_device_id == device_id) {
+			// The rigid LEDs only: a loose part's sit where it was last measured, which may be off.
+			if (blob.matched_device_id == device_id && !device->isPartLed(blob.matched_device_led_id)) {
 				int32_t index =
 				    findLedIndexById(device->search_model->led_model, blob.matched_device_led_id);
 				if (index == -1) {

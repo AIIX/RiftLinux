@@ -17,6 +17,10 @@
 #include "util/u_logging.h"
 #include "util/u_trace_marker.h"
 
+#ifdef XRT_OS_LINUX
+#include "util/u_linux.h"
+#endif
+
 #ifdef XRT_OS_WINDOWS
 #include "util/u_windows.h"
 #endif
@@ -40,6 +44,11 @@ main(int argc, char *argv[])
 {
 #ifdef XRT_OS_WINDOWS
 	u_win_try_privilege_or_priority_from_args(U_LOGGING_INFO, argc, argv);
+#endif
+
+#ifdef XRT_OS_LINUX
+	// Before any thread: they inherit the class, and a launcher may have handed down a background one.
+	u_linux_leave_background_scheduling(U_LOGGING_INFO, "monado-service");
 #endif
 
 	u_trace_marker_init();

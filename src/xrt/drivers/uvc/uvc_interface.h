@@ -126,3 +126,10 @@ uvc_fs_destroy(struct xrt_fs *stream);
 
 void
 uvc_fs_set_source_timestamp_callback(struct xrt_fs *stream, get_frame_timestamp_t callback, void *user_data);
+
+/*!
+ * Says once in the log when a running stream has had no whole frame for over a second, with what arrived since. Call
+ * from the thread that handles the stream's USB events, now and then: it is told even when no transfer comes back.
+ */
+void
+uvc_fs_check_stall(struct xrt_fs *stream);

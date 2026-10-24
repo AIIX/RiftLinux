@@ -10,9 +10,33 @@
 
 #include "xrt/xrt_byte_order.h"
 
+#include "os/os_time.h"
+#include "util/u_debug.h"
+#include "util/u_logging.h"
+
 #include "rift_usb.h"
 
 #include <errno.h>
+
+/*
+ * RIFT_LOG_USB: every feature report sent to or read from the headset and its radio, with its bytes, to compare
+ * with what the Oculus runtime sends (scripts/riftlinux/usbpcap_setup.py on a Windows capture).
+ */
+DEBUG_GET_ONCE_BOOL_OPTION(rift_log_usb, "RIFT_LOG_USB", false)
+
+static void
+rift_log_usb_report(const char *what, bool radio_hid, const uint8_t *buf, int len)
+{
+	if (!debug_get_bool_option_rift_log_usb() || len <= 0) {
+		return;
+	}
+	char hex[3 * 72 + 1] = {0};
+	for (int i = 0; i < len && i < 72; i++) {
+		snprintf(hex + 3 * i, 4, "%02x ", buf[i]);
+	}
+	U_LOG_RAW("RIFT_USB %.4f %s %s id 0x%02x %d B: %s", (double)os_monotonic_get_ns() / 1e9, what,
+	          radio_hid ? "radio" : "hmd", buf[0], len, hex);
+}
 
 
 /*
@@ -39,6 +63,7 @@ rift_send_report(struct rift_hmd *hmd, bool radio_hid, uint8_t report_id, void *
 	memcpy(buffer + 1, data, data_length);
 
 	result = os_hid_set_feature(radio_hid ? hmd->radio_dev : hmd->hmd_dev, buffer, data_length + 1);
+	rift_log_usb_report(result < 0 ? "SET-FAILED" : "SET", radio_hid, buffer, (int)data_length + 1);
 	if (result < 0) {
 		return result;
 	}
@@ -53,7 +78,11 @@ rift_get_report(struct rift_hmd *hmd, bool radio_hid, uint8_t report_id, uint8_t
 		assert(hmd->radio_dev != NULL);
 	}
 
-	return os_hid_get_feature(radio_hid ? hmd->radio_dev : hmd->hmd_dev, report_id, out, out_len);
+	const int result = os_hid_get_feature(radio_hid ? hmd->radio_dev : hmd->hmd_dev, report_id, out, out_len);
+	if (result > 0) {
+		rift_log_usb_report("GET", radio_hid, out, result);
+	}
+	return result;
 }
 
 int
@@ -238,6 +267,7 @@ rift_set_cv1_display(struct rift_hmd *hmd, uint8_t brightness, uint16_t persiste
 	buf[8] = persistence_rows & 0xff;
 	buf[9] = persistence_rows >> 8;
 
+	rift_log_usb_report("SET", false, buf, 14);
 	return os_hid_set_feature(hmd->hmd_dev, buf, 14);
 }
 

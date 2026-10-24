@@ -63,9 +63,52 @@ DEBUG_GET_ONCE_NUM_OPTION(sensor_fusion_exposure_wait_ms, "T_CONSTELLATION_SENSO
  * where the IMU had carried it, and handed straight out that is a step at the sensors' rate: the left Touch held still
  * shook by 1-3 mm per frame in a recording where Oculus's output stays under a fifth of a millimetre. Motion still
  * comes from the IMU at once; only the corrections are smoothed. 0 hands out the solved pose as it is.
+ *
+ * Corrections up to 30 mm used to be blended and larger ones jumped to: far from the sensors, where a solve of a few
+ * LEDs is centimetres off in depth, and as a sensor's view came back, that was a few jumps of 3-6 cm a minute. The
+ * Oculus runtime slides even its recalibrations (7 cm over a quarter of a second in a recorded session); a headset
+ * seen again after it was held still jumps, as there (see getTrackedPose).
  */
 DEBUG_GET_ONCE_NUM_OPTION(sensor_fusion_blend_ms, "T_CONSTELLATION_SENSOR_FUSION_BLEND_MS", 60)
-DEBUG_GET_ONCE_NUM_OPTION(sensor_fusion_blend_snap_mm, "T_CONSTELLATION_SENSOR_FUSION_BLEND_SNAP_MM", 30)
+DEBUG_GET_ONCE_NUM_OPTION(sensor_fusion_blend_snap_mm, "T_CONSTELLATION_SENSOR_FUSION_BLEND_SNAP_MM", 100)
+/*
+ * How long the pose applications get for a device worn on the head is carried on from the last solve before it is
+ * held, in milliseconds. Unseen by every sensor, the IMU alone carried the position off by tens of centimetres within
+ * seconds (a metre a second in a recorded session, the view sliding away and jumping back when seen again), and once
+ * the samples since the solve no longer fitted the IMU buffer, the last relation was extrapolated with its velocities
+ * for good: a headset put down out of every sensor's view went on turning at 57 degrees a second and was 25 m away two
+ * minutes later, still reported as tracked. Past this its position stays where it was, valid but not tracked, turning
+ * about the neck, and its orientation follows the gyro alone: as the Oculus runtime's recorded output does, about 90 ms
+ * after its last sight of the headset. 0 carries on as before.
+ */
+DEBUG_GET_ONCE_NUM_OPTION(sensor_fusion_hold_after_ms, "T_CONSTELLATION_SENSOR_FUSION_HOLD_AFTER_MS", 100)
+/*
+ * Held, the device turns about the neck: a point this far below and behind its origin, in millimetres (fitted to turns
+ * and nods in recorded sessions: 117-125 below, 121-129 behind). 0 and 0 hold the origin itself.
+ */
+DEBUG_GET_ONCE_NUM_OPTION(sensor_fusion_neck_down_mm, "T_CONSTELLATION_SENSOR_FUSION_NECK_DOWN_MM", 120)
+DEBUG_GET_ONCE_NUM_OPTION(sensor_fusion_neck_back_mm, "T_CONSTELLATION_SENSOR_FUSION_NECK_BACK_MM", 120)
+/*
+ * Which devices start their window over when seen again after a gap their IMU samples do not bridge, see
+ * processCameraSampleLocked: 0 none, 1 the one worn on the head, 2 every device.
+ */
+DEBUG_GET_ONCE_NUM_OPTION(sensor_fusion_gap_restart, "T_CONSTELLATION_SENSOR_FUSION_GAP_RESTART", 1)
+/*
+ * Whose queries at the latest solve's own time, or before an IMU sample has come in after it, get that solve as it is
+ * (see getTrackedPose): 0 nobody's (the relation history, as before), 1 applications', 2 the tracker's too.
+ */
+DEBUG_GET_ONCE_NUM_OPTION(sensor_fusion_at_solve, "T_CONSTELLATION_SENSOR_FUSION_AT_SOLVE", 1)
+/*
+ * How much noisier than its datasheet the headset's accelerometer is taken to be in the fusion (1: as the datasheet
+ * says, see kAccelNoiseDensity). The datasheet's is the white noise alone. At 1 the fusion followed the accelerometer
+ * over one sensor's view of the headset's depth: in a recorded session the position ran 7-10 cm ahead of what that
+ * sensor saw, its solves then left the prior and were rejected, and the view snapped 16 cm back. At 5 the snap is gone
+ * (the biggest step 6 mm, at most 45-58 mm ahead), four sessions' jumps over 10 mm went 33 -> 24, the headset agrees
+ * with the Oculus runtime's poses on its own frames as before, and its jitter there is unchanged but where one sensor
+ * alone sees a moving head (p95 0.11 -> 0.17 mm). At 10 that rose to 0.22 mm; at 3 the still head's turn jitter rose
+ * (p95 0.0055 -> 0.0094 degrees).
+ */
+DEBUG_GET_ONCE_FLOAT_OPTION(sensor_fusion_head_accel_noise, "T_CONSTELLATION_SENSOR_FUSION_HEAD_ACCEL_NOISE", 5.0f)
 /*
  * The IMU -> model rotation stays what calibration gave it (identity for a Touch, whose factory matrix already turns
  * the gyro into the model's axes, within 0.5 degrees of what Oculus tracked). Left free in every window it wandered off
@@ -365,6 +408,41 @@ collectImuSamplesForRange(Device &device,
 	}
 
 	return ImuCollectResult::Lapped;
+}
+
+/*!
+ * Whether the IMU samples in `(start_time_ns, end_time_ns]` fit one interval between keyframes
+ * (kMaxImuSamplesPerKeyframe): only then is a keyframe at the end tied to one at the start and solved with it. Samples
+ * up to the end that have not come in yet are counted at the rate of those that have.
+ */
+bool
+imuBridges(Device &device, timepoint_ns start_time_ns, timepoint_ns end_time_ns)
+{
+	std::array<xrt_imu_sample, kMaxImuSamplesPerKeyframe> samples_buf;
+	uint32_t num_samples = 0;
+	xrt_imu_sample first_after;
+
+	switch (collectImuSamplesForRange(device, start_time_ns, end_time_ns, samples_buf, num_samples, first_after)) {
+	case ImuCollectResult::Overflow:
+	case ImuCollectResult::Truncated: return false;
+	case ImuCollectResult::NoSampleAfterEnd: {
+		if (num_samples < 2) {
+			return true;
+		}
+		const timepoint_ns newest_ns = samples_buf[num_samples - 1].timestamp_ns;
+		const double period_ns =
+		    static_cast<double>(newest_ns - samples_buf[0].timestamp_ns) / static_cast<double>(num_samples - 1);
+		if (period_ns <= 0.0) {
+			return true;
+		}
+		const double to_come = static_cast<double>(end_time_ns - newest_ns) / period_ns;
+		return static_cast<double>(num_samples) + to_come <= static_cast<double>(kMaxImuSamplesPerKeyframe);
+	}
+	case ImuCollectResult::Ok:
+	case ImuCollectResult::Lapped: return true;
+	}
+
+	return true;
 }
 
 struct StaticCameraObservationCostFunctor
@@ -1068,6 +1146,40 @@ public:
 private:
 	double target_cost;
 };
+
+/*!
+ * The farthest the IMU may have carried the position from the last solve by the time it is held. Further than that is
+ * the fusion running off rather than the device moving, and the solved position is held instead.
+ */
+constexpr double kUnseenHoldMaxCarryM = 0.3;
+
+/*
+ * Lying still while held, the gyro's own reading is its bias. The last solve's bias estimate can be off: a headset put
+ * down out of view turned 2 degrees every 10 s on it while its gyro read 0.45 degrees. A window of a second counts as
+ * lying still when its mean is no larger than the bias left after factory calibration (0.04-0.09 degrees a second in
+ * recordings), the accelerometer is as quiet as lying still (0.045-0.075 m/s^2), and the means of its 50 ms blocks
+ * stay within a narrow range: lying down they spanned 0.19-0.36 degrees a second, worn on a head held as still as it
+ * could be 1.35-2.2 (the gyro's noise alone does not tell those apart). Kept 10 minutes for later holds.
+ */
+constexpr timepoint_ns kRestWindowNs = U_TIME_1S_IN_NS;
+constexpr uint32_t kRestMinSamples = 500;
+constexpr timepoint_ns kRestBlockNs = 50 * U_TIME_1MS_IN_NS;
+constexpr uint32_t kRestMinBlockSamples = 20;
+constexpr uint32_t kRestMinBlocks = 15;
+constexpr double kRestBlockRangeRadS = 0.5 * M_PI / 180.0;
+constexpr double kRestGyroMeanRadS = 0.15 * M_PI / 180.0;
+constexpr double kRestAccelStdMS2 = 0.12;
+constexpr timepoint_ns kRestBiasKeepNs = static_cast<timepoint_ns>(10 * 60) * U_TIME_1S_IN_NS;
+
+/*!
+ * The longest a single gyro sample turns the held orientation for. Samples come a millisecond apart; a longer step is
+ * a gap in them (a fusion that starts over drops the samples it had), and stretching one reading over it would turn
+ * the view by however fast the device happened to turn at that one moment.
+ */
+constexpr timepoint_ns kUnseenHoldMaxStepNs = 20 * U_TIME_1MS_IN_NS;
+
+//! How far back a hold that fell behind the IMU buffer turns from: the newest samples it still holds (it holds 5 s).
+constexpr timepoint_ns kUnseenHoldRecollectNs = static_cast<timepoint_ns>(4500) * U_TIME_1MS_IN_NS;
 
 //! What is left at @p now_ns of a blend offset set at @p set_ns.
 static xrt_vec3
@@ -2705,6 +2817,14 @@ SensorFusion::runFusionLocked()
 					carried_position = carried.pose.position;
 				}
 			}
+		} else if (this->device.has_latest_solve && keyframe.timestamp_ns == this->device.latest_solve_time_ns) {
+			/*
+			 * The same exposure solved again (another sensor's view of it came in): what it moves is a correction
+			 * like any other, blended. Taken as none, it threw the blend away and what was left of the last
+			 * correction jumped.
+			 */
+			have_carried = true;
+			carried_position = this->device.Tcv_world_device_latest.position;
 		}
 
 		/*
@@ -2714,7 +2834,17 @@ SensorFusion::runFusionLocked()
 		{
 			const timepoint_ns now_ns = os_monotonic_get_ns();
 			xrt_vec3 offset{0.0f, 0.0f, 0.0f};
-			if (have_carried) {
+			/*
+			 * Seen again after applications were handed the held pose: it goes straight to the solve, as the
+			 * Oculus runtime's does. Carried on from the last solve instead, it would blend from where the IMU had
+			 * taken it, not from where it was shown.
+			 */
+			bool was_held = false;
+			{
+				std::lock_guard<std::mutex> lock(this->unseen_hold.mutex);
+				was_held = this->unseen_hold.app_holding;
+			}
+			if (have_carried && !was_held) {
 				offset = decayedBlendOffset(this->device.blend_offset, this->device.blend_offset_ns,
 				                            now_ns) -
 				         (keyframe.device.Tcv_world_device.position - carried_position);
@@ -2724,6 +2854,15 @@ SensorFusion::runFusionLocked()
 					offset = xrt_vec3{0.0f, 0.0f, 0.0f};
 				}
 			}
+			SF_DEBUG(this,
+			         "Device %d keyframe %" PRIi64 " (latest %" PRIi64
+			         "): solved (%.4f %.4f %.4f), carried (%.4f %.4f %.4f) %s, blend (%.4f %.4f %.4f) -> (%.4f %.4f %.4f)%s",
+			         this->device.id, keyframe.timestamp_ns, this->device.latest_solve_time_ns,
+			         keyframe.device.Tcv_world_device.position.x, keyframe.device.Tcv_world_device.position.y,
+			         keyframe.device.Tcv_world_device.position.z, carried_position.x, carried_position.y,
+			         carried_position.z, have_carried ? "yes" : "no", this->device.blend_offset.x,
+			         this->device.blend_offset.y, this->device.blend_offset.z, offset.x, offset.y, offset.z,
+			         was_held ? ", was held" : "");
 			this->device.blend_offset = offset;
 			this->device.blend_offset_ns = now_ns;
 		}
@@ -2741,6 +2880,18 @@ SensorFusion::runFusionLocked()
 		device_updated = true;
 
 		SF_DEBUG(this, "Got new solved pose for device %d at %" PRIi64, this->device.id, keyframe.timestamp_ns);
+		// What the window has made of the IMU's biases, now and then.
+		if (keyframe.timestamp_ns - this->bias_logged_ns > static_cast<timepoint_ns>(10) * U_TIME_1S_IN_NS) {
+			this->bias_logged_ns = keyframe.timestamp_ns;
+			SF_DEBUG(this,
+			         "Device %d at %" PRIi64
+			         ": accelerometer bias (%.3f %.3f %.3f) scale (%.4f %.4f %.4f), gyro bias (%.4f %.4f %.4f)",
+			         this->device.id, keyframe.timestamp_ns, this->device.latest_accel_bias.x,
+			         this->device.latest_accel_bias.y, this->device.latest_accel_bias.z,
+			         this->device.latest_accel_scale.x, this->device.latest_accel_scale.y,
+			         this->device.latest_accel_scale.z, this->device.latest_gyro_bias.x,
+			         this->device.latest_gyro_bias.y, this->device.latest_gyro_bias.z);
+		}
 	}
 
 	SF_DEBUG(this, "Solved system in %zu iterations, %.3f -> %.3f sigma RMS over %d residuals (%s). Report: %s",
@@ -2884,6 +3035,25 @@ SensorFusion::pushCameraSample(constellation::ConstellationTracker *tracker, con
 	this->markDirtyLocked();
 
 	os_thread_helper_unlock(&this->thread);
+
+	// The solve as handed over, for the hold (UnseenHold::pushed_ns): the fusion may fold it in only later.
+	for (uint32_t i = 0; i < sample.device_count; i++) {
+		const constellation::DeviceState &state = sample.device_states[i];
+		if (state.device_id != this->device.id || !state.found_pose.has_value()) {
+			continue;
+		}
+		xrt_pose Tcv_world_cam = sample.Txr_world_cam.value();
+		math_pose_convert_from_opencv(&Tcv_world_cam, &Tcv_world_cam);
+		xrt_pose Tcv_world_device;
+		math_pose_transform(&Tcv_world_cam, &state.found_pose->Tcv_cam_device, &Tcv_world_device);
+		std::lock_guard<std::mutex> lock(this->unseen_hold.mutex);
+		if (sample.timestamp_ns > this->unseen_hold.pushed_ns) {
+			this->unseen_hold.pushed_ns = sample.timestamp_ns;
+			this->unseen_hold.pushed_T = map_vec3(Tcv_world_device.position).cast<double>();
+			this->unseen_hold.pushed_Q_model = map_quat(Tcv_world_device.orientation).cast<double>();
+		}
+		break;
+	}
 }
 
 void
@@ -2898,21 +3068,7 @@ SensorFusion::processCameraSampleLocked(const constellation::CameraSample &sampl
 	Keyframe *keyframe = nullptr;
 
 	if (this->reset_requested.exchange(false) && this->num_keyframes > 0) {
-		/*
-		 * As resetLocked, but the IMU ring stays: it is written without the lock, and the intervals read
-		 * it by timestamp, so the samples before the reset do no harm.
-		 */
-		this->problem->reset();
-		this->keyframe_head = 0;
-		this->num_keyframes = 0;
-		this->waiting_on_imu.store(false, std::memory_order_relaxed);
-		m_relation_history_clear(this->device.relation_history);
-		this->device.has_latest_solve = false;
-		this->device.blend_offset = xrt_vec3{0.0f, 0.0f, 0.0f};
-		this->device.blend_offset_ns = 0;
-		for (auto &preintegration : this->device.preintegrations) {
-			preintegration = DevicePreintegration::Identity(DevicePreintegrationState::Dirty);
-		}
+		this->dropWindowLocked();
 		this->num_resets_requested++;
 		SF_DEBUG(this, "Device %d: window dropped, its solves kept disagreeing with it.", this->device.id);
 	}
@@ -3005,6 +3161,23 @@ SensorFusion::processCameraSampleLocked(const constellation::CameraSample &sampl
 			         this->num_late_samples_dropped);
 
 			return;
+		}
+
+		/*
+		 * A headset seen again after a gap its IMU samples do not bridge: a keyframe tied to none before it is left out
+		 * of every solve, so the fusion went on from its last solve before the gap, and the tracker's prior with it.
+		 * After a 4 s blackout in a recorded session the headset was then found only by the slow search, about every
+		 * 520 ms, each find again a gap too long to bridge, for as long as that lasted. Started over from the new
+		 * solve, as after a gap past kMaxTimeBetweenKeyframesSeconds, the next frame finds it again (see
+		 * getTrackedPose).
+		 */
+		const int64_t gap_restart = debug_get_num_option_sensor_fusion_gap_restart();
+		if ((gap_restart >= 2 || (gap_restart == 1 && this->head)) && this->num_keyframes > 0 &&
+		    !imuBridges(this->device, this->keyframeLocked(0).timestamp_ns, sample.timestamp_ns)) {
+			SF_DEBUG(this, "Device %d seen again after %.0f ms, longer than its IMU samples bridge: the window starts over.",
+			         this->device.id, time_ns_to_s(sample.timestamp_ns - this->keyframeLocked(0).timestamp_ns) * 1000.0);
+			this->dropWindowLocked();
+			this->num_gap_restarts++;
 		}
 
 		// If the gap is too wide, just reset fusion.
@@ -3118,18 +3291,368 @@ SensorFusion::waitIdle()
 	}
 }
 
+/*!
+ * Turns a running hold's orientation on by the gyro samples since it was last turned, up to @p requested_time_ns, and
+ * runs the lying-still test over them. Called with the hold's lock held, by every query of the pose, whichever kind:
+ * only applications get the held pose, but while none asks (a headset lying dark, nothing running), the tracker's
+ * own queries at the sensors' rate keep it turning, so it never falls behind the samples the IMU buffer still has.
+ */
+static void
+turnUnseenHold(SensorFusion &fusion, const timepoint_ns requested_time_ns, std::span<xrt_imu_sample> samples_buf)
+{
+	SensorFusion::UnseenHold &hold = fusion.unseen_hold;
+	uint32_t num_samples = 0;
+	xrt_imu_sample first_after;
+
+	if (requested_time_ns <= hold.anchor_ns) {
+		return;
+	}
+	ImuCollectResult result = collectImuSamplesForRange(fusion.device, hold.anchor_ns, requested_time_ns,
+	                                                    samples_buf, num_samples, first_after);
+	if (result == ImuCollectResult::Truncated) {
+		// The samples since it was last turned are gone already: it turns on by the newest still buffered.
+		hold.anchor_ns = requested_time_ns - kUnseenHoldRecollectNs;
+		result = collectImuSamplesForRange(fusion.device, hold.anchor_ns, requested_time_ns, samples_buf,
+		                                   num_samples, first_after);
+		if (result == ImuCollectResult::Truncated) {
+			hold.anchor_ns = requested_time_ns;
+			return;
+		}
+	}
+	if ((result != ImuCollectResult::Ok && result != ImuCollectResult::NoSampleAfterEnd) || num_samples == 0) {
+		return;
+	}
+	for (uint32_t i = 0; i < num_samples; i++) {
+		const xrt_imu_sample &sample = samples_buf[i];
+		const Vector3d raw_gyro = map_vec3_f64(sample.gyro_rad_secs);
+		const double dt = time_ns_to_s(
+		    std::clamp<timepoint_ns>(sample.timestamp_ns - hold.anchor_ns, 0, kUnseenHoldMaxStepNs));
+		hold.gyro = raw_gyro - hold.gyro_bias;
+		hold.Q_world_device *= quat_exp_so3(hold.gyro * dt);
+		hold.anchor_ns = sample.timestamp_ns;
+
+		// The lying-still test, over windows of kRestWindowNs.
+		const double accel = map_vec3_f64(sample.accel_m_s2).norm();
+		if (hold.rest_count == 0) {
+			hold.rest_start_ns = sample.timestamp_ns;
+			hold.rest_gyro_sum = Vector3d::Zero();
+			hold.rest_accel_sum = 0.0;
+			hold.rest_accel_sq = 0.0;
+			hold.rest_block_start_ns = sample.timestamp_ns;
+			hold.rest_block_count = 0;
+			hold.rest_blocks = 0;
+			hold.rest_block_sum = Vector3d::Zero();
+		}
+		hold.rest_count++;
+		hold.rest_gyro_sum += raw_gyro;
+		hold.rest_accel_sum += accel;
+		hold.rest_accel_sq += accel * accel;
+		hold.rest_block_count++;
+		hold.rest_block_sum += raw_gyro;
+		if (sample.timestamp_ns - hold.rest_block_start_ns >= kRestBlockNs) {
+			if (hold.rest_block_count >= kRestMinBlockSamples) {
+				const Vector3d block = hold.rest_block_sum / hold.rest_block_count;
+				hold.rest_block_min = hold.rest_blocks == 0 ? block : hold.rest_block_min.cwiseMin(block);
+				hold.rest_block_max = hold.rest_blocks == 0 ? block : hold.rest_block_max.cwiseMax(block);
+				hold.rest_blocks++;
+			}
+			hold.rest_block_start_ns = sample.timestamp_ns;
+			hold.rest_block_count = 0;
+			hold.rest_block_sum = Vector3d::Zero();
+		}
+		if (sample.timestamp_ns - hold.rest_start_ns < kRestWindowNs) {
+			continue;
+		}
+		const double n = static_cast<double>(hold.rest_count);
+		hold.rest_count = 0;
+		if (n < kRestMinSamples || hold.rest_blocks < kRestMinBlocks) {
+			continue;
+		}
+		const Vector3d mean = hold.rest_gyro_sum / n;
+		const double block_range = (hold.rest_block_max - hold.rest_block_min).maxCoeff();
+		const double accel_mean = hold.rest_accel_sum / n;
+		const double accel_var = MAX(0.0, hold.rest_accel_sq / n - accel_mean * accel_mean);
+		if (block_range <= kRestBlockRangeRadS && mean.norm() <= kRestGyroMeanRadS &&
+		    std::sqrt(accel_var) <= kRestAccelStdMS2) {
+			if (hold.rest_bias_ns == 0 || hold.rest_bias_ns < hold.solve_time_ns) {
+				const SensorFusion *const sf = &fusion;
+				SF_INFO(sf,
+				        "Device %d lies still out of view: gyro bias %.3f degrees a second "
+				        "(the last solve's was %.3f).",
+				        fusion.device.id, mean.norm() * 180.0 / M_PI,
+				        hold.start_gyro_bias.norm() * 180.0 / M_PI);
+			}
+			hold.gyro_bias = mean;
+			hold.rest_bias = mean;
+			hold.rest_bias_ns = sample.timestamp_ns;
+		}
+	}
+	hold.Q_world_device.normalize();
+}
+
+//! The device's origin from its neck, in the IMU's frame for a model turned by @p Qcv_imu_model (UnseenHold::lever).
+static Vector3d
+neckLever(const xrt_quat &Qcv_imu_model)
+{
+	// In the model's OpenCV axes the origin sits above (-y) and in front (+z) of the neck.
+	const Vector3d lever_model(0.0, -0.001 * static_cast<double>(debug_get_num_option_sensor_fusion_neck_down_mm()),
+	                           0.001 * static_cast<double>(debug_get_num_option_sensor_fusion_neck_back_mm()));
+	return map_quat(Qcv_imu_model).cast<double>() * lever_model;
+}
+
+//! A hold starts where its pose is now: the neck stays there, the device turns about it.
+static void
+startNeck(SensorFusion::UnseenHold &hold, const xrt_quat &Qcv_imu_model)
+{
+	hold.lever = neckLever(Qcv_imu_model);
+	hold.pivot = hold.T_world_device - hold.Q_world_device * hold.lever;
+}
+
+/*!
+ * The pose of a device unseen since @p solve_time_ns for longer than the hold time, see @ref
+ * SensorFusion::UnseenHold: in the OpenCV world, of the IMU, as the solve.
+ *
+ * The first call of a hold carries the solve on to @p hold_start_ns as the pose was handed out until then (not at all
+ * when that is the solve's own time: a solve that came alone), every call turns the orientation on by the gyro samples
+ * since the one before, and the position with it about the neck. Nothing is ever extrapolated: past the newest sample
+ * the caller predicts with the gyro's rate.
+ *
+ * With @p solve_time_ns -1 the fusion has started over and has no solve yet (the solve arguments are unused): a hold
+ * already running carries on, otherwise one starts from the last pose handed out. @return false when there is
+ * neither.
+ */
+static bool
+getUnseenPose(SensorFusion &fusion,
+              const double world_gravity_mag,
+              const timepoint_ns solve_time_ns,
+              const xrt_pose &Tcv_world_device_solve,
+              const xrt_vec3_f64 &solve_world_velocity,
+              const xrt_vec3_f64 &solve_accel_bias,
+              const xrt_vec3_f64 &solve_gyro_bias,
+              const xrt_vec3_f64 &solve_accel_scale,
+              const xrt_quat &Qcv_imu_model,
+              const timepoint_ns hold_start_ns,
+              const timepoint_ns requested_time_ns,
+              std::span<xrt_imu_sample> samples_buf,
+              timepoint_ns &out_time_ns,
+              xrt_space_relation &out_relation)
+{
+	SensorFusion::UnseenHold &hold = fusion.unseen_hold;
+	std::lock_guard<std::mutex> lock(hold.mutex);
+
+	const Vector3d gyro_bias = map_vec3_f64(solve_gyro_bias);
+	uint32_t num_samples = 0;
+	xrt_imu_sample first_after;
+
+	if (solve_time_ns < 0) {
+		/*
+		 * A hold is running while it has turned on past the last pose handed out from a solve, recently: one left
+		 * from long ago has an orientation the gyro samples since no longer reach (the IMU buffer holds 5 s).
+		 */
+		const bool running = hold.solve_time_ns != 0 && hold.anchor_ns >= hold.last_ns &&
+		                     requested_time_ns - hold.anchor_ns < kUnseenHoldRecollectNs;
+		if (!running) {
+			if (!hold.have_last || requested_time_ns - hold.last_ns >= kUnseenHoldRecollectNs) {
+				return false;
+			}
+			hold.anchor_ns = hold.last_ns;
+			hold.base_ns = hold.last_ns;
+			hold.T_world_device = hold.last_T_world_device;
+			hold.Q_world_device = hold.last_Q_world_device;
+			hold.gyro = Vector3d::Zero();
+			const bool rest_bias_recent =
+			    hold.rest_bias_ns != 0 && hold.last_ns - hold.rest_bias_ns < kRestBiasKeepNs;
+			hold.gyro_bias = rest_bias_recent ? hold.rest_bias : hold.last_gyro_bias;
+			hold.start_gyro_bias = hold.last_gyro_bias;
+			hold.rest_count = 0;
+			startNeck(hold, hold.last_Qcv_imu_model);
+		}
+		if (hold.solve_time_ns != solve_time_ns) {
+			const SensorFusion *const sf = &fusion;
+			SF_INFO(sf,
+			        "Device %d: the fusion started over and has no pose yet; its position is held where it "
+			        "was %.0f ms ago, turning about the neck, its orientation follows the gyro until it is "
+			        "solved again.",
+			        fusion.device.id, time_ns_to_s(requested_time_ns - hold.anchor_ns) * 1000.0);
+		}
+		hold.solve_time_ns = solve_time_ns;
+	} else if (solve_time_ns >= 0 && hold.solve_time_ns != solve_time_ns) {
+		hold.solve_time_ns = solve_time_ns;
+		hold.anchor_ns = solve_time_ns;
+		hold.base_ns = solve_time_ns;
+		hold.T_world_device = map_vec3(Tcv_world_device_solve.position).cast<double>();
+		hold.Q_world_device = map_quat(Tcv_world_device_solve.orientation).cast<double>();
+		hold.gyro = Vector3d::Zero();
+		const bool rest_bias_recent =
+		    hold.rest_bias_ns != 0 && solve_time_ns - hold.rest_bias_ns < kRestBiasKeepNs;
+		hold.gyro_bias = rest_bias_recent ? hold.rest_bias : gyro_bias;
+		hold.start_gyro_bias = gyro_bias;
+		hold.rest_count = 0;
+
+		const ImuCollectResult result =
+		    hold_start_ns > solve_time_ns
+		        ? collectImuSamplesForRange(fusion.device, solve_time_ns, hold_start_ns, samples_buf, num_samples,
+		                                    first_after)
+		        : ImuCollectResult::Ok;
+		if ((result == ImuCollectResult::Ok || result == ImuCollectResult::NoSampleAfterEnd) && num_samples > 0) {
+			const Vector3d gravity_vec = {0, world_gravity_mag, 0};
+			const Vector3d accel_bias = map_vec3_f64(solve_accel_bias);
+			const Vector3d accel_scale = map_vec3_f64(solve_accel_scale);
+			Vector3d T_world_device = hold.T_world_device;
+			Vector3d world_velocity = map_vec3_f64(solve_world_velocity);
+			timepoint_ns pose_ns = solve_time_ns;
+			for (uint32_t i = 0; i < num_samples; i++) {
+				integrateOnce(pose_ns, samples_buf[i], T_world_device, hold.Q_world_device, world_velocity,
+				              gravity_vec, accel_bias, gyro_bias, accel_scale);
+			}
+			hold.Q_world_device.normalize();
+			if ((T_world_device - hold.T_world_device).norm() <= kUnseenHoldMaxCarryM) {
+				hold.T_world_device = T_world_device;
+			}
+			hold.anchor_ns = pose_ns;
+			hold.base_ns = pose_ns;
+			hold.gyro = map_vec3_f64(samples_buf[num_samples - 1].gyro_rad_secs) - hold.gyro_bias;
+		} else if (hold_start_ns > solve_time_ns) {
+			// Nobody asked for a pose since well before the samples still buffered: it starts from the solve.
+			hold.anchor_ns = requested_time_ns;
+		}
+		startNeck(hold, Qcv_imu_model);
+
+		// Said once in a while: at the edge of every sensor's view a headset is held and found many times over.
+		const timepoint_ns now_ns = os_monotonic_get_ns();
+		if (hold.logged_ns == 0 || now_ns - hold.logged_ns > static_cast<timepoint_ns>(5) * U_TIME_1S_IN_NS) {
+			const SensorFusion *const sf = &fusion;
+			SF_INFO(sf,
+			        "Device %d not seen for %.0f ms: its position is held, turning about the neck, its orientation "
+			        "follows the gyro until it is seen again (gyro bias %.3f degrees a second, %s; %u more holds "
+			        "since the last said).",
+			        fusion.device.id, time_ns_to_s(requested_time_ns - solve_time_ns) * 1000.0,
+			        hold.gyro_bias.norm() * 180.0 / M_PI,
+			        rest_bias_recent ? "as read lying still" : "the last solve's", hold.unlogged);
+			hold.logged_ns = now_ns;
+			hold.unlogged = 0;
+		} else {
+			hold.unlogged++;
+		}
+	}
+
+	/*
+	 * A solve the tracker handed over since the time the hold's pose stands for, and the fusion has not folded in
+	 * (it lags, or started over): seen there, so the hold stands on it, turning on from it, rather than keeping the
+	 * device where it was for as long as the fusion takes.
+	 */
+	if (hold.pushed_ns > hold.base_ns && requested_time_ns - hold.pushed_ns < kUnseenHoldRecollectNs) {
+		const xrt_quat &Qcv_imu_model_now = solve_time_ns < 0 ? hold.last_Qcv_imu_model : Qcv_imu_model;
+		const Eigen::Quaterniond Q_imu_model = map_quat(Qcv_imu_model_now).cast<double>();
+		hold.anchor_ns = hold.pushed_ns;
+		hold.base_ns = hold.pushed_ns;
+		hold.T_world_device = hold.pushed_T;
+		hold.Q_world_device = (hold.pushed_Q_model * Q_imu_model.conjugate()).normalized();
+		hold.gyro = Vector3d::Zero();
+		startNeck(hold, Qcv_imu_model_now);
+	}
+
+	turnUnseenHold(fusion, requested_time_ns, samples_buf);
+
+	out_relation = xrt_space_relation{
+	    .relation_flags = static_cast<xrt_space_relation_flags>(
+	        XRT_SPACE_RELATION_ORIENTATION_VALID_BIT | XRT_SPACE_RELATION_POSITION_VALID_BIT |
+	        XRT_SPACE_RELATION_LINEAR_VELOCITY_VALID_BIT | XRT_SPACE_RELATION_ANGULAR_VELOCITY_VALID_BIT |
+	        XRT_SPACE_RELATION_ORIENTATION_TRACKED_BIT),
+	    .pose = XRT_POSE_IDENTITY,
+	    .linear_velocity = XRT_VEC3_ZERO,
+	    .angular_velocity = XRT_VEC3_ZERO,
+	};
+	const Vector3d lever_world = hold.Q_world_device * hold.lever;
+	const Vector3d angular_world = hold.Q_world_device * hold.gyro;
+	map_vec3(out_relation.pose.position) = (hold.pivot + lever_world).cast<float>();
+	map_quat(out_relation.pose.orientation) = hold.Q_world_device.cast<float>();
+	map_vec3(out_relation.angular_velocity) = angular_world.cast<float>();
+	map_vec3(out_relation.linear_velocity) = angular_world.cross(lever_world).cast<float>();
+	out_time_ns = hold.anchor_ns;
+	return true;
+}
+
+//! Keeps the pose just handed out from a solve (OpenCV world, of the IMU) for a hold after the fusion starts over.
+static void
+keepLastPose(SensorFusion &fusion,
+             const xrt_space_relation &relation,
+             timepoint_ns pose_ns,
+             const xrt_vec3_f64 &gyro_bias,
+             const xrt_quat &Qcv_imu_model)
+{
+	SensorFusion::UnseenHold &hold = fusion.unseen_hold;
+	std::lock_guard<std::mutex> lock(hold.mutex);
+	hold.have_last = true;
+	hold.last_ns = pose_ns;
+	hold.last_T_world_device = map_vec3(relation.pose.position).cast<double>();
+	hold.last_Q_world_device = map_quat(relation.pose.orientation).cast<double>();
+	hold.last_gyro_bias = map_vec3_f64(gyro_bias);
+	hold.last_Qcv_imu_model = Qcv_imu_model;
+}
+
 void
 SensorFusion::getTrackedPose(timepoint_ns requested_time_ns,
                              timepoint_ns &out_time_ns,
                              xrt_space_relation &out_relation,
-                             bool blended)
+                             bool for_app)
 {
 	out_relation = XRT_SPACE_RELATION_ZERO;
+
+	// Only a device worn on the head is held; a controller's pose is the driver's to hold (rift_radio.c).
+	const timepoint_ns hold_after_ns =
+	    this->head ? static_cast<timepoint_ns>(debug_get_num_option_sensor_fusion_hold_after_ms()) * U_TIME_1MS_IN_NS
+	               : 0;
+	std::array<xrt_imu_sample, kImuBufferSize> samples_buf;
 
 	os_thread_helper_lock(&this->thread);
 
 	if (!device.has_latest_solve) {
 		os_thread_helper_unlock(&this->thread);
+		// Started over (or never solved): applications get the held pose rather than none.
+		xrt_quat last_Qcv_imu_model;
+		{
+			std::lock_guard<std::mutex> lock(this->unseen_hold.mutex);
+			last_Qcv_imu_model = this->unseen_hold.last_Qcv_imu_model;
+		}
+		if (for_app && hold_after_ns > 0 &&
+		    getUnseenPose(*this, 0.0, -1, xrt_pose{}, xrt_vec3_f64{}, xrt_vec3_f64{}, xrt_vec3_f64{},
+		                  xrt_vec3_f64{}, last_Qcv_imu_model, 0, requested_time_ns, samples_buf, out_time_ns,
+		                  out_relation)) {
+			{
+				std::lock_guard<std::mutex> lock(this->unseen_hold.mutex);
+				this->unseen_hold.app_holding = true;
+			}
+			math_quat_rotate(&out_relation.pose.orientation, &last_Qcv_imu_model, &out_relation.pose.orientation);
+			math_pose_convert_from_opencv(&out_relation.pose, &out_relation.pose);
+			math_vec3_convert_from_opencv(&out_relation.linear_velocity, &out_relation.linear_velocity);
+			math_vec3_convert_from_opencv(&out_relation.angular_velocity, &out_relation.angular_velocity);
+		} else if (!for_app && hold_after_ns > 0) {
+			/*
+			 * The tracker's own query keeps a running hold turning, and gets it once it stands on a solve handed over
+			 * since the fusion started over: where the device was just found, turned on by the gyro, so the next frames
+			 * find it near and the fusion has its next keyframe. Given nothing, as before, the tracker found a headset
+			 * seen again after a blackout only by the slow search.
+			 */
+			xrt_space_relation held = XRT_SPACE_RELATION_ZERO;
+			timepoint_ns held_ns = 0;
+			bool on_solve = false;
+			if (getUnseenPose(*this, 0.0, -1, xrt_pose{}, xrt_vec3_f64{}, xrt_vec3_f64{}, xrt_vec3_f64{},
+			                  xrt_vec3_f64{}, last_Qcv_imu_model, 0, requested_time_ns, samples_buf, held_ns,
+			                  held)) {
+				std::lock_guard<std::mutex> lock(this->unseen_hold.mutex);
+				on_solve = this->unseen_hold.pushed_ns != 0 &&
+				           this->unseen_hold.base_ns == this->unseen_hold.pushed_ns;
+			}
+			if (on_solve) {
+				out_relation = held;
+				out_time_ns = held_ns;
+				math_quat_rotate(&out_relation.pose.orientation, &last_Qcv_imu_model, &out_relation.pose.orientation);
+				math_pose_convert_from_opencv(&out_relation.pose, &out_relation.pose);
+				math_vec3_convert_from_opencv(&out_relation.linear_velocity, &out_relation.linear_velocity);
+				math_vec3_convert_from_opencv(&out_relation.angular_velocity, &out_relation.angular_velocity);
+			}
+		}
 		return;
 	}
 
@@ -3146,6 +3669,75 @@ SensorFusion::getTrackedPose(timepoint_ns requested_time_ns,
 
 	os_thread_helper_unlock(&this->thread);
 
+	/*
+	 * Held once unseen past the hold time; and on, re-placed rather than carried, by a solve that came alone while
+	 * held: one solve after a gap the IMU no longer tied to the last one has no velocity worth carrying the pose with
+	 * (in a recorded session the view went on sliding at a metre a second from one, the wrong way).
+	 */
+	bool hold_now = false;
+	bool alone = false;
+	if (hold_after_ns > 0) {
+		std::lock_guard<std::mutex> lock(this->unseen_hold.mutex);
+		SensorFusion::UnseenHold &hold = this->unseen_hold;
+		if (latest_solve_time_ns != hold.seen_latest_ns) {
+			hold.seen_prev_ns = hold.seen_latest_ns;
+			hold.seen_latest_ns = latest_solve_time_ns;
+		}
+		alone = hold.seen_prev_ns == 0 || latest_solve_time_ns - hold.seen_prev_ns > hold_after_ns;
+		/*
+		 * Held from the fusion's newest solve: carried on from one far older, the pose runs off (the IMU alone, then
+		 * the extrapolated relation). While held, solves the tracker hands over before the fusion has folded them in
+		 * are followed (see getUnseenPose).
+		 */
+		hold_now = requested_time_ns - latest_solve_time_ns > hold_after_ns || (alone && hold.app_holding);
+	}
+	const timepoint_ns hold_start_ns = alone ? latest_solve_time_ns : latest_solve_time_ns + hold_after_ns;
+	if (!for_app && hold_now) {
+		/*
+		 * The tracker's own query starts and turns the hold, so the hold keeps up with the IMU while no application
+		 * asks (a headset lying dark with nothing running). It gets the pose it always got (below), carried on from the
+		 * last solve by the IMU, for as long as the IMU samples since still bridge to a new keyframe; past that the
+		 * carried pose runs off (a metre a second in a recorded session), and the held one is where the next frames
+		 * find a headset seen again: turned back to the sensors, it stood about where it was lost.
+		 */
+		xrt_space_relation held = XRT_SPACE_RELATION_ZERO;
+		timepoint_ns held_ns = 0;
+		getUnseenPose(*this, world_gravity_mag, latest_solve_time_ns, Tcv_world_device, world_velocity,
+		              accel_bias, gyro_bias, accel_scale, Qcv_imu_model, hold_start_ns, requested_time_ns,
+		              samples_buf, held_ns, held);
+		if (!imuBridges(this->device, latest_solve_time_ns, requested_time_ns)) {
+			out_relation = held;
+			out_time_ns = held_ns;
+			math_quat_rotate(&out_relation.pose.orientation, &Qcv_imu_model, &out_relation.pose.orientation);
+			math_pose_convert_from_opencv(&out_relation.pose, &out_relation.pose);
+			math_vec3_convert_from_opencv(&out_relation.linear_velocity, &out_relation.linear_velocity);
+			math_vec3_convert_from_opencv(&out_relation.angular_velocity, &out_relation.angular_velocity);
+			return;
+		}
+	}
+	if (for_app && hold_now) {
+		getUnseenPose(*this, world_gravity_mag, latest_solve_time_ns, Tcv_world_device, world_velocity,
+		              accel_bias, gyro_bias, accel_scale, Qcv_imu_model, hold_start_ns, requested_time_ns,
+		              samples_buf, out_time_ns, out_relation);
+		{
+			std::lock_guard<std::mutex> lock(this->unseen_hold.mutex);
+			this->unseen_hold.app_holding = true;
+		}
+		math_quat_rotate(&out_relation.pose.orientation, &Qcv_imu_model, &out_relation.pose.orientation);
+		// What is left of the last correction's blend fades out on the held pose as on the carried one.
+		out_relation.pose.position = out_relation.pose.position +
+		                             decayedBlendOffset(blend_offset, blend_offset_ns, os_monotonic_get_ns());
+
+		math_pose_convert_from_opencv(&out_relation.pose, &out_relation.pose);
+		math_vec3_convert_from_opencv(&out_relation.linear_velocity, &out_relation.linear_velocity);
+		math_vec3_convert_from_opencv(&out_relation.angular_velocity, &out_relation.angular_velocity);
+		return;
+	}
+	if (for_app && hold_after_ns > 0) {
+		std::lock_guard<std::mutex> lock(this->unseen_hold.mutex);
+		this->unseen_hold.app_holding = false;
+	}
+
 	bool integrate_to = true;
 
 	if (requested_time_ns <= latest_solve_time_ns) {
@@ -3153,9 +3745,17 @@ SensorFusion::getTrackedPose(timepoint_ns requested_time_ns,
 		integrate_to = false;
 	}
 
-	std::array<xrt_imu_sample, kImuBufferSize> samples_buf;
 	uint32_t num_samples = 0;
 	std::optional<xrt_imu_sample> first_after;
+
+	/*
+	 * Asked for at the latest solve's own time, or before an IMU sample has come in after it: the latest solve as it
+	 * is. The relation history has the pose the solve before carried on to there, which the latest replaced: a query
+	 * there got the old pose, and an application's got the new solve's blend offset on top of it, a step of the whole
+	 * correction the wrong way and back on the next frame (asking right after each exposure, as replays do), and the
+	 * tracker's prior for the other cameras' views of the exposure missed what the first had found.
+	 */
+	bool at_solve = requested_time_ns == latest_solve_time_ns;
 
 	if (integrate_to) {
 		xrt_imu_sample raw_first_after;
@@ -3176,6 +3776,7 @@ SensorFusion::getTrackedPose(timepoint_ns requested_time_ns,
 		if (num_samples == 0) {
 			SF_TRACE(this, "No IMU data found for dead reckoning");
 			integrate_to = false;
+			at_solve = result == ImuCollectResult::Ok || result == ImuCollectResult::NoSampleAfterEnd;
 		}
 
 		if (result == ImuCollectResult::NoSampleAfterEnd) {
@@ -3183,6 +3784,10 @@ SensorFusion::getTrackedPose(timepoint_ns requested_time_ns,
 		} else {
 			first_after = raw_first_after;
 		}
+	}
+
+	if (debug_get_num_option_sensor_fusion_at_solve() < (for_app ? 1 : 2)) {
+		at_solve = false;
 	}
 
 	if (integrate_to) {
@@ -3200,6 +3805,37 @@ SensorFusion::getTrackedPose(timepoint_ns requested_time_ns,
 		out_time_ns = samples_buf[num_samples - 1].timestamp_ns;
 
 		SF_TRACE(this, "Used dead reckoning for pose at ts %" PRIi64, requested_time_ns);
+	} else if (at_solve) {
+		out_relation = xrt_space_relation{
+		    .relation_flags = static_cast<xrt_space_relation_flags>(
+		        XRT_SPACE_RELATION_ORIENTATION_VALID_BIT | XRT_SPACE_RELATION_POSITION_VALID_BIT |
+		        XRT_SPACE_RELATION_LINEAR_VELOCITY_VALID_BIT | XRT_SPACE_RELATION_ORIENTATION_TRACKED_BIT |
+		        XRT_SPACE_RELATION_POSITION_TRACKED_BIT),
+		    .pose = Tcv_world_device,
+		    .linear_velocity = XRT_VEC3_ZERO,
+		    .angular_velocity = XRT_VEC3_ZERO,
+		};
+		map_vec3(out_relation.linear_velocity) = map_vec3_f64(world_velocity).cast<float>();
+		// The turn rate: the gyro's first reading after it, else what the history has there.
+		if (first_after.has_value()) {
+			map_vec3(out_relation.angular_velocity) =
+			    (map_quat(Tcv_world_device.orientation).cast<double>() *
+			     (map_vec3_f64(first_after->gyro_rad_secs) - map_vec3_f64(gyro_bias)))
+			        .cast<float>();
+			out_relation.relation_flags = static_cast<xrt_space_relation_flags>(
+			    out_relation.relation_flags | XRT_SPACE_RELATION_ANGULAR_VELOCITY_VALID_BIT);
+		} else {
+			xrt_space_relation history = XRT_SPACE_RELATION_ZERO;
+			m_relation_history_get(this->device.relation_history, latest_solve_time_ns, &history);
+			if ((history.relation_flags & XRT_SPACE_RELATION_ANGULAR_VELOCITY_VALID_BIT) != 0) {
+				out_relation.angular_velocity = history.angular_velocity;
+				out_relation.relation_flags = static_cast<xrt_space_relation_flags>(
+				    out_relation.relation_flags | XRT_SPACE_RELATION_ANGULAR_VELOCITY_VALID_BIT);
+			}
+		}
+		out_time_ns = latest_solve_time_ns;
+
+		SF_TRACE(this, "Used the latest solve for pose at ts %" PRIi64, requested_time_ns);
 	} else {
 		m_relation_history_get(this->device.relation_history, requested_time_ns, &out_relation);
 		out_time_ns = requested_time_ns;
@@ -3207,9 +3843,13 @@ SensorFusion::getTrackedPose(timepoint_ns requested_time_ns,
 		SF_TRACE(this, "Used relation history for pose at ts %" PRIi64, requested_time_ns);
 	}
 
+	if (for_app && hold_after_ns > 0 && (out_relation.relation_flags & XRT_SPACE_RELATION_POSITION_VALID_BIT) != 0) {
+		keepLastPose(*this, out_relation, out_time_ns, gyro_bias, Qcv_imu_model);
+	}
+
 	math_quat_rotate(&out_relation.pose.orientation, &Qcv_imu_model, &out_relation.pose.orientation);
 
-	if (blended) {
+	if (for_app) {
 		out_relation.pose.position = out_relation.pose.position +
 		                             decayedBlendOffset(blend_offset, blend_offset_ns, os_monotonic_get_ns());
 	}
@@ -3250,6 +3890,26 @@ SensorFusion::resetLocked()
 	this->num_late_samples_dropped = 0;
 
 	this->device.resetLocked();
+}
+
+void
+SensorFusion::dropWindowLocked()
+{
+	/*
+	 * As resetLocked, but the IMU ring stays: it is written without the lock, and the intervals read it by timestamp,
+	 * so the samples before the reset do no harm.
+	 */
+	this->problem->reset();
+	this->keyframe_head = 0;
+	this->num_keyframes = 0;
+	this->waiting_on_imu.store(false, std::memory_order_relaxed);
+	m_relation_history_clear(this->device.relation_history);
+	this->device.has_latest_solve = false;
+	this->device.blend_offset = xrt_vec3{0.0f, 0.0f, 0.0f};
+	this->device.blend_offset_ns = 0;
+	for (auto &preintegration : this->device.preintegrations) {
+		preintegration = DevicePreintegration::Identity(DevicePreintegrationState::Dirty);
+	}
 }
 
 void
@@ -3359,12 +4019,15 @@ SensorFusion::preintegrateDeviceLocked(bool &work_remaining, bool &wants_imu_wak
 			continue;
 		}
 
+		const double accel_noise_scale =
+		    this->head ? static_cast<double>(debug_get_float_option_sensor_fusion_head_accel_noise()) : 1.0;
 		preintegration.imu_preintegration = preintegrate(std::span<const xrt_imu_sample>(samples_buf.data(),
 		                                                                                 num_samples), //
 		                                                 first_after,                                  //
 		                                                 bias,                                         //
 		                                                 start_keyframe->timestamp_ns,                 //
-		                                                 end_keyframe.timestamp_ns);                   //
+		                                                 end_keyframe.timestamp_ns,                    //
+		                                                 accel_noise_scale);                           //
 
 		preintegration.state = DevicePreintegrationState::Integrated;
 

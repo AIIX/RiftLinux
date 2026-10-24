@@ -46,6 +46,7 @@
 #include <atomic>
 #include <chrono>
 #include <thread>
+#include <optional>
 #include <cinttypes>
 #include <cstdio>
 #include <cstdlib>
@@ -106,6 +107,8 @@ struct ReplayDevice
 	//! The fusion is the prior only within this long of a solve, 0 for always: the Touch driver's rule.
 	timepoint_ns fusion_fresh_ns{0};
 	timepoint_ns last_solve_ns{0};
+	//! Within that time too, the held pose when the fusion has none (it started over), as the Touch driver does.
+	bool held_when_no_fusion{false};
 
 	/*!
 	 * After that, the Touch driver hands over its IMU's orientation and the position held where it was last
@@ -185,6 +188,16 @@ replay_get_tracked_pose(t_constellation_tracker_tracking_source *source,
 			return;
 		}
 		rd->tracker->getTrackedPose(rd->id, when_ns, *out_relation, false);
+		const xrt_space_relation_flags needed =
+		    (xrt_space_relation_flags)(XRT_SPACE_RELATION_POSITION_VALID_BIT | XRT_SPACE_RELATION_ORIENTATION_VALID_BIT);
+		if (rd->held_when_no_fusion && rd->fusion_fresh_ns > 0 && rd->have_hold &&
+		    (out_relation->relation_flags & needed) != needed) {
+			out_relation->pose = rd->hold_pose;
+			out_relation->relation_flags =
+			    (xrt_space_relation_flags)(XRT_SPACE_RELATION_ORIENTATION_VALID_BIT |
+			                               XRT_SPACE_RELATION_ORIENTATION_TRACKED_BIT |
+			                               XRT_SPACE_RELATION_POSITION_VALID_BIT);
+		}
 	} else {
 		m_relation_history_get(rd->history, when_ns, out_relation);
 	}
@@ -249,6 +262,8 @@ struct Options
 	int blob_threshold{RIFT_BLOBWATCH_BLOB_REQUIRED_THRESHOLD_CV1};
 	//! `track` mode: how long after its last solve a Touch's fusion pose is used (RIFT_TOUCH_POSITION_HOLD_NS).
 	double touch_fresh_ms{150.0};
+	//! `track` mode: a Touch whose fusion has no pose within that time gets the held pose, as in the Rift driver.
+	bool touch_held_when_no_fusion{false};
 	//! `frames` mode: take the Touch gyros' bias out whenever they lie still, as the Rift driver does.
 	bool rest_bias{true};
 	//! `frames` mode: blobs added to every frame of their camera (camera,dx,dy,ux,uy,bbx,bby,bbw,bbh,sx,sy), e.g.
@@ -262,6 +277,8 @@ struct Options
 	int max_blob_width{RIFT_BLOBWATCH_DEFAULT_MAX_BLOB_WIDTH};
 	//! `frames` mode: hand frames over at the pace they were captured, as live, not as fast as they go.
 	bool realtime{false};
+	//! track: stretches of the run, in seconds from its first sample, in which no sensor sees anything.
+	std::vector<std::pair<double, double>> blind;
 	//! `frames` mode: run the tracker's camera threads as live does, fast and slow searches racing the frames.
 	bool threaded{false};
 	//! `frames` mode: place the cameras where the template's last samples have them (a run that placed them
@@ -316,6 +333,8 @@ usage()
 	    "                         processed (default 10).\n"
 	    "  --touch-fresh-ms T     track: a Touch's fusion pose is used up to T ms after its last solve\n"
 	    "                         (default 150, the Rift driver's).\n"
+	    "  --touch-held 0|1       track: within that time, a Touch whose fusion has no pose (it started over) gets\n"
+	    "                         its held pose as the prior, as the Rift driver does (default 0).\n"
 	    "  --frames-dir D         frames: run the Rift blobwatch and the tracker on raw sensor frames and IMU\n"
 	    "                         samples from D (frames.zst, frames.csv, imu.csv), <in.ctdata> giving the cameras,\n"
 	    "                         their placement and the devices. Implies --prior fusion.\n"
@@ -330,7 +349,10 @@ usage()
 	    "  --rest-bias 0|1   frames: take the Touch gyros' bias out whenever they lie still (1).\n"
 	    "  --inject-blobs FILE   frames: add these blobs to every frame of their camera.\n"
 	    "  --max-blob-width N    frames: the blobwatch's largest blob (50).\n"
-	    "  --realtime 0|1        frames: hand frames over at the pace they were captured (0).\n"
+	    "  --blind S,E[,S,E...]  track: no sensor sees anything from S to E seconds after the first sample (the IMU\n"
+	    "                        and the app's queries go on), to compare what is held with what was tracked.\n"
+	    "  --realtime 0|1        frames, track: hand frames (track: samples and the app's queries) over at the pace\n"
+	    "                        they were captured (0); what the fusion times on the clock then runs as live.\n"
 	    "  --threaded 0|1        frames: run the tracker's camera threads as live (0, one thread).\n"
 	    "  --forget-every S      frames: forget the controllers every S seconds, to measure finding them again.\n"
 	    "  --app-hz F             track: query every device's output pose F times a second of the\n"
@@ -382,6 +404,19 @@ parse_options(int argc, char **argv, Options &o)
 			o.inject_blobs = value;
 		} else if (arg == "--max-blob-width") {
 			o.max_blob_width = atoi(value);
+		} else if (arg == "--blind") {
+			std::vector<double> v;
+			for (const char *c = value; *c != '\0';) {
+				char *end = nullptr;
+				v.push_back(strtod(c, &end));
+				c = (*end == ',') ? end + 1 : end;
+				if (end == c && *c != '\0') {
+					break;
+				}
+			}
+			for (size_t k = 0; k + 1 < v.size(); k += 2) {
+				o.blind.emplace_back(v[k], v[k + 1]);
+			}
 		} else if (arg == "--realtime") {
 			o.realtime = atoi(value) != 0;
 		} else if (arg == "--threaded") {
@@ -410,6 +445,8 @@ parse_options(int argc, char **argv, Options &o)
 			o.app_after_each_ms = atof(value);
 		} else if (arg == "--touch-fresh-ms") {
 			o.touch_fresh_ms = atof(value);
+		} else if (arg == "--touch-held") {
+			o.touch_held_when_no_fusion = atoi(value) != 0;
 		} else if (arg == "--calibration-from") {
 			o.calibration_from = value;
 		} else if (arg == "--camera") {
@@ -624,16 +661,19 @@ do_replay(const Options &o)
 		    .imu_sink = nullptr,
 		    .loose_part = {},
 		    .serial = {},
+		    .head = false,
 		};
 		if (device.led_model.led_count > 0) {
 			static LoosePart part = load_loose_part(o, device.led_model.leds[0]);
 			give_loose_part(device_params, part, device.led_model.led_count > 24);
+			device_params.head = device.led_model.led_count > 24;
 		}
 
 		const bool touch = device.led_model.led_count <= 24;
 		if (touch) {
 			// RIFT_TOUCH_POSITION_HOLD_NS
 			rd->fusion_fresh_ns = static_cast<timepoint_ns>(o.touch_fresh_ms * U_TIME_1MS_IN_NS);
+			rd->held_when_no_fusion = o.touch_held_when_no_fusion;
 		}
 		device_params.led_model.match_parameters = {
 		    .min_leds_for_correspondence_search_without_prior =
@@ -743,6 +783,20 @@ do_replay(const Options &o)
 	uint64_t considered = 0;
 	uint64_t replayed = 0;
 
+	// --realtime: at the recorded pace, so that what the fusion times on the monotonic clock (blends) runs as live.
+	std::optional<std::chrono::steady_clock::time_point> pace_wall;
+	timepoint_ns pace_first_ns = 0;
+	auto pace = [&](timepoint_ns ts) {
+		if (!o.realtime || !track) {
+			return;
+		}
+		if (!pace_wall) {
+			pace_wall = std::chrono::steady_clock::now();
+			pace_first_ns = ts;
+		}
+		std::this_thread::sleep_until(*pace_wall + std::chrono::nanoseconds(ts - pace_first_ns));
+	};
+
 	for (const auto &recorded : dataset.samples) {
 		if (recorded.timestamp_ns < from_ns || recorded.timestamp_ns > to_ns) {
 			continue;
@@ -776,6 +830,7 @@ do_replay(const Options &o)
 				app_next_ns = recorded.timestamp_ns;
 			}
 			for (; app_next_ns <= recorded.timestamp_ns; app_next_ns += app_period_ns) {
+				pace(app_next_ns);
 				for (auto &rd : replay_devices) {
 					xrt_space_relation relation;
 					if (rd->fusion_fresh_ns > 0 &&
@@ -788,6 +843,15 @@ do_replay(const Options &o)
 			}
 		}
 
+		pace(recorded.timestamp_ns);
+		bool blinded = false;
+		for (const auto &b : o.blind) {
+			const double at_s = static_cast<double>(recorded.timestamp_ns - t0) / U_TIME_1S_IN_NS;
+			blinded = blinded || (at_s >= b.first && at_s < b.second);
+		}
+		if (blinded) {
+			continue;
+		}
 		ct::CameraSample sample = recorded;
 		sample.source = &stub_blobwatch;
 		if (!track) {
@@ -1074,6 +1138,7 @@ do_frames(const Options &o)
 		const bool touch = device.led_model.led_count <= 24;
 		if (touch) {
 			rd->fusion_fresh_ns = static_cast<timepoint_ns>(o.touch_fresh_ms * U_TIME_1MS_IN_NS);
+			rd->held_when_no_fusion = o.touch_held_when_no_fusion;
 		}
 		t_constellation_tracker_device_params device_params = {
 		    .led_model = device.led_model,
@@ -1081,10 +1146,12 @@ do_frames(const Options &o)
 		    .imu_sink = nullptr,
 		    .loose_part = {},
 		    .serial = {},
+		    .head = false,
 		};
 		if (device.led_model.led_count > 0) {
 			static LoosePart part = load_loose_part(o, device.led_model.leds[0]);
 			give_loose_part(device_params, part, device.led_model.led_count > 24);
+			device_params.head = device.led_model.led_count > 24;
 		}
 		device_params.led_model.match_parameters = {
 		    .min_leds_for_correspondence_search_without_prior = 7u,

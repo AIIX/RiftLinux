@@ -31,6 +31,23 @@ A Valve bug in SteamVR for Linux, not the driver ([SteamVR for Linux #963](https
 **SteamVR's compositor crashes as SteamVR quits.**
 After the session has ended, and harmless: SteamVR's own exit code. Nothing is lost.
 
+**A game does not start from inside VR, or waits forever.**
+Steam asks some questions before a game's first start (an agreement, a launch option, a third-party account) on the
+monitor, not in the headset; SteamVR's Desktop tab is empty on Linux, so take the headset off and answer them there.
+Some games also ask on their own window first. A game whose anti-cheat its developer has not enabled for Linux
+starts and is then removed from online play: its own log says so, and no driver can change that.
+
+**SteamVR shows "SteamVR has encountered an unexpected problem" and nothing starts any more.**
+SteamVR's compositor stopped and SteamVR did not start it again. Close SteamVR and start it again; if it does not
+close, log out and in.
+
+**After quitting a game the headset stays dark.**
+SteamVR's own compositor can fail as a game quits, with or without direct mode. Close SteamVR and start it again.
+
+**With direct mode off, SteamVR stops when the headset is put down.**
+Seen on KDE Plasma (Wayland): SteamVR's own compositor loses the display when the headset's display switches off.
+Keep direct mode on: `riftlinux-setup direct-mode on`.
+
 ## The picture
 
 **The headset is dark and its light is orange.**

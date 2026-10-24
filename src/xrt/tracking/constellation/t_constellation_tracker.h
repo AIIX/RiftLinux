@@ -110,6 +110,12 @@ struct t_constellation_tracker_device_params
 
 	//! A stable identifier of the device, such as its serial number, to save the part's measured place under.
 	char serial[32];
+
+	/*!
+	 * The device is worn on the head: unseen by every sensor, the pose applications get is held, turning about the
+	 * neck, see SensorFusion::getTrackedPose. Controllers leave it false.
+	 */
+	bool head;
 };
 
 enum t_constellation_tracker_flags

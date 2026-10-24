@@ -69,6 +69,9 @@ extern "C" {
 #include <sys/wait.h>
 #include <unistd.h>
 #include "util/u_notice.h"
+#ifdef XRT_OS_LINUX
+#include "util/u_linux.h"
+#endif
 #include "util/u_json.h"
 #include "xrt/xrt_compositor.h"
 #include "xrt/xrt_session.h"
@@ -396,12 +399,20 @@ recalibration_done()
  * Monado service recenters on a put-on: placed at the first pose, it faced wherever the headset pointed in a hand.
  * Placed again, once the head has settled in the new measurement, when measuring the sensors again moved the room.
  */
+/*!
+ * How long the headset has to be worn before it may be placed on: a headset taken as worn while it moves (its wear
+ * sensor missing the face) was placed while still being put on, from a moment it was held still in the hands, and the
+ * world faced 60 degrees off.
+ */
+static constexpr int64_t kPlaceWornForNs = static_cast<int64_t>(3) * U_TIME_1S_IN_NS;
+
 static void
 set_world_from_driver_once(struct xrt_device *xdev, const struct xrt_space_relation *head)
 {
 	static int64_t settle_since_ns = 0;
 	static float settle_yaw = 0.0f;
 	static int64_t last_check_ns = 0;
+	static int64_t worn_since_ns = 0;
 	// Only this (the HMD's pose) thread.
 	static rl::room::Settle resettle;
 
@@ -442,7 +453,14 @@ set_world_from_driver_once(struct xrt_device *xdev, const struct xrt_space_relat
 	float d = (yaw - settle_yaw) * 180.0f / (float)M_PI;
 	d = d > 180.0f ? d - 360.0f : (d < -180.0f ? d + 360.0f : d);
 	if (!recentre) {
-		if (!head_worn(xdev) || settle_since_ns == 0 || fabsf(d) > 8.0f || fabsf(forward.y) > 0.6f) {
+		const bool worn = head_worn(xdev);
+		if (!worn) {
+			worn_since_ns = 0;
+		} else if (worn_since_ns == 0) {
+			worn_since_ns = now_ns;
+		}
+		if (!worn || now_ns - worn_since_ns < kPlaceWornForNs || settle_since_ns == 0 || fabsf(d) > 8.0f ||
+		    fabsf(forward.y) > 0.6f) {
 			settle_since_ns = now_ns;
 			settle_yaw = yaw;
 			return;
@@ -2196,9 +2214,20 @@ CDeviceDriver_Monado::GetPose()
 	 * calibration, when no sensor is placed yet). The last tracked position is held, not moving; before there is one,
 	 * the head stands at an eye height in SteamVR's room (the world is not placed yet), turning only.
 	 */
+	/*
+	 * Unseen by every sensor the tracker holds the headset, turning about the neck: valid but not tracked, with the
+	 * velocity of that turn (a pose of the IMU's orientation alone never has one, nor a position of its own). Shown as
+	 * handed out, as the Oculus runtime shows a headset it cannot see; it jumped when the copy below was shown.
+	 */
+	const bool held = (rel.relation_flags & XRT_SPACE_RELATION_POSITION_TRACKED_BIT) == 0 &&
+	                  (rel.relation_flags & XRT_SPACE_RELATION_POSITION_VALID_BIT) != 0 &&
+	                  (rel.relation_flags & XRT_SPACE_RELATION_LINEAR_VELOCITY_VALID_BIT) != 0;
 	if ((rel.relation_flags & XRT_SPACE_RELATION_POSITION_TRACKED_BIT) != 0) {
 		m_last_position = rel.pose.position;
 		m_position_known = true;
+	} else if (held && m_position_known) {
+		m_last_position = rel.pose.position;
+		copy_vec3(&rel.pose.position, t.vecPosition);
 	} else {
 		struct xrt_vec3 standing = {0.0f, kStandingEyeHeightM + g_world_from_driver.height_m.load(), 0.0f};
 		copy_vec3(m_position_known ? &m_last_position : &standing, t.vecPosition);
@@ -3484,6 +3513,14 @@ CServerDriver_Monado::Init(vr::IVRDriverContext *pDriverContext)
 
 	ovrd_log("Initializing Monado driver\n");
 	const int64_t init_start_ns = os_monotonic_get_ns();
+
+#ifdef XRT_OS_LINUX
+	// Before the driver's threads, which inherit it: SteamVR started from a background session runs in its class.
+	if (!u_linux_leave_background_scheduling(U_LOGGING_INFO, "SteamVR driver")) {
+		ovrd_log("SteamVR runs at the lowest CPU priority (started from a background session): start Steam from the "
+		         "desktop\n");
+	}
+#endif
 
 #ifdef XRT_OS_LINUX
 	riftlinux_load_floor();

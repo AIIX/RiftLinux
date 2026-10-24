@@ -1175,6 +1175,13 @@ def cmd_register(p, opts):
                 vs["driver_" + DRIVER_NAME] = sect
                 write_json(vrsettings, vs, indent=3)
                 logn("SteamVR had blocked the driver (safe mode): enabled again")
+            # SteamVR 2.18 starts without SteamVR Home unless it is switched on; one the user switched off stays off.
+            steamvr = vs.get("steamvr", {})
+            if "enableHomeApp" not in steamvr:
+                steamvr["enableHomeApp"] = True
+                vs["steamvr"] = steamvr
+                write_json(vrsettings, vs, indent=3)
+                logn("SteamVR Home switched on (SteamVR 2.18 starts without it)")
     if logs:
         try:
             d = os.path.join(os.environ.get("XDG_CACHE_HOME") or os.path.join(HOME, ".cache"), "riftlinux")

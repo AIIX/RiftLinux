@@ -551,9 +551,6 @@ static const char *optional_instance_extensions[] = {
 #ifdef VK_EXT_swapchain_colorspace
     VK_EXT_SWAPCHAIN_COLORSPACE_EXTENSION_NAME,
 #endif
-#ifdef VK_KHR_get_surface_capabilities2
-    VK_KHR_GET_SURFACE_CAPABILITIES_2_EXTENSION_NAME,
-#endif
 #ifdef VK_EXT_display_surface_counter
     VK_EXT_DISPLAY_SURFACE_COUNTER_EXTENSION_NAME,
 #endif
