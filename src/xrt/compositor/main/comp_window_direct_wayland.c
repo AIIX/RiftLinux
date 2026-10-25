@@ -11,11 +11,14 @@
  */
 
 #include <errno.h>
+#include <fcntl.h>
 #include <linux/input.h>
+#include <linux/kcmp.h>
 #include <poll.h>
 #include <stdlib.h>
 #include <stdio.h>
 #include <string.h>
+#include <sys/syscall.h>
 #include <unistd.h>
 #include <wayland-client.h>
 #include <xf86drm.h>
@@ -25,8 +28,10 @@
 #include "xrt/xrt_compiler.h"
 #include "main/comp_window.h"
 #include "main/comp_window_direct.h"
+#include "os/os_time.h"
 #include "util/u_debug.h"
 #include "util/u_notice.h"
+#include "util/u_time.h"
 
 #ifndef VK_EXT_acquire_drm_display
 #error "Wayland direct requires the Vulkan extension VK_EXT_acquire_drm_display"
@@ -34,11 +39,20 @@
 
 DEBUG_GET_ONCE_OPTION(requested_connector, "XRT_COMPOSITOR_WAYLAND_CONNECTOR", NULL)
 
+//! After a lease that failed, the headset is asked for again after 1 s, then 2, 4 and 8 s (RiftLinux).
+#define TAKE_AGAIN_FIRST_WAIT_NS (1LL * U_TIME_1S_IN_NS)
+#define TAKE_AGAIN_LONGEST_WAIT_NS (8LL * U_TIME_1S_IN_NS)
+
 struct direct_wayland_lease
 {
 	struct comp_window_direct_wayland *w;
 
 	int leased_fd;
+	/*!
+	 * The copy of leased_fd Vulkan was given (RiftLinux): the specification has the fd stay open until the display
+	 * is released, and Mesa closes the one it was given when it is; with a copy each side closes its own.
+	 */
+	int vk_fd;
 	bool finished;
 	struct wp_drm_lease_v1 *lease;
 };
@@ -90,6 +104,11 @@ struct comp_window_direct_wayland
 	 */
 	bool lost;
 	bool released;
+	//! No lease asked for before this, after the last one failed; the wait doubles each time (RiftLinux).
+	int64_t ask_after_ns;
+	int64_t ask_wait_ns;
+	//! Said once while lost: the desktop offers the connector, but nothing is on it.
+	bool told_nothing_on_it;
 	uint32_t width, height;
 	bool (*swapchain_check_ready)(struct comp_target *ct);
 	VkResult (*swapchain_present)(struct comp_target *ct,
@@ -129,6 +148,34 @@ get_vk(struct comp_window_direct_wayland *cww)
 	return &cww->base.base.c->base.vk;
 }
 
+//! Both fds are the same open file (kcmp): false also when that cannot be told.
+static bool
+same_open_file(int fd_a, int fd_b)
+{
+	const pid_t pid = getpid();
+	return syscall(SYS_kcmp, pid, pid, KCMP_FILE, fd_a, fd_b) == 0;
+}
+
+/*!
+ * Vulkan lets go of the headset's display (RiftLinux). Its copy of the leased fd is closed here unless the driver
+ * closed it (Mesa does): only while that fd number still holds the lease's file, so no other file is closed.
+ */
+static void
+release_display(struct comp_window_direct_wayland *w)
+{
+	struct vk_bundle *vk = get_vk(w);
+	if (w->vk_display != VK_NULL_HANDLE) {
+		vk->vkReleaseDisplayEXT(vk->physical_device, w->vk_display);
+		w->vk_display = VK_NULL_HANDLE;
+	}
+	if (w->lease != NULL && w->lease->vk_fd >= 0) {
+		if (w->lease->leased_fd >= 0 && same_open_file(w->lease->vk_fd, w->lease->leased_fd)) {
+			close(w->lease->vk_fd);
+		}
+		w->lease->vk_fd = -1;
+	}
+}
+
 static void
 comp_window_direct_wayland_destroy(struct comp_target *w)
 {
@@ -136,11 +183,7 @@ comp_window_direct_wayland_destroy(struct comp_target *w)
 
 	comp_target_swapchain_cleanup(&w_wayland->base);
 
-	if (w_wayland->vk_display != VK_NULL_HANDLE) {
-		struct vk_bundle *vk = get_vk(w_wayland);
-		vk->vkReleaseDisplayEXT(vk->physical_device, w_wayland->vk_display);
-		w_wayland->vk_display = VK_NULL_HANDLE;
-	}
+	release_display(w_wayland);
 
 	struct direct_wayland_lease_device *dev = w_wayland->devices, *next_dev;
 	while (dev) {
@@ -150,8 +193,12 @@ comp_window_direct_wayland_destroy(struct comp_target *w)
 	}
 
 	if (w_wayland->lease) {
-		close(w_wayland->lease->leased_fd);
-		wp_drm_lease_v1_destroy(w_wayland->lease->lease);
+		if (w_wayland->lease->leased_fd >= 0) {
+			close(w_wayland->lease->leased_fd);
+		}
+		if (w_wayland->lease->lease != NULL) {
+			wp_drm_lease_v1_destroy(w_wayland->lease->lease);
+		}
 		free(w_wayland->lease);
 	}
 
@@ -174,7 +221,8 @@ static void
 _lease_finished(void *data, struct wp_drm_lease_v1 *wp_drm_lease_v1)
 {
 	struct direct_wayland_lease *lease = data;
-	if (lease->leased_fd >= 0) {
+	// Kept while Vulkan holds its copy: closed after the display is released (RiftLinux).
+	if (lease->leased_fd >= 0 && lease->vk_fd < 0) {
 		close(lease->leased_fd);
 		lease->leased_fd = -1;
 	}
@@ -214,9 +262,16 @@ comp_window_direct_wayland_create_surface(struct comp_window_direct_wayland *w,
 		return ret;
 	}
 
-	ret = vk->vkAcquireDrmDisplayEXT(vk->physical_device, w->lease->leased_fd, w->vk_display);
+	w->lease->vk_fd = fcntl(w->lease->leased_fd, F_DUPFD_CLOEXEC, 0);
+	if (w->lease->vk_fd < 0) {
+		COMP_ERROR(w->base.base.c, "Could not copy the leased fd: %s", strerror(errno));
+		return VK_ERROR_INITIALIZATION_FAILED;
+	}
+	ret = vk->vkAcquireDrmDisplayEXT(vk->physical_device, w->lease->vk_fd, w->vk_display);
 	if (ret != VK_SUCCESS) {
 		COMP_ERROR(w->base.base.c, "vkAcquireDrmDisplayEXT failed: %s", vk_result_string(ret));
+		close(w->lease->vk_fd);
+		w->lease->vk_fd = -1;
 		return ret;
 	}
 
@@ -637,6 +692,7 @@ comp_window_direct_wayland_init(struct comp_target *w)
 	struct direct_wayland_lease *lease = calloc(1, sizeof(struct direct_wayland_lease));
 	lease->w = w_wayland;
 	lease->leased_fd = -1;
+	lease->vk_fd = -1;
 	lease->finished = false;
 	lease->lease = wp_drm_lease_request_v1_submit(request);
 
@@ -673,36 +729,81 @@ _update_window_title(struct comp_target *ct, const char *title)
  *
  */
 
+/*!
+ * The lease given back: first to the desktop, which ends it while it is still held (closing it first had the kernel
+ * end it, and GNOME's revoke then failed: "No such file or directory"), then Vulkan lets go of the display and the
+ * fds are closed.
+ */
 static void
 forget_lease(struct comp_window_direct_wayland *w)
 {
+	if (w->lease != NULL && w->lease->lease != NULL) {
+		wp_drm_lease_v1_destroy(w->lease->lease);
+		w->lease->lease = NULL;
+		wl_display_roundtrip(w->display);
+	}
+	release_display(w);
 	if (w->lease == NULL) {
 		return;
 	}
 	if (w->lease->leased_fd >= 0) {
 		close(w->lease->leased_fd);
 	}
-	if (w->lease->lease != NULL) {
-		wp_drm_lease_v1_destroy(w->lease->lease);
-	}
 	free(w->lease);
 	w->lease = NULL;
 }
 
-//! A connector the desktop offers now: the Rift's, else the first.
+//! After a lease that failed: the headset is not asked for again before the wait is over.
+static void
+ask_again_later(struct comp_window_direct_wayland *w)
+{
+	w->ask_wait_ns = w->ask_wait_ns == 0 ? TAKE_AGAIN_FIRST_WAIT_NS : w->ask_wait_ns * 2;
+	if (w->ask_wait_ns > TAKE_AGAIN_LONGEST_WAIT_NS) {
+		w->ask_wait_ns = TAKE_AGAIN_LONGEST_WAIT_NS;
+	}
+	w->ask_after_ns = os_monotonic_get_ns() + w->ask_wait_ns;
+}
+
+/*!
+ * Nothing on the connector: the kernel has it disconnected (RiftLinux). GNOME offers the headset's connector again as
+ * soon as its lease ends, also while the CV1 is off HDMI, and a lease on it has no display modes; the headset is asked
+ * for only once it is back. Its current state, not probed again; false when it cannot be read.
+ */
+static bool
+connector_disconnected(struct direct_wayland_lease_device *dev, struct direct_wayland_lease_connector *conn)
+{
+	if (dev->drm_fd < 0) {
+		return false;
+	}
+	drmModeConnectorPtr c = drmModeGetConnectorCurrent(dev->drm_fd, conn->id);
+	if (c == NULL) {
+		return false;
+	}
+	const bool disconnected = c->connection == DRM_MODE_DISCONNECTED;
+	drmModeFreeConnector(c);
+	return disconnected;
+}
+
+//! A connector the desktop offers now with something on it: the Rift's, else the first.
 static bool
 pick_offered_connector(struct comp_window_direct_wayland *w,
                        struct direct_wayland_lease_device **out_dev,
-                       struct direct_wayland_lease_connector **out_conn)
+                       struct direct_wayland_lease_connector **out_conn,
+                       bool *out_nothing_on_it)
 {
 	*out_dev = NULL;
 	*out_conn = NULL;
+	*out_nothing_on_it = false;
 	for (struct direct_wayland_lease_device *d = w->devices; d != NULL; d = d->next) {
 		if (!d->done) {
 			continue;
 		}
 		for (struct direct_wayland_lease_connector *cn = d->connectors; cn != NULL; cn = cn->next) {
 			if (cn->withdrawn || cn->name == NULL) {
+				continue;
+			}
+			if (connector_disconnected(d, cn)) {
+				*out_nothing_on_it = true;
 				continue;
 			}
 			if (*out_conn == NULL || is_rift_description(cn->description) || is_rift_description(cn->name)) {
@@ -726,27 +827,24 @@ static bool
 take_headset_again(struct comp_window_direct_wayland *w)
 {
 	struct comp_target *ct = &w->base.base;
-	struct vk_bundle *vk = get_vk(w);
 
 	// The desktop's news (lease ended or granted, connectors offered).
 	comp_window_direct_wayland_flush(ct);
 
 	if (!w->released) {
 		comp_target_swapchain_release_output(&w->base);
-		if (w->vk_display != VK_NULL_HANDLE) {
-			vk->vkReleaseDisplayEXT(vk->physical_device, w->vk_display);
-			w->vk_display = VK_NULL_HANDLE;
-		}
 		forget_lease(w);
 		w->selected_connector = NULL;
 		w->released = true;
+		w->told_nothing_on_it = false;
 		COMP_INFO(ct->c, "Headset output given up; it is taken again when the desktop offers it");
 	}
 
 	if (w->lease != NULL) {
 		if (w->lease->finished) {
-			// Refused, or ended at once: asked again when offered.
+			// Refused, or ended at once: asked again when offered, after a wait.
 			forget_lease(w);
+			ask_again_later(w);
 			return false;
 		}
 		if (w->lease->leased_fd < 0) {
@@ -754,25 +852,35 @@ take_headset_again(struct comp_window_direct_wayland *w)
 		}
 		VkResult ret = comp_window_direct_wayland_create_surface(w, &w->base.surface.handle, w->width, w->height);
 		if (ret != VK_SUCCESS) {
-			COMP_ERROR(ct->c, "The headset's display could not be taken again: %s", vk_result_string(ret));
-			if (w->vk_display != VK_NULL_HANDLE) {
-				vk->vkReleaseDisplayEXT(vk->physical_device, w->vk_display);
-				w->vk_display = VK_NULL_HANDLE;
-			}
 			forget_lease(w);
+			ask_again_later(w);
+			COMP_ERROR(ct->c, "The headset's display could not be taken again (%s): asked again in %d s",
+			           vk_result_string(ret), (int)(w->ask_wait_ns / U_TIME_1S_IN_NS));
 			return false;
 		}
 		w->base.display = w->vk_display;
 		w->lost = false;
 		w->released = false;
+		w->ask_wait_ns = 0;
+		w->ask_after_ns = 0;
 		COMP_INFO(ct->c, "Headset taken again: connector %s (%s)", w->selected_connector->name,
 		          w->selected_connector->description);
 		return true;
 	}
 
+	if (os_monotonic_get_ns() < w->ask_after_ns) {
+		return false;
+	}
 	struct direct_wayland_lease_device *dev = NULL;
 	struct direct_wayland_lease_connector *conn = NULL;
-	if (!pick_offered_connector(w, &dev, &conn)) {
+	bool nothing_on_it = false;
+	if (!pick_offered_connector(w, &dev, &conn, &nothing_on_it)) {
+		if (nothing_on_it && !w->told_nothing_on_it) {
+			w->told_nothing_on_it = true;
+			COMP_INFO(ct->c,
+			          "The desktop offers the headset's connector while the headset is off HDMI: asked for "
+			          "when it is back");
+		}
 		return false; // Not offered (yet).
 	}
 	struct wp_drm_lease_request_v1 *request = wp_drm_lease_device_v1_create_lease_request(dev->device);
@@ -783,6 +891,7 @@ take_headset_again(struct comp_window_direct_wayland *w)
 	struct direct_wayland_lease *lease = calloc(1, sizeof(struct direct_wayland_lease));
 	lease->w = w;
 	lease->leased_fd = -1;
+	lease->vk_fd = -1;
 	lease->lease = wp_drm_lease_request_v1_submit(request);
 	wp_drm_lease_v1_add_listener(lease->lease, &lease_listener, lease);
 	w->lease = lease;
@@ -824,9 +933,21 @@ direct_wayland_present(struct comp_target *ct,
 		 * the compositor hears of it first. Taken again when the desktop offers the headset back.
 		 */
 		if (!w->lost) {
-			COMP_INFO(ct->c, "The headset's display went dark (%s, off when not worn, or unplugged): taken again "
-			          "when it is back",
-			          vk_result_string(ret));
+			// Why, as far as this tells: the CV1 off HDMI (display off, or unplugged) or still on it.
+			const char *hdmi = "";
+			if (w->selected_device != NULL && w->selected_connector != NULL &&
+			    w->selected_device->drm_fd >= 0) {
+				drmModeConnectorPtr c =
+				    drmModeGetConnectorCurrent(w->selected_device->drm_fd, w->selected_connector->id);
+				if (c != NULL) {
+					hdmi = c->connection == DRM_MODE_DISCONNECTED
+					           ? "; off HDMI: its display switched off (not worn) or unplugged"
+					           : "; still on HDMI: the desktop or the link took it";
+					drmModeFreeConnector(c);
+				}
+			}
+			COMP_INFO(ct->c, "The headset's display went dark (%s%s): taken again when it is back",
+			          vk_result_string(ret), hdmi);
 		}
 		w->lost = true;
 		return VK_ERROR_OUT_OF_DATE_KHR;

@@ -80,6 +80,16 @@ def backup(path):
     _backed_up.add(path)
 
 
+def backup_link(path):
+    """Before a link is replaced: the link itself kept next to it, pointing where it did. Its target can sit where
+    only root writes (another runtime's file in /usr/share/openxr), and it is not changed."""
+    if path in _backed_up or not os.path.islink(path):
+        backup(path)
+        return
+    os.symlink(os.readlink(path), f"{path}.bak-riftlinux-{STAMP}")
+    _backed_up.add(path)
+
+
 def write_json(path, data, indent="\t"):
     backup(path)
     os.makedirs(os.path.dirname(path), exist_ok=True)
@@ -618,7 +628,7 @@ def check_openxr(p, opts):
     steamxr = os.path.join(p.steamvr, "steamxr_linux64.json") if p.steamvr else None
 
     def fix():
-        backup(p.openxr_active)
+        backup_link(p.openxr_active)
         os.makedirs(os.path.dirname(p.openxr_active), exist_ok=True)
         tmp = p.openxr_active + ".tmp-riftlinux"
         if os.path.lexists(tmp):
