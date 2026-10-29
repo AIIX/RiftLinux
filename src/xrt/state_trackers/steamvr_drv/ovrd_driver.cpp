@@ -30,6 +30,7 @@
 
 #include "math/m_api.h"
 #include "ovrd_log.hpp"
+#include "ovrd_watchdog.hpp"
 #include "openvr_driver.h"
 
 extern "C" {
@@ -79,6 +80,7 @@ extern "C" {
 #include "ovrd_socket.hpp"
 #include "riftlinux/rl_floor.hpp"
 #include "riftlinux/rl_room.hpp"
+#include "riftlinux/rl_settings.hpp"
 #include "main/comp_main_interface.h"
 #include "render/render_output_settings.h"
 extern char **environ;
@@ -223,6 +225,8 @@ floor_now_s()
 
 //! Socket asked (riftlinux-setup, test tools): SteamVR quits the way its own Exit does, from RunFrame.
 static std::atomic<bool> g_quit_requested{false};
+//! SteamVR told its processes to quit (VREvent_Quit seen): its compositor stopping then is no fault.
+static std::atomic<bool> g_steamvr_quitting{false};
 
 //! Asks the tracker to measure every sensor again; true when it starts (logged either way).
 static bool
@@ -247,6 +251,52 @@ static std::atomic<bool> g_dashboard_visible{false};
 //! dashboard, which an application cannot.
 static std::atomic<int64_t> g_dashboard_toggle_until_ns{0};
 
+/*!
+ * SteamVR's dashboard kept where the user is (SteamVR's frame thread only, but g_dashboard_follow_world, raised by the
+ * pose thread as it places the world):
+ * - SteamVR opens it as it starts, in front of the head as the sensors had it before the world was placed on the user;
+ *   placing the world then turned and moved it with the room: it stood behind the user, its back to them. Opened by
+ *   SteamVR before the world is placed, it is closed at once and opened once the world is, in front; open as the world
+ *   is placed (a button opened it), it is closed and opened again, in front (closed and opened again alone, it stood
+ *   turned away for a moment first).
+ * - Steam opens its menu as a game starts (and again over it): it stood in front of the game. Open once a game has
+ *   been showing for a second, it is closed when it opened before the game showed (from the menu the game was picked
+ *   in) or later without a press of the menu or Oculus button; twice at most for one game, never a tug of war with
+ *   Steam. settings.json "steamvr": {"close_menu_for_games": false} keeps it.
+ */
+static std::atomic<bool> g_dashboard_follow_world{false};
+//! What the driver's last press of the menu button is to do, until SteamVR shows it did.
+enum class MenuStep
+{
+	none,
+	closing,
+	closing_to_open,
+	to_open,
+	opening,
+};
+static struct
+{
+	bool close_for_games = true;
+	//! A game is SteamVR's scene application (riftlinux-notices: "game 1 <key>" / "game 0"), which, since when, and
+	//! when the last one ended.
+	bool game = false;
+	std::string game_key;
+	int64_t game_since_ns = 0;
+	int64_t game_ended_ns = 0;
+	//! Closed over this game so far.
+	int closed = 0;
+	//! A menu or Oculus button last pressed or released.
+	int64_t pressed_ns = 0;
+	//! The dashboard as last seen, when it opened, and whether a button opened it.
+	bool was_open = false;
+	int64_t opened_ns = 0;
+	bool by_button = false;
+	MenuStep step = MenuStep::none;
+	int64_t step_ns = 0;
+	//! SteamVR's own, closed until the world is placed on the user.
+	bool hidden_for_world = false;
+} g_menu;
+
 #ifdef XRT_OS_LINUX
 /*!
  * Driver direct mode (ovrd_direct_mode.hpp): SteamVR's images shown by Monado's compositor. Null when off, which is
@@ -257,6 +307,9 @@ static OvrdDirectMode *g_direct_mode = nullptr;
 
 //! The headset reported as worn whatever its sensor says (direct mode capture runs, unattended).
 static std::atomic<bool> g_report_worn{false};
+//! settings.json "steamvr": {"standby": "pick-up"}: SteamVR's standby also ends when the headset moves (see
+//! riftlinux_load_standby).
+static std::atomic<bool> g_standby_by_pick_up{false};
 
 /*!
  * The Rift tab's picture row: Auto-HDR on or off and its strength, applied at once to Monado's
@@ -486,6 +539,7 @@ set_world_from_driver_once(struct xrt_device *xdev, const struct xrt_space_relat
 		g_world_from_driver.translation[2] = -moved.z;
 	}
 	g_world_from_driver.set.store(true, std::memory_order_release);
+	g_dashboard_follow_world.store(true);
 
 	ovrd_log("World %s on the user: heading %.1f deg, at %.2f %.2f m\n", recentre ? "recentred" : "placed",
 	         yaw * 180.0f / (float)M_PI, head->pose.position.x, head->pose.position.z);
@@ -1596,9 +1650,14 @@ public:
 
 			if (in.monado_input_type == XRT_INPUT_TYPE_BOOLEAN) {
 				bool state = input->value.boolean;
-				if (binding_name == XRT_INPUT_TOUCH_MENU_CLICK &&
-				    os_monotonic_get_ns() < g_dashboard_toggle_until_ns.load()) {
-					state = true;
+				if (binding_name == XRT_INPUT_TOUCH_MENU_CLICK) {
+					if (state != m_menuButtonDown) {
+						m_menuButtonDown = state;
+						g_menu.pressed_ns = now_ns;
+					}
+					if (os_monotonic_get_ns() < g_dashboard_toggle_until_ns.load()) {
+						state = true;
+					}
 				}
 				vr::VRDriverInput()->UpdateBooleanComponent(handle, state, 0);
 				// ovrd_log("Update %s: %d\n",
@@ -1661,6 +1720,9 @@ public:
 				} else {
 					riftlinux_helper_command("cmd-open-quick");
 				}
+			}
+			if (down != m_oculusButtonDown) {
+				g_menu.pressed_ns = now_ns;
 			}
 			m_oculusButtonDown = down;
 		}
@@ -1780,6 +1842,8 @@ private:
 
 	std::string m_input_profile;
 
+	//! The left Touch's menu button as pressed (not the driver's own presses).
+	bool m_menuButtonDown = false;
 	//! The right Touch's Oculus button: down, since when, held long enough to recentre.
 	bool m_oculusButtonDown = false;
 	int64_t m_oculusButtonSinceNs = 0;
@@ -1949,8 +2013,8 @@ CDeviceDriver_Monado::PoseUpdateThreadFunction()
 			was_worn = m_headDetect->value.boolean;
 			// Capture runs (headset on a desk): reported worn, so SteamVR stays out of standby and shows the
 			// application.
-			vr::VRDriverInput()->UpdateBooleanComponent(m_proximity,
-			                                            m_headDetect->value.boolean || g_report_worn.load(), 0);
+			vr::VRDriverInput()->UpdateBooleanComponent(
+			    m_proximity, m_headDetect->value.boolean || g_report_worn.load(), 0);
 		}
 	}
 	ovrd_log("Stopping HMD pose update thread\n");
@@ -2032,39 +2096,6 @@ CDeviceDriver_Monado::Activate(vr::TrackedDeviceIndex_t unObjectId)
 		vr::VRProperties()->SetStringProperty(m_ulPropertyContainer,
 		                                      vr::Prop_Audio_DefaultPlaybackDeviceId_String, sink);
 		ovrd_log("Audio playback device: %s\n", sink);
-
-		/*
-		 * SteamVR asks the headset whether it is worn (/user/head/proximity) and found no such input on it; the
-		 * Oculus driver's Rift profile has one, fed here from the CV1's wear sensor.
-		 */
-		for (uint32_t i = 0; i < m_xdev->input_count; i++) {
-			if (m_xdev->inputs[i].name == XRT_INPUT_GENERIC_HEAD_DETECT) {
-				m_headDetect = &m_xdev->inputs[i];
-			}
-		}
-		if (m_headDetect != NULL) {
-			vr::VRProperties()->SetStringProperty(m_ulPropertyContainer, vr::Prop_InputProfilePath_String,
-			                                      "{oculus}/input/rift_profile.json");
-			vr::VRDriverInput()->CreateBooleanComponent(m_ulPropertyContainer, "/proximity", &m_proximity);
-			/*
-			 * And that the headset has one: without it SteamVR judged presence by movement alone, and after its
-			 * standby (or at start) the picture stayed black until the head moved.
-			 */
-			vr::VRProperties()->SetBoolProperty(m_ulPropertyContainer, vr::Prop_ContainsProximitySensor_Bool,
-			                                    true);
-		}
-		/*
-		 * Direct mode: SteamVR's per-application throttling and prediction settings apply, as for the
-		 * headsets whose drivers reproject themselves; motion smoothing's half-rate lock goes the same way.
-		 */
-		if (g_direct_mode != nullptr) {
-			vr::VRProperties()->SetBoolProperty(m_ulPropertyContainer, vr::Prop_Hmd_SupportsAppThrottling_Bool,
-			                                    true);
-			// SteamVR paces to the driver's vsync events (Monado's display) rather than its own vsync model.
-			vr::VRProperties()->SetBoolProperty(m_ulPropertyContainer,
-			                                    vr::Prop_DriverDirectModeSendsVsyncEvents_Bool, true);
-			g_direct_mode->start_vsync_events();
-		}
 #ifdef OVRD_HAVE_PULSE_HEADERS
 		/*
 		 * SteamVR knew the headphones only: the microphone, on the same USB audio device, is the headset's recording
@@ -2082,6 +2113,44 @@ CDeviceDriver_Monado::Activate(vr::TrackedDeviceIndex_t unObjectId)
 			    }
 		    });
 #endif
+	}
+	/*
+	 * SteamVR asks the headset whether it is worn (/user/head/proximity) and found no such input on it; the Oculus
+	 * driver's Rift profile has one, fed here from the CV1's wear sensor. Whatever the serial reads (these were tied
+	 * to a CV1 serial with the audio above; a serial the headset failed to report left SteamVR without them).
+	 */
+	for (uint32_t i = 0; i < m_xdev->input_count; i++) {
+		if (m_xdev->inputs[i].name == XRT_INPUT_GENERIC_HEAD_DETECT) {
+			m_headDetect = &m_xdev->inputs[i];
+		}
+	}
+	if (m_headDetect != NULL) {
+		vr::VRProperties()->SetStringProperty(m_ulPropertyContainer, vr::Prop_InputProfilePath_String,
+		                                      "{oculus}/input/rift_profile.json");
+		vr::VRDriverInput()->CreateBooleanComponent(m_ulPropertyContainer, "/proximity", &m_proximity);
+		/*
+		 * And that the headset has one: without it SteamVR judged presence by movement alone, and after its standby
+		 * (or at start) the picture stayed black until the head moved.
+		 */
+		vr::VRProperties()->SetBoolProperty(m_ulPropertyContainer, vr::Prop_ContainsProximitySensor_Bool, true);
+		/*
+		 * SteamVR also leaves its standby when the headset moves, by its own rule ("movement or prox sensor"): a
+		 * headset picked up, or lying on a bed someone moves on, woke it with nobody wearing it. By default its
+		 * standby follows the wear sensor alone; steamvr.standby "pick-up" keeps SteamVR's own rule.
+		 */
+		vr::VRProperties()->SetBoolProperty(m_ulPropertyContainer, vr::Prop_IgnoreMotionForStandby_Bool,
+		                                    !g_standby_by_pick_up.load());
+	}
+	/*
+	 * Direct mode: SteamVR's per-application throttling and prediction settings apply, as for the headsets whose
+	 * drivers reproject themselves; motion smoothing's half-rate lock goes the same way.
+	 */
+	if (g_direct_mode != nullptr) {
+		vr::VRProperties()->SetBoolProperty(m_ulPropertyContainer, vr::Prop_Hmd_SupportsAppThrottling_Bool, true);
+		// SteamVR paces to the driver's vsync events (Monado's display) rather than its own vsync model.
+		vr::VRProperties()->SetBoolProperty(m_ulPropertyContainer, vr::Prop_DriverDirectModeSendsVsyncEvents_Bool,
+		                                    true);
+		g_direct_mode->start_vsync_events();
 	}
 	// clang-format off
 
@@ -2129,6 +2198,11 @@ void
 CDeviceDriver_Monado::EnterStandby()
 {
 	ovrd_log("Enter Standby\n");
+#ifdef XRT_OS_LINUX
+	if (g_direct_mode != nullptr) {
+		g_direct_mode->enter_standby();
+	}
+#endif
 }
 
 void *
@@ -2471,22 +2545,11 @@ riftlinux_settings_path()
 	return dir + "/riftlinux/settings.json";
 }
 
-//! The settings file parsed, or NULL (none, unreadable); free with cJSON_Delete.
+//! The settings file parsed, or NULL (none, unreadable, not a JSON object); free with cJSON_Delete.
 static cJSON *
 riftlinux_settings_load()
 {
-	FILE *file = fopen(riftlinux_settings_path().c_str(), "r");
-	if (file == nullptr) {
-		return nullptr;
-	}
-	std::string text;
-	char buf[4096];
-	size_t n;
-	while ((n = fread(buf, 1, sizeof(buf), file)) > 0 && text.size() < 65536) {
-		text.append(buf, n);
-	}
-	fclose(file);
-	return cJSON_Parse(text.c_str());
+	return rl::settings::load();
 }
 
 /*
@@ -2675,41 +2738,11 @@ openxr_runtime_default()
 	}
 }
 
-//! Sets @p section.@p key to @p item (taken) in the settings file, keeping everything else in it.
+//! Sets @p section.@p key to @p item (taken) in the settings file, keeping everything else in it (rl::settings).
 static void
 riftlinux_settings_set_item(const char *section, const char *key, cJSON *item)
 {
-	// Read, changed, written whole: one writer at a time, or a change made at the same moment is lost.
-	static std::mutex write_lock;
-	std::lock_guard<std::mutex> lock(write_lock);
-	cJSON *root = riftlinux_settings_load();
-	if (root == nullptr) {
-		root = cJSON_CreateObject();
-	}
-	cJSON *sec = cJSON_GetObjectItemCaseSensitive(root, section);
-	if (!cJSON_IsObject(sec)) {
-		cJSON_DeleteItemFromObjectCaseSensitive(root, section);
-		sec = cJSON_AddObjectToObject(root, section);
-	}
-	cJSON_DeleteItemFromObjectCaseSensitive(sec, key);
-	cJSON_AddItemToObject(sec, key, item);
-	char *text = cJSON_Print(root);
-	cJSON_Delete(root);
-	if (text == nullptr) {
-		return;
-	}
-	const std::string path = riftlinux_settings_path();
-	const std::string dir = path.substr(0, path.rfind('/'));
-	mkdir(dir.c_str(), 0755);
-	const std::string tmp = path + ".tmp";
-	FILE *file = fopen(tmp.c_str(), "w");
-	if (file != nullptr) {
-		fputs(text, file);
-		fputc('\n', file);
-		fclose(file);
-		rename(tmp.c_str(), path.c_str());
-	}
-	cJSON_free(text);
+	rl::settings::set_item(section, key, item);
 }
 
 //! Sets @p section.@p key to the number @p value in the settings file.
@@ -2735,16 +2768,119 @@ riftlinux_load_floor()
 	const cJSON *floor = cJSON_GetObjectItemCaseSensitive(tracking, "floor_m");
 	const cJSON *height = cJSON_GetObjectItemCaseSensitive(tracking, "height_cm");
 	const cJSON *eye = cJSON_GetObjectItemCaseSensitive(tracking, "eye_height_m");
-	g_world_from_driver.floor_m.store(cJSON_IsNumber(floor) ? (float)floor->valuedouble : 0.0f);
+	// Within reach of a room (a file edited by hand may hold any number).
+	g_world_from_driver.floor_m.store(
+	    cJSON_IsNumber(floor) ? (float)std::clamp(floor->valuedouble, -3.0, 3.0) : 0.0f);
 	g_world_from_driver.floor_known.store(cJSON_IsNumber(floor));
-	g_world_from_driver.height_m.store(cJSON_IsNumber(height) ? (float)height->valuedouble / 100.0f : 0.0f);
+	g_world_from_driver.height_m.store(
+	    cJSON_IsNumber(height) ? (float)std::clamp(height->valuedouble, -100.0, 100.0) / 100.0f : 0.0f);
 	if (cJSON_IsNumber(eye)) {
 		std::lock_guard<std::mutex> lock(g_recal.lock);
-		g_recal.keeper.set_saved_eye((float)eye->valuedouble);
+		g_recal.keeper.set_saved_eye((float)std::clamp(eye->valuedouble, 0.3, 2.5));
 	}
 	cJSON_Delete(settings);
 	ovrd_log("Floor %.3f m, height %+.0f cm (settings.json)\n", g_world_from_driver.floor_m.load(),
 	         g_world_from_driver.height_m.load() * 100.0f);
+}
+
+/*!
+ * SteamVR started by the headset (the watchdog's note, rl::watchdog::start_note_path): a headset picked up to be put
+ * away started SteamVR, Home and the headset's sound for nobody. Unless it is worn for 10 s straight (moving as on a
+ * head counts as worn for a moment) or a game starts within 2 minutes, SteamVR quits again; settings.json "steamvr":
+ * {"quit_if_not_put_on": false} lets it run on. Once a second, from RunFrame.
+ */
+static struct
+{
+	bool watching = false;
+	std::string what;
+	int64_t since_ns = 0;
+	int worn_s = 0;
+} g_headset_start;
+
+static void
+headset_start_read()
+{
+	const std::string path = rl::watchdog::start_note_path();
+	const std::string text = rl::watchdog::read_text(path, 256);
+	if (text.empty()) {
+		return;
+	}
+	unlink(path.c_str());
+	long long at = 0;
+	char what[64] = "";
+	const long long age = sscanf(text.c_str(), "%lld %63[^\n]", &at, what) == 2 ? (long long)time(nullptr) - at : -1;
+	// Started by hand later, after a start that did not come: not the headset's.
+	if (age < 0 || age > 30) {
+		return;
+	}
+	cJSON *settings = riftlinux_settings_load();
+	const bool quit = !cJSON_IsFalse(
+	    cJSON_GetObjectItemCaseSensitive(cJSON_GetObjectItemCaseSensitive(settings, "steamvr"), "quit_if_not_put_on"));
+	cJSON_Delete(settings);
+	if (!quit) {
+		ovrd_log("SteamVR started by the headset (%s): it runs on (settings.json steamvr.quit_if_not_put_on)\n", what);
+		return;
+	}
+	g_headset_start.watching = true;
+	g_headset_start.what = what;
+	g_headset_start.since_ns = os_monotonic_get_ns();
+	ovrd_log("SteamVR started by the headset (%s): it quits again unless the headset is put on within 2 minutes or a "
+	         "game starts\n",
+	         what);
+}
+
+//! True: SteamVR started by a headset that was not put on, to quit.
+static bool
+headset_start_check(bool worn, int64_t now_ns)
+{
+	if (!g_headset_start.watching) {
+		return false;
+	}
+	g_headset_start.worn_s = worn ? g_headset_start.worn_s + 1 : 0;
+	if (g_headset_start.worn_s >= 10 || g_menu.game) {
+		g_headset_start.watching = false;
+		ovrd_log("SteamVR started by the headset: %s, it stays\n", g_menu.game ? "a game started" : "put on");
+		return false;
+	}
+	if (now_ns - g_headset_start.since_ns < 120LL * U_TIME_1S_IN_NS) {
+		return false;
+	}
+	g_headset_start.watching = false;
+	ovrd_log("SteamVR started by the headset (%s), which was not put on: quitting\n", g_headset_start.what.c_str());
+	return true;
+}
+
+/*!
+ * settings.json "steamvr": {"standby": "pick-up"}: SteamVR's standby also ends when the headset moves, by SteamVR's own
+ * rule (as on Windows with the Oculus runtime: picked up, or moved where it lies); the picture still waits until the
+ * headset is worn. Default "worn": the standby follows the wear sensor alone (SteamVR ignores the headset's movement),
+ * so a headset on a bed someone moves on keeps SteamVR in standby. Read at SteamVR's start.
+ */
+static void
+riftlinux_load_standby()
+{
+	cJSON *settings = riftlinux_settings_load();
+	const cJSON *standby =
+	    cJSON_GetObjectItemCaseSensitive(cJSON_GetObjectItemCaseSensitive(settings, "steamvr"), "standby");
+	g_standby_by_pick_up.store(cJSON_IsString(standby) && strcmp(standby->valuestring, "pick-up") == 0);
+	cJSON_Delete(settings);
+	ovrd_log("%s\n", g_standby_by_pick_up.load()
+	                     ? "SteamVR's standby also ends when the headset moves, by SteamVR's own rule (settings.json "
+	                       "steamvr.standby)"
+	                     : "SteamVR's standby ends when the headset is worn; SteamVR ignores its movement for it");
+}
+
+//! settings.json "steamvr": {"close_menu_for_games": false} leaves Steam's menu open over games (see g_menu).
+static void
+riftlinux_load_menu()
+{
+	cJSON *settings = riftlinux_settings_load();
+	const cJSON *steamvr = cJSON_GetObjectItemCaseSensitive(settings, "steamvr");
+	g_menu.close_for_games = !cJSON_IsFalse(cJSON_GetObjectItemCaseSensitive(steamvr, "close_menu_for_games"));
+	cJSON_Delete(settings);
+	if (!g_menu.close_for_games) {
+		ovrd_log("Dashboard: Steam's menu stays open over games (settings.json steamvr.close_menu_for_games)\n");
+	}
 }
 
 /*!
@@ -3248,6 +3384,7 @@ riftlinux_helper_poll()
 		g_notices.fd = -1;
 		g_notices.pid = 0;
 		g_dashboard_visible.store(false);
+		g_menu.game = false;
 		return;
 	}
 	if (n < 0) {
@@ -3260,6 +3397,21 @@ riftlinux_helper_poll()
 		partial.erase(0, eol + 1);
 		if (line == "dashboard 1" || line == "dashboard 0") {
 			g_dashboard_visible.store(line == "dashboard 1");
+		} else if (line == "game 0" || line.rfind("game 1 ", 0) == 0) {
+			const int64_t now_ns = os_monotonic_get_ns();
+			const bool game = line != "game 0";
+			if (game && !g_menu.game) {
+				// Another game, or the same one started again: closing its menu may happen again.
+				const std::string key = line.substr(7);
+				if (key != g_menu.game_key || now_ns - g_menu.game_ended_ns > 10LL * U_TIME_1S_IN_NS) {
+					g_menu.closed = 0;
+				}
+				g_menu.game_key = key;
+				g_menu.game_since_ns = now_ns;
+			} else if (!game && g_menu.game) {
+				g_menu.game_ended_ns = now_ns;
+			}
+			g_menu.game = game;
 		} else if (line.rfind("height ", 0) == 0) {
 			const float cm = (float)std::lround(atof(line.c_str() + 7) / 10.0);
 			g_world_from_driver.height_m.store(cm / 100.0f);
@@ -3338,6 +3490,69 @@ riftlinux_helper_poll()
 	}
 	if (partial.size() > 4096) {
 		partial.clear();
+	}
+}
+
+//! A press of the left Touch's menu button, SteamVR's dashboard toggle, for what step is to come of it.
+static void
+menu_press(int64_t now_ns, MenuStep step)
+{
+	g_dashboard_toggle_until_ns.store(now_ns + 120 * U_TIME_1MS_IN_NS);
+	g_menu.step = step;
+	g_menu.step_ns = now_ns;
+}
+
+//! The dashboard in front of the user and off games (see g_menu), from RunFrame.
+static void
+menu_run_frame(int64_t now_ns)
+{
+	const bool open = g_dashboard_visible.load();
+	if (open != g_menu.was_open) {
+		g_menu.was_open = open;
+		if (open && g_menu.step == MenuStep::opening) {
+			// Opened again in front by the driver: what opened it before still counts.
+			g_menu.step = MenuStep::none;
+		} else if (open) {
+			g_menu.opened_ns = now_ns;
+			g_menu.by_button = now_ns - g_menu.pressed_ns < 1500 * U_TIME_1MS_IN_NS;
+			if (!g_menu.by_button && !g_world_from_driver.set.load() && g_menu.step == MenuStep::none) {
+				menu_press(now_ns, MenuStep::closing);
+				g_menu.hidden_for_world = true;
+				ovrd_log("Dashboard: opened before the world was placed on you, shown once it is\n");
+			}
+		} else if (g_menu.step == MenuStep::closing) {
+			g_menu.step = MenuStep::none;
+		} else if (g_menu.step == MenuStep::closing_to_open) {
+			g_menu.step = MenuStep::to_open;
+		}
+	}
+	if (g_menu.step != MenuStep::none && now_ns - g_menu.step_ns > 3LL * U_TIME_1S_IN_NS) {
+		ovrd_log("Dashboard: SteamVR did not follow the menu button, left as it is\n");
+		g_menu.step = MenuStep::none;
+	}
+
+	if (g_menu.step == MenuStep::none && g_dashboard_follow_world.exchange(false)) {
+		if (open) {
+			menu_press(now_ns, MenuStep::closing_to_open);
+			ovrd_log("Dashboard: open as the world was placed on you, opening it again in front of you\n");
+		} else if (g_menu.hidden_for_world) {
+			menu_press(now_ns, MenuStep::opening);
+			ovrd_log("Dashboard: the world placed on you, showing it in front of you\n");
+		}
+		g_menu.hidden_for_world = false;
+	}
+	// Released before it is pressed again.
+	if (g_menu.step == MenuStep::to_open && now_ns > g_dashboard_toggle_until_ns.load() + 200 * U_TIME_1MS_IN_NS) {
+		menu_press(now_ns, MenuStep::opening);
+	}
+
+	if (g_menu.close_for_games && g_menu.game && open && (g_menu.opened_ns < g_menu.game_since_ns || !g_menu.by_button) &&
+	    g_menu.step == MenuStep::none && g_menu.closed < 2 && now_ns - g_menu.game_since_ns > U_TIME_1S_IN_NS) {
+		menu_press(now_ns, MenuStep::closing);
+		g_menu.closed++;
+		ovrd_log("Dashboard: open over %s, %s, closed (riftlinux-setup game-menu keep leaves it open)\n",
+		         g_menu.game_key.c_str(),
+		         g_menu.opened_ns < g_menu.game_since_ns ? "opened before it showed" : "without a button press");
 	}
 }
 
@@ -3524,6 +3739,9 @@ CServerDriver_Monado::Init(vr::IVRDriverContext *pDriverContext)
 
 #ifdef XRT_OS_LINUX
 	riftlinux_load_floor();
+	riftlinux_load_menu();
+	riftlinux_load_standby();
+	headset_start_read();
 #endif
 
 #ifdef XRT_OS_LINUX
@@ -3541,7 +3759,14 @@ CServerDriver_Monado::Init(vr::IVRDriverContext *pDriverContext)
 	}
 
 	bool direct_mode = false;
-	float direct_mode_guard_ms = 0.0f;
+	/*
+	 * Without GPU fences on SteamVR's images (NVIDIA), a frame goes to Monado this long after SteamVR presented it at
+	 * the earliest (display.direct_mode_guard_ms); ALVR's Linux driver holds its reads 4 ms. Most frames waited
+	 * that long for Monado's frame anyway.
+	 */
+	float direct_mode_guard_ms = 3.0f;
+	bool direct_mode_fence = true;
+	bool direct_mode_present_split = true;
 	bool direct_mode_compositor_unorm = false;
 	bool direct_mode_app_unorm = false;
 	bool direct_mode_fast_path = true;
@@ -3567,8 +3792,11 @@ CServerDriver_Monado::Init(vr::IVRDriverContext *pDriverContext)
 		    cJSON_IsTrue(cJSON_GetObjectItemCaseSensitive(cJSON_GetObjectItemCaseSensitive(settings, "tab"), "performance")));
 		const cJSON *guard = cJSON_GetObjectItemCaseSensitive(display, "direct_mode_guard_ms");
 		if (cJSON_IsNumber(guard)) {
-			direct_mode_guard_ms = (float)guard->valuedouble;
+			direct_mode_guard_ms = (float)std::clamp(guard->valuedouble, 0.0, 20.0);
 		}
+		direct_mode_fence = !cJSON_IsFalse(cJSON_GetObjectItemCaseSensitive(display, "direct_mode_fence"));
+		direct_mode_present_split =
+		    !cJSON_IsFalse(cJSON_GetObjectItemCaseSensitive(display, "direct_mode_present_split"));
 		const cJSON *fc = cJSON_GetObjectItemCaseSensitive(display, "direct_mode_format_compositor");
 		const cJSON *fa = cJSON_GetObjectItemCaseSensitive(display, "direct_mode_format_app");
 		if (cJSON_IsString(fc)) {
@@ -3818,6 +4046,15 @@ CServerDriver_Monado::Init(vr::IVRDriverContext *pDriverContext)
 		}
 		cJSON_Delete(settings);
 	}
+	// settings.json "headset": the wear sensor and when the display switches off (rl::settings::headset_to_env).
+	{
+		cJSON *settings = riftlinux_settings_load();
+		const std::string headset = rl::settings::headset_to_env(settings);
+		if (!headset.empty()) {
+			ovrd_log("Headset settings: %s\n", headset.c_str());
+		}
+		cJSON_Delete(settings);
+	}
 	// The devices; with direct mode Monado's compositor follows, which takes the headset's display.
 	xret = xrt_instance_create_system(m_xinst, &m_xsys, &m_xsysd, &m_xso, NULL);
 	ovrd_log("Devices up in %.1f s\n", (double)(os_monotonic_get_ns() - init_start_ns) / 1e9);
@@ -3856,6 +4093,11 @@ CServerDriver_Monado::Init(vr::IVRDriverContext *pDriverContext)
 			g_direct_mode = new OvrdDirectMode(m_xcn, m_xhmd, driver_from_world, direct_mode_guard_ms,
 			                                   direct_mode_compositor_unorm, direct_mode_app_unorm);
 			g_direct_mode->m_max_layers = direct_mode_max_layers;
+			g_direct_mode->m_fence = direct_mode_fence;
+			g_direct_mode->m_present_split = direct_mode_present_split;
+			if (!direct_mode_present_split) {
+				ovrd_log("Direct mode: Present hands each frame over itself (display.direct_mode_present_split false)\n");
+			}
 			g_direct_mode->m_hdr_test = hdr_test;
 			g_direct_mode->m_players_hdr.store(hdr_players);
 			g_direct_mode->m_capture_count = g_direct_mode->m_capture_left = direct_mode_capture;
@@ -3893,7 +4135,10 @@ CServerDriver_Monado::Init(vr::IVRDriverContext *pDriverContext)
 			cJSON_AddBoolToObject(hdr, "bright", rs.hdr_bright);
 		};
 		handlers.recalibrate = []() { return request_recalibration("the driver's socket"); };
-		handlers.quit = []() { g_quit_requested.store(true); };
+		handlers.quit = []() {
+			ovrd_log("Asked to quit through the driver socket\n");
+			g_quit_requested.store(true);
+		};
 		ovrd_socket_start(handlers);
 	}
 #endif
@@ -4035,6 +4280,66 @@ CServerDriver_Monado::RunFrame()
 			u_notice_sensors placed_now = {};
 			const bool placed_known = u_notice_get_sensors(&placed_now);
 			const bool worn_now = m_xhmd != nullptr && head_worn(m_xhmd);
+			if (headset_start_check(worn_now, now_ns)) {
+				g_quit_requested.store(true);
+			}
+#ifdef XRT_OS_LINUX
+			/*
+			 * SteamVR's compositor stopped showing frames outside standby: its GPU device was lost (a GPU fault,
+			 * NVIDIA's Xid 32, seen at a standby's end, after a game quit and as it started); it keeps running
+			 * without presenting and SteamVR never starts it again, the headset frozen. SteamVR is closed as its
+			 * Exit does, and the watchdog starts it again (rl::watchdog::note_restart, once in ten minutes).
+			 */
+			static bool compositor_gone_told = false;
+			// Not as SteamVR quits (its compositor stops first, and SteamVR can wait long for Steam's web helper).
+			const bool quitting = g_steamvr_quitting.load() || vr::VRServerDriverHost()->IsExiting();
+			if (quitting) {
+				compositor_gone_told = true;
+			}
+			/*
+			 * SteamVR's shutdown that never ends: SteamVR 2.18 waits, five seconds at a time and for good, to kill a
+			 * process that has ended already ("Kill process N: ... because it didn't quit in time"): its monitor after
+			 * its compositor crashed on the way out (any direct mode driver), or Steam's web helper after it aborted at
+			 * a game's exit; seen with the headset put on and taken off during a session, with RiftLinux 0.1.0 as well.
+			 * Until its server ends no SteamVR starts again (its namespace stays taken). This driver still runs then:
+			 * 30 s after SteamVR began exiting it ends the process, the headset's display dark first. _exit: the exit's
+			 * own clean-up is where SteamVR deadlocked too. Only while SteamVR itself says it is exiting. After 10 s
+			 * when this driver closed SteamVR for a compositor that stopped (below): its clients wait on that
+			 * compositor and its shutdown sticks for sure, while the headset stays dark until SteamVR starts again.
+			 */
+			static int64_t quitting_since_ns = 0;
+			static bool closed_for_compositor = false;
+			const bool exiting = vr::VRServerDriverHost()->IsExiting();
+			const int stuck_after_s = closed_for_compositor ? 10 : 30;
+			if (exiting && quitting_since_ns == 0) {
+				quitting_since_ns = now_ns;
+			} else if (exiting && now_ns - quitting_since_ns > static_cast<int64_t>(stuck_after_s) * U_TIME_1S_IN_NS) {
+				ovrd_log("SteamVR began quitting %d s ago and is still here (its shutdown stuck, waiting for a process "
+				         "that has ended?): this driver ends SteamVR's server, the headset's display dark first\n",
+				         stuck_after_s);
+				u_notice_request_display_off();
+				// Its monitor too, once the server has gone: else Steam still counts SteamVR as running.
+				const pid_t monitor = rl::watchdog::end_monitor_after_server();
+				if (monitor != 0) {
+					ovrd_log("SteamVR's monitor (process %d) is ended as soon as its server has gone, so Steam "
+					         "sees SteamVR closed and can start it again\n",
+					         (int)monitor);
+				}
+				std::this_thread::sleep_for(std::chrono::milliseconds(500));
+				_exit(0);
+			}
+			if (g_direct_mode != nullptr && !compositor_gone_told && !g_quit_requested.load() &&
+			    g_direct_mode->compositor_stopped(now_ns, 8LL * U_TIME_1S_IN_NS)) {
+				compositor_gone_told = true;
+				closed_for_compositor = true;
+				const bool again = rl::watchdog::note_restart("its compositor stopped showing frames");
+				ovrd_log("SteamVR's compositor stopped showing frames 8 s ago, outside standby (its GPU device lost?): "
+				         "SteamVR is closed%s\n",
+				         again ? " and started again" : "; not started again (it was restarted this way within ten "
+				                                       "minutes)");
+				g_quit_requested.store(true);
+			}
+#endif
 
 			notices_first_calibration(placed_known && placed_now.found > 0 && placed_now.placed == 0, worn_now);
 			notices_controller_hint(m_left != nullptr && m_left->m_battery_percent.load() >= 0,
@@ -4094,7 +4399,7 @@ CServerDriver_Monado::RunFrame()
 		(void)request_recalibration("the Rift tab");
 	}
 	if (g_quit_requested.exchange(false)) {
-		ovrd_log("Asked to quit (driver socket): SteamVR quits the way its Exit does\n");
+		ovrd_log("Quitting: SteamVR quits the way its Exit does\n");
 		vr::VRServerDriverHost()->VendorSpecificEvent(vr::k_unTrackedDeviceIndex_Hmd, vr::VREvent_DriverRequestedQuit,
 		                                              {}, 0);
 	}
@@ -4142,6 +4447,9 @@ CServerDriver_Monado::RunFrame()
 	if (m_right) {
 		m_right->RunFrame();
 	}
+#ifdef XRT_OS_LINUX
+	menu_run_frame(os_monotonic_get_ns());
+#endif
 
 	// https://github.com/ValveSoftware/openvr/issues/719#issuecomment-358038640
 	struct vr::VREvent_t event;
@@ -4190,6 +4498,13 @@ CServerDriver_Monado::RunFrame()
 			                                                                      : "process disconnected:";
 			ovrd_log("SteamVR event: %s pid %u (%s)%s\n", what, event.data.process.pid, comm,
 			         vr::VRServerDriverHost()->IsExiting() ? ", SteamVR exiting" : "");
+			// SteamVR quitting: it is exiting, or its compositor or monitor is asked to quit (Home is asked to quit
+			// for a game too).
+			if (vr::VRServerDriverHost()->IsExiting() ||
+			    ((event.eventType == vr::VREvent_Quit || event.eventType == vr::VREvent_QuitAcknowledged) &&
+			     (strcmp(comm, "vrcompositor") == 0 || strcmp(comm, "vrmonitor") == 0))) {
+				g_steamvr_quitting.store(true);
+			}
 			break;
 		}
 		case vr::VREvent_DashboardActivated:
@@ -4197,7 +4512,14 @@ CServerDriver_Monado::RunFrame()
 		case vr::VREvent_Compositor_ChaperoneBoundsShown:
 		case vr::VREvent_Compositor_ChaperoneBoundsHidden: break;
 
-		default: ovrd_log("Unhandled Event: %d\n", event.eventType);
+		default: {
+			// Once a kind: SteamVR repeats some all session long (a fifth of its log was these).
+			static std::map<uint32_t, bool> logged;
+			if (!logged[event.eventType]) {
+				logged[event.eventType] = true;
+				ovrd_log("Unhandled Event: %d (each kind logged once)\n", event.eventType);
+			}
+		}
 		}
 	}
 }
@@ -4209,85 +4531,33 @@ CServerDriver_Monado::RunFrame()
  *
  */
 
+/*
+ * Steam loads this while SteamVR is not running and starts SteamVR when it asks: on Linux Steam is 32-bit and loads
+ * the 32-bit build of the same watchdog (riftlinux_watchdog32.cpp); this one serves a 64-bit Steam.
+ */
 class CWatchdogDriver_Monado : public vr::IVRWatchdogProvider
 {
 public:
-	CWatchdogDriver_Monado()
+	vr::EVRInitError
+	Init(vr::IVRDriverContext *pDriverContext) override
 	{
-		ovrd_log("Created watchdog object\n");
-		m_pWatchdogThread = nullptr;
+		VR_INIT_WATCHDOG_DRIVER_CONTEXT(pDriverContext);
+		m_watchdog.start();
+		return vr::VRInitError_None;
 	}
 
-	// clang-format off
-	virtual ~CWatchdogDriver_Monado() {};
-	virtual vr::EVRInitError Init(vr::IVRDriverContext *pDriverContext);
-	virtual void Cleanup();
-	// clang-format on
+	void
+	Cleanup() override
+	{
+		m_watchdog.stop();
+		VR_CLEANUP_WATCHDOG_DRIVER_CONTEXT();
+	}
 
 private:
-	std::thread *m_pWatchdogThread;
+	rl::watchdog::Watchdog m_watchdog;
 };
 
 CWatchdogDriver_Monado g_watchdogDriverMonado;
-bool g_bExiting = false;
-
-void
-WatchdogThreadFunction()
-{
-	while (!g_bExiting) {
-#if defined(_WINDOWS)
-		// on windows send the event when the Y key is pressed.
-		if ((0x01 & GetAsyncKeyState('Y')) != 0) {
-			// Y key was pressed.
-			vr::VRWatchdogHost()->WatchdogWakeUp(vr::TrackedDeviceClass_HMD);
-		}
-		std::this_thread::sleep_for(std::chrono::microseconds(500));
-#else
-		ovrd_log("Watchdog wakeup\n");
-		// for the other platforms, just send one every five seconds
-		std::this_thread::sleep_for(std::chrono::seconds(1));
-		vr::VRWatchdogHost()->WatchdogWakeUp(vr::ETrackedDeviceClass::TrackedDeviceClass_HMD);
-#endif
-	}
-
-	ovrd_log("Watchdog exit\n");
-}
-
-vr::EVRInitError
-CWatchdogDriver_Monado::Init(vr::IVRDriverContext *pDriverContext)
-{
-	VR_INIT_WATCHDOG_DRIVER_CONTEXT(pDriverContext);
-	ovrd_log_init(vr::VRDriverLog());
-
-	// Watchdog mode on Windows starts a thread that listens for the 'Y' key
-	// on the keyboard to be pressed. A real driver should wait for a system
-	// button event or something else from the the hardware that signals
-	// that the VR system should start up.
-	g_bExiting = false;
-
-	ovrd_log("starting watchdog thread\n");
-
-	m_pWatchdogThread = new std::thread(WatchdogThreadFunction);
-	if (!m_pWatchdogThread) {
-		ovrd_log("Unable to create watchdog thread\n");
-		return vr::VRInitError_Driver_Failed;
-	}
-
-	return vr::VRInitError_None;
-}
-
-void
-CWatchdogDriver_Monado::Cleanup()
-{
-	g_bExiting = true;
-	if (m_pWatchdogThread) {
-		m_pWatchdogThread->join();
-		delete m_pWatchdogThread;
-		m_pWatchdogThread = nullptr;
-	}
-
-	ovrd_log_cleanup();
-}
 
 
 /*

@@ -36,6 +36,7 @@
 #include "util/u_distortion_mesh.h"
 #include "util/u_logging.h"
 #include "util/u_misc.h"
+#include "util/u_notice.h"
 #include "util/u_time.h"
 #include "util/u_var.h"
 #include "util/u_visibility_mask.h"
@@ -48,6 +49,7 @@
 #include <stdio.h>
 #include <assert.h>
 #include <inttypes.h>
+#include <string.h>
 
 #include "rift_internal.h"
 #include "rift_usb.h"
@@ -75,6 +77,29 @@ DEBUG_GET_ONCE_NUM_OPTION(rift_display_brightness, "RIFT_DISPLAY_BRIGHTNESS", 25
 #define RIFT_CV1_PERSISTENCE_ROWS 264
 //! How long the CV1 has to lie unworn before its panel goes off, see rift_cv1_update_display_power; negative: never.
 DEBUG_GET_ONCE_NUM_OPTION(rift_display_off_unworn_ms, "RIFT_DISPLAY_OFF_UNWORN_MS", 5000)
+/*
+ * Not worn (headset.not_worn): "black" (the default) keeps the display on and has the compositor show pure black, and
+ * switches it off only after RIFT_DISPLAY_BLACK_THEN_OFF_MIN minutes black (negative: never); "off" switches it off. Switched off,
+ * the CV1 leaves HDMI (also by itself, some 20 s after its picture stops), and the desktop rebuilds its monitors at
+ * every unplug and plug: GNOME 48 on NVIDIA kept about 210 MiB of GPU memory each time. The Oculus runtime keeps the
+ * display on too, showing black. Without a compositor that shows black, "off" as before.
+ */
+DEBUG_GET_ONCE_OPTION(rift_display_not_worn, "RIFT_DISPLAY_NOT_WORN", "black")
+DEBUG_GET_ONCE_NUM_OPTION(rift_display_black_then_off_min, "RIFT_DISPLAY_BLACK_THEN_OFF_MIN", 10)
+//! How long the headset's driver waits for a compositor to show black before it switches the display off itself.
+#define RIFT_BLACK_WAIT_NS (2 * U_TIME_1S_IN_NS)
+/*
+ * The wear sensor, from settings.json "headset" (the SteamVR driver and RiftLinux's own runtime set these before the
+ * headset is opened). Off: the headset counts as worn whenever it runs, for a sensor that misreads (a face shield or
+ * thick pad, a covered or dirty window); the display then never switches off by itself and SteamVR never goes to
+ * standby, so the panel stays lit until SteamVR is quit. Its two levels (worn above, not worn below; in between the
+ * last state stays) and whether moving as on a head counts as worn are adjustable.
+ */
+DEBUG_GET_ONCE_BOOL_OPTION(rift_wear_sensor, "RIFT_WEAR_SENSOR", true)
+DEBUG_GET_ONCE_NUM_OPTION(rift_wear_worn_above, "RIFT_WEAR_WORN_ABOVE", 30)
+DEBUG_GET_ONCE_NUM_OPTION(rift_wear_unworn_below, "RIFT_WEAR_UNWORN_BELOW", 15)
+DEBUG_GET_ONCE_BOOL_OPTION(rift_wear_by_motion, "RIFT_WEAR_BY_MOTION", true)
+DEBUG_GET_ONCE_NUM_OPTION(rift_wear_by_motion_after_s, "RIFT_WEAR_BY_MOTION_AFTER_S", 20)
 //! The panel stays on this long after start, worn or not, so the compositor finds the display.
 #define RIFT_DISPLAY_ON_AT_START_NS (30LL * U_TIME_1S_IN_NS)
 //! Apply the HMD accelerometer's factory matrix as well as its offset, see where it's applied for why it's off.
@@ -133,12 +158,16 @@ static void
 rift_cv1_update_display_power(struct rift_hmd *hmd, timepoint_ns now)
 {
 	const int64_t off_ms = debug_get_num_option_rift_display_off_unworn_ms();
-	if (off_ms < 0) {
+	// The process ends without the driver's own shutdown (u_notice_request_display_off): dark now.
+	const bool forced_off = u_notice_display_off_requested();
+	if (off_ms < 0 && !forced_off) {
 		return;
 	}
 
 	bool want_on = true;
-	if (hmd->presence) {
+	if (forced_off) {
+		want_on = false;
+	} else if (hmd->presence) {
 		hmd->unworn_since_ns = 0;
 	} else {
 		if (hmd->unworn_since_ns == 0) {
@@ -150,6 +179,44 @@ rift_cv1_update_display_power(struct rift_hmd *hmd, timepoint_ns now)
 		 * Once a compositor has it, the panel going off doesn't take it away.
 		 */
 		want_on = now - hmd->unworn_since_ns < off_ms * U_TIME_1MS_IN_NS || now < hmd->display_on_until_ns;
+	}
+
+	if (!forced_off && strcmp(debug_get_option_rift_display_not_worn(), "black") == 0) {
+		const int64_t then_off_min = debug_get_num_option_rift_display_black_then_off_min();
+		const bool black_done = !want_on && then_off_min >= 0 &&
+		                        now - hmd->unworn_since_ns >=
+		                            off_ms * U_TIME_1MS_IN_NS + then_off_min * 60 * U_TIME_1S_IN_NS;
+		const bool want_black = !want_on && !black_done;
+		// Black for as long as it is not worn, through the switch-off too: the picture never comes back first.
+		u_notice_request_display_black(!want_on);
+		if (want_black && hmd->display_on) {
+			if (hmd->black_asked_ns == 0) {
+				hmd->black_asked_ns = now;
+			}
+			if (u_notice_display_black()) {
+				if (!hmd->black_logged) {
+					hmd->black_logged = true;
+					HMD_INFO(hmd, "Display black: headset not worn, it stays connected.");
+				}
+				return;
+			}
+			if (now - hmd->black_asked_ns < RIFT_BLACK_WAIT_NS) {
+				return;
+			}
+			if (!hmd->black_logged) {
+				hmd->black_logged = true;
+				HMD_INFO(hmd, "No compositor showed the headset black: its display is switched off instead.");
+			}
+		} else if (!want_black) {
+			if (want_on && hmd->black_asked_ns != 0 && hmd->display_on) {
+				HMD_INFO(hmd, "Display picture again: headset worn.");
+			}
+			if (black_done && hmd->display_on && hmd->black_asked_ns != 0) {
+				HMD_INFO(hmd, "Display black for %d min: switched off.", (int)then_off_min);
+			}
+			hmd->black_asked_ns = 0;
+			hmd->black_logged = false;
+		}
 	}
 
 	if (want_on == hmd->display_on || now - hmd->display_power_failed_ns < U_TIME_1S_IN_NS) {
@@ -183,16 +250,26 @@ rift_cv1_update_display_power(struct rift_hmd *hmd, timepoint_ns now)
 #define RIFT_HEAD_MOTION_BLOCK_NS (50 * U_TIME_1MS_IN_NS)
 #define RIFT_HEAD_MOTION_WINDOW_NS (U_TIME_1S_IN_NS)
 /*
- * Worn while at least RIFT_HEAD_MOTION_NEED of the last RIFT_HEAD_MOTION_WINDOWS seconds moved more than
- * RIFT_HEAD_MOTION_RANGE_RAD_S. A head held as still as it can be never read below 1.24 degrees a second; lying on a
- * bed the headset read 0.29 (median) with bumps up to 9, and worn by any one second over 0.5, held for 10 s, it was
- * worn two thirds of the time with nobody near it, so its display never went dark. Counted this way: the bed 12 % of a
- * minute (only while it was shaken), the still head all of the time, and a worn session alike but for the seconds the
- * headset was off the head.
+ * A second moved when it moved more than RIFT_HEAD_MOTION_RANGE_RAD_S. A head held as still as it can be never read
+ * below 1.24 degrees a second; lying on a bed the headset read 0.29 (median) with bumps up to 9, and worn by any one
+ * second over 0.5, held for 10 s, it was worn two thirds of the time with nobody near it, so its display never went
+ * dark.
+ *
+ * Worn once all but RIFT_HEAD_MOTION_START_SLACK of the last seconds (the headset's by_motion_after_s and those) moved
+ * and the headset had turned more than RIFT_HEAD_MOTION_TURN_DEG within the last RIFT_HEAD_MOTION_WINDOWS seconds; then
+ * while at least RIFT_HEAD_MOTION_NEED of the last RIFT_HEAD_MOTION_WINDOWS moved (a head held still keeps it). Held in
+ * the hands a headset moves as a head does (35-420 degrees a second, every second, upright), so the start takes longer
+ * than a pick-up lasts: worn after 5 of 10 seconds, a headset picked up and looked into was worn 6 s later and again
+ * after 4 s. On a bed someone moved on, the headset moved as much (1-75 degrees a second, upright) but turned at most
+ * 4.8 degrees within 10 s, where a worn head turned more than 8 degrees in 94-97 % of its seconds and held hands more
+ * than 60: with the turn counted, neither bed recording was ever worn, the hands only after their 20 s, and two worn
+ * sessions after 25 and 26 s and then throughout.
  */
 #define RIFT_HEAD_MOTION_RANGE_RAD_S (1.0f * (float)M_PI / 180.0f)
 #define RIFT_HEAD_MOTION_WINDOWS 10
 #define RIFT_HEAD_MOTION_NEED 5
+#define RIFT_HEAD_MOTION_START_SLACK 2
+#define RIFT_HEAD_MOTION_TURN_DEG 8.0f
 //! Worn by motion until the next window has been counted.
 #define RIFT_HEAD_MOTION_KEEP_NS ((int64_t)1500 * U_TIME_1MS_IN_NS)
 /*
@@ -213,6 +290,9 @@ vec3_max(struct xrt_vec3 a, struct xrt_vec3 b)
 	return (struct xrt_vec3){MAX(a.x, b.x), MAX(a.y, b.y), MAX(a.z, b.z)};
 }
 
+static float
+quat_angle_deg(const struct xrt_quat *a, const struct xrt_quat *b);
+
 static void
 rift_head_motion_update(struct rift_hmd *hmd,
                         int64_t timestamp_ns,
@@ -228,6 +308,16 @@ rift_head_motion_update(struct rift_hmd *hmd,
 		hmd->head_motion.accel_sum = (struct xrt_vec3)XRT_VEC3_ZERO;
 		hmd->head_motion.accel_count = 0;
 	}
+	// The gyro's own orientation, for how far the headset turned (a gap of more than 100 ms is not integrated).
+	if (hmd->head_motion.rot_ns == 0) {
+		hmd->head_motion.rot = (struct xrt_quat)XRT_QUAT_IDENTITY;
+	} else if (timestamp_ns > hmd->head_motion.rot_ns &&
+	           timestamp_ns - hmd->head_motion.rot_ns < 100 * U_TIME_1MS_IN_NS) {
+		math_quat_integrate_velocity(&hmd->head_motion.rot, gyro,
+		                             (float)time_ns_to_s(timestamp_ns - hmd->head_motion.rot_ns),
+		                             &hmd->head_motion.rot);
+	}
+	hmd->head_motion.rot_ns = timestamp_ns;
 	hmd->head_motion.block_sum = m_vec3_add(hmd->head_motion.block_sum, *gyro);
 	hmd->head_motion.block_count++;
 	hmd->head_motion.accel_sum = m_vec3_add(hmd->head_motion.accel_sum, *accel);
@@ -250,20 +340,36 @@ rift_head_motion_update(struct rift_hmd *hmd,
 	if (timestamp_ns - hmd->head_motion.window_start_ns < RIFT_HEAD_MOTION_WINDOW_NS) {
 		return;
 	}
+	// How far the headset turned within the last windows, then this window's end into the ring.
+	float turned_deg = 0.0f;
+	for (uint32_t k = 0; k < hmd->head_motion.turn_count; k++) {
+		turned_deg = MAX(turned_deg, quat_angle_deg(&hmd->head_motion.rot, &hmd->head_motion.turn_ring[k]));
+	}
+	hmd->head_motion.turn_ring[hmd->head_motion.turn_next] = hmd->head_motion.rot;
+	const uint32_t ring = (uint32_t)ARRAY_SIZE(hmd->head_motion.turn_ring);
+	hmd->head_motion.turn_next = (hmd->head_motion.turn_next + 1) % ring;
+	hmd->head_motion.turn_count = MIN(hmd->head_motion.turn_count + 1, ring);
 	const struct xrt_vec3 down = m_vec3_mul_scalar(hmd->head_motion.accel_sum,
 	                                               1.0f / (float)MAX(hmd->head_motion.accel_count, 1u));
 	const bool upright = down.y > RIFT_HEAD_MOTION_UPRIGHT_COS * m_vec3_len(down);
 	if (!upright) {
 		// Not as on a head: worn by the sensor alone from now on.
 		hmd->head_motion.history = 0;
+		hmd->head_motion.turning = 0;
 		hmd->head_motion.moving_until_ns = 0;
 	} else if (hmd->head_motion.blocks >= 10) {
 		const struct xrt_vec3 range = m_vec3_sub(hmd->head_motion.block_max, hmd->head_motion.block_min);
 		const bool moved = range.x > RIFT_HEAD_MOTION_RANGE_RAD_S || range.y > RIFT_HEAD_MOTION_RANGE_RAD_S ||
 		                   range.z > RIFT_HEAD_MOTION_RANGE_RAD_S;
-		hmd->head_motion.history = (uint16_t)(((hmd->head_motion.history << 1) | (moved ? 1u : 0u)) &
-		                                      ((1u << RIFT_HEAD_MOTION_WINDOWS) - 1u));
-		if (__builtin_popcount(hmd->head_motion.history) >= RIFT_HEAD_MOTION_NEED) {
+		hmd->head_motion.history = (hmd->head_motion.history << 1) | (moved ? 1u : 0u);
+		hmd->head_motion.turning =
+		    (hmd->head_motion.turning << 1) | (moved && turned_deg > RIFT_HEAD_MOTION_TURN_DEG ? 1u : 0u);
+		const bool worn = timestamp_ns < hmd->head_motion.moving_until_ns;
+		const int start = hmd->wear.by_motion_after_s;
+		const uint64_t start_mask = (1ull << (start + RIFT_HEAD_MOTION_START_SLACK)) - 1ull;
+		const uint64_t keep_mask = (1ull << RIFT_HEAD_MOTION_WINDOWS) - 1ull;
+		if (worn ? __builtin_popcountll(hmd->head_motion.history & keep_mask) >= RIFT_HEAD_MOTION_NEED
+		         : __builtin_popcountll(hmd->head_motion.turning & start_mask) >= start) {
 			hmd->head_motion.moving_until_ns = timestamp_ns + RIFT_HEAD_MOTION_KEEP_NS;
 		}
 	}
@@ -360,9 +466,11 @@ rift_sensor_thread_tick(struct rift_hmd *hmd)
 			 * above 30, unworn below 15, unchanged in between.
 			 */
 			const uint16_t wear = report.cv1.presence_sensor;
-			if (wear > 30) {
+			if (!hmd->wear.use_sensor) {
 				hmd->presence_sensor = true;
-			} else if (wear < 15) {
+			} else if (wear > hmd->wear.worn_above) {
+				hmd->presence_sensor = true;
+			} else if (wear < hmd->wear.unworn_below) {
 				hmd->presence_sensor = false;
 			}
 			/*
@@ -370,7 +478,7 @@ rift_sensor_thread_tick(struct rift_hmd *hmd)
 			 * face kept the display dark on a head and SteamVR in standby (no Home). A headset put down lies
 			 * still, so it still goes dark.
 			 */
-			const bool moving = recv_time_ns < hmd->head_motion.moving_until_ns;
+			const bool moving = hmd->wear.by_motion && recv_time_ns < hmd->head_motion.moving_until_ns;
 			if (moving && !hmd->presence_sensor && !hmd->head_motion.logged) {
 				hmd->head_motion.logged = true;
 				HMD_WARN(hmd,
@@ -379,6 +487,9 @@ rift_sensor_thread_tick(struct rift_hmd *hmd)
 				         wear);
 			}
 			hmd->presence = hmd->presence_sensor || moving;
+			if (hmd->presence) {
+				__atomic_store_n(&hmd->worn_last_ns, recv_time_ns, __ATOMIC_RELAXED);
+			}
 			rift_cv1_update_display_power(hmd, recv_time_ns);
 
 			/*
@@ -1714,6 +1825,19 @@ rift_devices_create(struct os_hid_device *hmd_dev,
 	struct rift_hmd *hmd = U_DEVICE_ALLOCATE(struct rift_hmd, flags, has_presence ? 2 : 1, 0);
 	// The tracker hears the wear state from the first report on.
 	hmd->presence_told = -1;
+	// In use from the start: the controllers stay awake until it has lain unworn for a while.
+	hmd->worn_last_ns = os_monotonic_get_ns();
+	// How the wear sensor is read; levels that cross each other fall back to the defaults.
+	hmd->wear.use_sensor = debug_get_bool_option_rift_wear_sensor();
+	hmd->wear.worn_above = (int)debug_get_num_option_rift_wear_worn_above();
+	hmd->wear.unworn_below = (int)debug_get_num_option_rift_wear_unworn_below();
+	hmd->wear.by_motion = debug_get_bool_option_rift_wear_by_motion();
+	// At least one second; the history holds 64 (less the slack).
+	hmd->wear.by_motion_after_s = (int)CLAMP(debug_get_num_option_rift_wear_by_motion_after_s(), 1, 60);
+	if (hmd->wear.unworn_below > hmd->wear.worn_above || hmd->wear.unworn_below < 0) {
+		hmd->wear.worn_above = 30;
+		hmd->wear.unworn_below = 15;
+	}
 
 	hmd->xfctx = xfctx;
 
@@ -1974,6 +2098,25 @@ rift_devices_create(struct os_hid_device *hmd_dev,
 	hmd->base.compute_distortion = rift_hmd_compute_distortion;
 
 	hmd->log_level = debug_get_log_option_rift_log();
+
+	if (variant == RIFT_VARIANT_CV1) {
+		if (!hmd->wear.use_sensor) {
+			HMD_WARN(hmd, "Wear sensor off (settings): the headset counts as worn whenever it runs; the display "
+			              "stays on until SteamVR or the runtime is quit.");
+		} else if (hmd->wear.worn_above != 30 || hmd->wear.unworn_below != 15 || !hmd->wear.by_motion ||
+		           hmd->wear.by_motion_after_s != 20) {
+			HMD_WARN(hmd,
+			         "Wear sensor (settings): worn above %d, not worn below %d, moving as on a head %s %d s.",
+			         hmd->wear.worn_above, hmd->wear.unworn_below,
+			         hmd->wear.by_motion ? "counts as worn after" : "does not count; would count after",
+			         hmd->wear.by_motion_after_s);
+		}
+		const int64_t off_ms = debug_get_num_option_rift_display_off_unworn_ms();
+		if (off_ms != 5000) {
+			HMD_WARN(hmd, "Display off when not worn: %s.",
+			         off_ms < 0 ? "never (settings)" : "after a different time (settings)");
+		}
+	}
 
 	// Print name.
 	u_truncate_snprintf(hmd->base.str, XRT_DEVICE_NAME_LEN, "%s", variant_name(hmd->variant));

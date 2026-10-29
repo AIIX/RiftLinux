@@ -8,6 +8,7 @@
 
 #include "util/u_notice.h"
 
+#include <atomic>
 #include <mutex>
 
 static std::mutex g_notice_lock;
@@ -91,3 +92,45 @@ u_notice_get_recalibration(struct u_notice_recalibration *out_result)
 	*out_result = g_recalibration;
 	return g_recalibration_set;
 }
+
+static std::atomic<bool> g_display_off_requested{false};
+
+extern "C" void
+u_notice_request_display_off(void)
+{
+	g_display_off_requested.store(true);
+}
+
+extern "C" bool
+u_notice_display_off_requested(void)
+{
+	return g_display_off_requested.load();
+}
+
+static std::atomic<bool> g_display_black_requested{false};
+static std::atomic<bool> g_display_black{false};
+
+extern "C" void
+u_notice_request_display_black(bool black)
+{
+	g_display_black_requested.store(black);
+}
+
+extern "C" bool
+u_notice_display_black_requested(void)
+{
+	return g_display_black_requested.load();
+}
+
+extern "C" void
+u_notice_set_display_black(bool black)
+{
+	g_display_black.store(black);
+}
+
+extern "C" bool
+u_notice_display_black(void)
+{
+	return g_display_black.load();
+}
+

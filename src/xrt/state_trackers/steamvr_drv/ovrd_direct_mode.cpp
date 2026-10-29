@@ -15,6 +15,8 @@
 
 #include <unistd.h>
 #include <dlfcn.h>
+#include <linux/types.h>
+#include <sys/ioctl.h>
 #include <string>
 
 #include <algorithm>
@@ -445,6 +447,54 @@ make_hdr_test_chart(struct xrt_compositor_native *xcn, uint32_t &out_w, uint32_t
 }
 #endif
 
+/*
+ * GPU fences of a dma-buf (linux/dma-buf.h, linux/sync_file.h; spelled out for older kernel headers): the fences a
+ * reader must wait for (the writers'), as a sync file; two sync files merged into one.
+ */
+struct rl_dma_buf_export_sync_file
+{
+	__u32 flags;
+	__s32 fd;
+};
+#define RL_DMA_BUF_SYNC_READ (1 << 0)
+#define RL_DMA_BUF_IOCTL_EXPORT_SYNC_FILE _IOWR('b', 2, struct rl_dma_buf_export_sync_file)
+struct rl_sync_merge_data
+{
+	char name[32];
+	__s32 fd2;
+	__s32 fence;
+	__u32 flags;
+	__u32 pad;
+};
+#define RL_SYNC_IOC_MERGE _IOWR('>', 3, struct rl_sync_merge_data)
+
+//! The writers' fences of @p dmabuf_fd as a sync file, -1 if it gives none (not a dma-buf); errno says why.
+int
+export_read_fence(int dmabuf_fd)
+{
+	struct rl_dma_buf_export_sync_file info = {RL_DMA_BUF_SYNC_READ, -1};
+	if (ioctl(dmabuf_fd, RL_DMA_BUF_IOCTL_EXPORT_SYNC_FILE, &info) != 0) {
+		return -1;
+	}
+	return info.fd;
+}
+
+//! @p a and @p b (either may be -1) as one sync file; both are closed. -1 if merging failed.
+int
+merge_fences(int a, int b)
+{
+	if (a < 0 || b < 0) {
+		return a >= 0 ? a : b;
+	}
+	struct rl_sync_merge_data merge = {};
+	snprintf(merge.name, sizeof(merge.name), "riftlinux");
+	merge.fd2 = b;
+	const int ok = ioctl(a, RL_SYNC_IOC_MERGE, &merge);
+	close(a);
+	close(b);
+	return ok == 0 ? merge.fence : -1;
+}
+
 } // namespace
 
 OvrdDirectMode::OvrdDirectMode(struct xrt_compositor_native *xcn,
@@ -469,6 +519,10 @@ OvrdDirectMode::~OvrdDirectMode()
 	if (m_vsync_thread.joinable()) {
 		m_vsync_thread.join();
 	}
+	if (m_pending.valid && m_pending.fence >= 0) {
+		close(m_pending.fence);
+	}
+	m_pending.valid = false;
 	std::lock_guard<std::mutex> lock(m_lock);
 	ovrd_log("Direct mode: driver cleanup, %zu set(s) still held\n", m_sets.size());
 	while (!m_sets.empty()) {
@@ -558,6 +612,9 @@ OvrdDirectMode::CreateSwapTextureSet(uint32_t unPid,
 	}
 	set->is_compositor = strcmp(comm, "vrcompositor") == 0;
 	set->number = m_set_count++;
+	if (set->is_compositor) {
+		m_compositor_set_ns.store(os_monotonic_get_ns());
+	}
 	/*
 	 * SteamVR hands an application's float images over as they are (format 97 for a game submitting
 	 * R16G16B16A16_SFLOAT in linear colour, in a desk test): linear light, white at 1.0, highlights above; the
@@ -620,12 +677,14 @@ void
 OvrdDirectMode::acquire_locked(Set *set)
 {
 	uint32_t index = 0;
+	const int64_t from_ns = os_monotonic_get_ns();
 	if (xrt_swapchain_acquire_image(set->xsc, &index) != XRT_SUCCESS ||
 	    xrt_swapchain_wait_image(set->xsc, U_TIME_1S_IN_NS, index) != XRT_SUCCESS) {
 		ovrd_log("Direct mode: no image to acquire\n");
 		set->acquired = -1;
 		return;
 	}
+	m_acquire_max_ns = std::max(m_acquire_max_ns, os_monotonic_get_ns() - from_ns);
 	set->acquired = (int32_t)index;
 }
 
@@ -730,6 +789,8 @@ void
 OvrdDirectMode::Present(vr::SharedTextureHandle_t syncTexture)
 {
 	pacing_trace().add('P');
+	const int64_t entered_ns = os_monotonic_get_ns();
+	m_present_seen_ns.store(entered_ns);
 	{
 		// How long SteamVR's compositor waited between starting this frame and presenting it: about nothing when
 		// the game's frame was there already (it renders a frame ahead), the game's own time when it waits for the
@@ -751,7 +812,7 @@ OvrdDirectMode::Present(vr::SharedTextureHandle_t syncTexture)
 		std::this_thread::sleep_for(std::chrono::milliseconds(test_delay_ms));
 	}
 	std::vector<std::array<SubmitLayerPerEye_t, 2>> layers;
-	int64_t shown = 0;
+	int fence = -1;
 	const int64_t present_ns = os_monotonic_get_ns();
 	if (m_last_present_ns != 0) {
 		const int64_t gap_ns = present_ns - m_last_present_ns;
@@ -764,6 +825,59 @@ OvrdDirectMode::Present(vr::SharedTextureHandle_t syncTexture)
 		// releases before it ends a frame; GetNextSwapTextureSetIndex acquires the next.
 		std::lock_guard<std::mutex> lock(m_lock);
 		layers.swap(m_layers);
+		// In standby SteamVR goes on presenting about ten times a second without layers; the first frame with layers
+		// ends it.
+		if (!layers.empty()) {
+			m_standby.store(false);
+		}
+		// The fences of every image this frame shows, both eyes, every layer (an image once): one sync file.
+		if (m_fence && m_fences_work != 0) {
+			std::vector<int> fds;
+			for (const auto &layer : layers) {
+				for (const SubmitLayerPerEye_t &eye : layer) {
+					auto it = m_handles.find(eye.hTexture);
+					if (it == m_handles.end()) {
+						continue;
+					}
+					const int fd = it->second.first->fds[it->second.second];
+					if (fd >= 0 && std::find(fds.begin(), fds.end(), fd) == fds.end()) {
+						fds.push_back(fd);
+					}
+				}
+			}
+			bool all = !fds.empty();
+			int err = 0;
+			for (int fd : fds) {
+				const int f = export_read_fence(fd);
+				if (f < 0) {
+					all = false;
+					err = errno;
+					break;
+				}
+				fence = merge_fences(fence, f);
+				if (fence < 0) {
+					all = false;
+					break;
+				}
+			}
+			if (!all && fence >= 0) {
+				close(fence);
+				fence = -1;
+			}
+			if (m_fences_work < 0 && !fds.empty()) {
+				m_fences_work = all ? 1 : 0;
+				if (all) {
+					ovrd_log("Direct mode: SteamVR's images carry GPU fences (dma-bufs): Monado waits for them "
+					         "before it reads a frame\n");
+				} else {
+					ovrd_log("Direct mode: SteamVR's images carry no GPU fences here (%s)\n",
+					         err != 0 ? strerror(err) : "merging failed");
+				}
+				ovrd_log("Direct mode: a frame goes to Monado %.1f ms after SteamVR presented it at the earliest "
+				         "(display.direct_mode_guard_ms)\n",
+				         m_guard_ms);
+			}
+		}
 		if (!layers.empty()) {
 			const vr::SharedTextureHandle_t first = layers[0][0].hTexture;
 			m_repeat_run = first == m_last_first_texture ? m_repeat_run + 1 : 0;
@@ -829,10 +943,47 @@ OvrdDirectMode::Present(vr::SharedTextureHandle_t syncTexture)
 	}
 #endif
 
-	if (m_guard_ms > 0) {
-		std::this_thread::sleep_for(std::chrono::microseconds((int64_t)(m_guard_ms * 1000.0f)));
+	/*
+	 * SteamVR expects Present to return at once (its frame timing: "time blocked on call to present, usually 0.0") and
+	 * leaves the time until vsync to PostPresent ("to allow the driver to take more time until vsync"), as ALVR's
+	 * Linux driver does it. So Present only takes the frame (its layers, their fences, the images back to Monado) and
+	 * PostPresent waits for Monado's frame and hands it over: the same wait as before, in the call made for it.
+	 * display.direct_mode_present_split false: all of it in Present, as before.
+	 */
+	if (!m_present_split) {
+		submit_frame(std::move(layers), fence, entered_ns, syncTexture != 0);
+	} else {
+		if (m_pending.valid) {
+			// No PostPresent came for the frame before (SteamVR quitting?): it goes first.
+			m_no_post_present++;
+			PendingFrame before = std::move(m_pending);
+			m_pending.valid = false;
+			submit_frame(std::move(before.layers), before.fence, before.entered_ns, before.sync_given);
+		}
+		m_pending.layers = std::move(layers);
+		m_pending.fence = fence;
+		m_pending.entered_ns = entered_ns;
+		m_pending.sync_given = syncTexture != 0;
+		m_pending.valid = true;
 	}
+	{
+		std::lock_guard<std::mutex> lock(m_lock);
+		m_present_max_ns = std::max(m_present_max_ns, (int64_t)os_monotonic_get_ns() - entered_ns);
+	}
+}
 
+/*!
+ * Hands a frame SteamVR presented to Monado: waits for Monado's frame (which paces SteamVR's compositor to the
+ * headset's refresh), the layers, the guard, the commit.
+ */
+void
+OvrdDirectMode::submit_frame(std::vector<std::array<SubmitLayerPerEye_t, 2>> layers,
+                             int fence,
+                             int64_t entered_ns,
+                             bool sync_given)
+{
+	const int64_t submit_from_ns = os_monotonic_get_ns();
+	int64_t shown = 0;
 	// Monado's frame pacing: this waits until it is time to hand over the next frame, which paces SteamVR's
 	// compositor to the headset's refresh.
 	int64_t frame_id = 0;
@@ -856,6 +1007,7 @@ OvrdDirectMode::Present(vr::SharedTextureHandle_t syncTexture)
 	const int64_t wait_from_ns = os_monotonic_get_ns();
 	const xrt_result_t waited = xrt_comp_wait_frame(xc, &frame_id, &display_time_ns, &display_period_ns);
 	const int64_t woken_ns = os_monotonic_get_ns();
+	m_wait_max_ns = std::max(m_wait_max_ns, woken_ns - wait_from_ns);
 	pacing_trace().add('w', frame_id, display_time_ns);
 	// When Monado wakes a present before the refresh it shows it at (a wait that really waited), for the hold.
 	if (waited == XRT_SUCCESS) {
@@ -872,6 +1024,9 @@ OvrdDirectMode::Present(vr::SharedTextureHandle_t syncTexture)
 	}
 	if (waited != XRT_SUCCESS || xrt_comp_begin_frame(xc, frame_id) != XRT_SUCCESS) {
 		ovrd_log("Direct mode: Monado's compositor refused a frame\n");
+		if (fence >= 0) {
+			close(fence);
+		}
 		return;
 	}
 	struct xrt_layer_frame_data frame = {};
@@ -1004,7 +1159,26 @@ OvrdDirectMode::Present(vr::SharedTextureHandle_t syncTexture)
 	}
 #endif
 
-	xrt_comp_layer_commit(xc, XRT_GRAPHICS_SYNC_HANDLE_INVALID);
+	/*
+	 * SteamVR gives no sign when its GPU has finished drawing the images (no sync texture on Linux): with their
+	 * fences (dma-bufs: AMD, Intel) Monado waits for them on its own thread. Without (NVIDIA), Monado read some
+	 * half drawn (bright glitches); and SteamVR's compositor's own drawing carries only placeholder fences, signalled
+	 * already (ALVR's finding), so on every GPU the frame is not handed over before the guard has passed since SteamVR
+	 * presented it (the wait for Monado's frame usually covered it already), as ALVR's Linux driver does.
+	 */
+	if (fence >= 0) {
+		m_fenced++;
+	}
+	if (m_guard_ms > 0.0f) {
+		const int64_t until = entered_ns + (int64_t)(m_guard_ms * 1e6f);
+		const int64_t left = until - os_monotonic_get_ns();
+		if (left > 0) {
+			std::this_thread::sleep_for(std::chrono::nanoseconds(left));
+			m_guard_held++;
+		}
+	}
+	m_commit_after_max_ns = std::max(m_commit_after_max_ns, os_monotonic_get_ns() - entered_ns);
+	xrt_comp_layer_commit(xc, fence >= 0 ? (xrt_graphics_sync_handle_t)fence : XRT_GRAPHICS_SYNC_HANDLE_INVALID);
 	pacing_trace().add('p', (int64_t)layers.size(), display_time_ns);
 
 	// Vsync events follow Monado's display: this frame's refresh is on their grid (11 ms of vsync to photons).
@@ -1023,7 +1197,7 @@ OvrdDirectMode::Present(vr::SharedTextureHandle_t syncTexture)
 		         (long long)m_frames, (long long)m_from_compositor, (long long)m_from_app,
 		         (long long)m_upper_from_compositor, (long long)m_upper_from_app, m_max_layers,
 		         (long long)m_layers_total, (long long)m_layers_shown, (long long)m_next_calls,
-		         syncTexture != 0 ? "given" : "none", m_pose_n > 0 ? m_pose_deg_sum / m_pose_n : 0.0f,
+		         sync_given ? "given" : "none", m_pose_n > 0 ? m_pose_deg_sum / m_pose_n : 0.0f,
 		         m_pose_deg_max, m_pose_cm_max, m_guard_ms);
 		std::string sets;
 		for (const auto &kv : m_first_layer_set) {
@@ -1066,6 +1240,19 @@ OvrdDirectMode::Present(vr::SharedTextureHandle_t syncTexture)
 			m_reprojection_flags = 0;
 			m_throttle_max = m_predict_max = 0;
 		}
+		{
+			std::lock_guard<std::mutex> lock(m_lock);
+			ovrd_log("Direct mode: longest present %.1f ms, hand-over %.1f ms (%s), wait for Monado's frame %.1f ms, "
+			         "wait for an image %.1f ms, present to hand-over %.1f ms; frames handed over with GPU fences %lld, "
+			         "held by the guard %lld; frames without PostPresent %lld\n",
+			         (double)m_present_max_ns / 1e6, (double)m_submit_max_ns / 1e6,
+			         m_present_split ? "in PostPresent" : "in Present", (double)m_wait_max_ns / 1e6,
+			         (double)m_acquire_max_ns / 1e6, (double)m_commit_after_max_ns / 1e6, (long long)m_fenced,
+			         (long long)m_guard_held, (long long)m_no_post_present);
+			m_no_post_present = 0;
+			m_present_max_ns = m_submit_max_ns = m_wait_max_ns = m_acquire_max_ns = m_commit_after_max_ns = 0;
+			m_fenced = m_guard_held = 0;
+		}
 		m_late = 0;
 		m_gap_max_ns = 0;
 		m_repeat_max = 0;
@@ -1074,12 +1261,21 @@ OvrdDirectMode::Present(vr::SharedTextureHandle_t syncTexture)
 		m_pose_n = 0;
 		m_last_log_ns = now_ns;
 	}
+	{
+		std::lock_guard<std::mutex> lock(m_lock);
+		m_submit_max_ns = std::max(m_submit_max_ns, (int64_t)os_monotonic_get_ns() - submit_from_ns);
+	}
 }
 
 
 void
 OvrdDirectMode::PostPresent(const Throttling_t *pThrottling)
 {
+	if (m_pending.valid) {
+		PendingFrame frame = std::move(m_pending);
+		m_pending.valid = false;
+		submit_frame(std::move(frame.layers), frame.fence, frame.entered_ns, frame.sync_given);
+	}
 	// Motion smoothing: how SteamVR throttles the application in direct mode.
 	uint32_t throttle = 0;
 	if (pThrottling != nullptr) {
@@ -1215,4 +1411,19 @@ OvrdDirectMode::GetFrameTiming(vr::DriverDirectMode_FrameTiming *pFrameTiming)
 	// Cleared again: these bits share the field with VRCompositor_ThrottleMask, what is left in it SteamVR reads as
 	// frames to throttle the application by (openvr_driver.h); 0x100 would hold it back one frame.
 	pFrameTiming->m_nReprojectionFlags = 0;
+	// One present a frame and none dropped, as ALVR's Linux driver reports: a dropped frame reported, SteamVR
+	// reads the GPU as overloaded and halves the rate (interleaved reprojection) from then on. Monado shows every
+	// refresh itself.
+	if (pFrameTiming->m_nSize >= sizeof(vr::DriverDirectMode_FrameTiming)) {
+		static bool told = false;
+		if (!told) {
+			told = true;
+			ovrd_log("Direct mode: SteamVR's frame timing as it asks: %u presents, %u presented late, %u dropped\n",
+			         pFrameTiming->m_nNumFramePresents, pFrameTiming->m_nNumMisPresented,
+			         pFrameTiming->m_nNumDroppedFrames);
+		}
+		pFrameTiming->m_nNumFramePresents = 1;
+		pFrameTiming->m_nNumMisPresented = 0;
+		pFrameTiming->m_nNumDroppedFrames = 0;
+	}
 }

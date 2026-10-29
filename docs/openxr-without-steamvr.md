@@ -55,8 +55,9 @@ The runtime writes its log to `~/.cache/riftlinux/runtime.log`.
 - **Close the application** (Rift tab, *Settings* page, *Application*): asks the application to quit the OpenXR way,
   and ends it if it does not. The way out of an application that has no quit of its own.
 - **Measure the sensors manually**, notices, floor and height, sound and microphone: as in SteamVR.
-- When you put the headset on, the view is recentred on you. When you take it off, the display switches off; on
-  Wayland the desktop gets the display back, and the runtime takes it again when you put the headset on.
+- When you put the headset on, the view is recentred on you. When you take it off, the picture goes black, and after
+  a while black the display switches off; on Wayland the desktop then gets the display back, and the runtime takes it
+  again when you put the headset on.
 - There is no boundary (SteamVR's Chaperone exists only in SteamVR).
 
 ## Example: WayVR, your desktop in VR

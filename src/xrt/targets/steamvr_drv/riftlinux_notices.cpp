@@ -17,6 +17,7 @@
  * "cmd-hdr-content 0|1" (HDR content on screen now, shown at HDR Bright).
  * Answers on the same
  * socket "dashboard 1" / "dashboard 0" as SteamVR's dashboard opens and closes (the Oculus button then closes it),
+ * "game 1 <application key>" / "game 0" as a game becomes SteamVR's scene application or stops being it,
  * "height <mm>" and "floor" from the tab's view card, "autohdr 0|1", "autohdr-strength <%>", "autohdr-colour <%>",
  * "hdr-bright 0|1" and "smoothing 0|1" from its picture and motion cards, "direct-mode 0|1", "render-scale <%>"
  * (both for SteamVR's next start) and "fast-path 0|1" from its display card. The driver also sends "cmd-status
@@ -46,15 +47,19 @@
 #include "stb_image_write.h"
 
 #include "riftlinux/rl_pulse.hpp"
+#include "riftlinux/rl_steam.hpp"
 #include "riftlinux/rl_tab.hpp"
 
 #include <dlfcn.h>
 #include <poll.h>
+#include <signal.h>
 #include <unistd.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
 
 #include <algorithm>
+#include <climits>
+#include <cctype>
 #include <chrono>
 #include <cmath>
 #include <cstdint>
@@ -63,6 +68,7 @@
 #include <cstring>
 #include <ctime>
 #include <deque>
+#include <map>
 #include <string>
 #include <vector>
 
@@ -114,6 +120,615 @@ valid_name(const std::string &name)
 	       });
 }
 
+//! A game, as the scene application: any but SteamVR's own (Home, its parts, Steam's client) and this helper.
+static bool
+is_game_key(const std::string &key)
+{
+	for (const char *own : {"openvr.tool.", "openvr.component.", "steam.client", "system.generated.steamwebhelper",
+	                        "system.generated.riftlinux-notices"}) {
+		if (key.rfind(own, 0) == 0) {
+			return false;
+		}
+	}
+	return key != "steam.app.250820";
+}
+
+/*!
+ * Games added to Steam from outside it (Steam's "non-Steam game" shortcuts) that run with Proton: Steam lists them
+ * in SteamVR's library with their program file as what to start, the Windows .exe, and SteamVR's Play starts that
+ * file directly; Linux cannot run it, it ends at once, SteamVR gives up and starts Home again, and the game never
+ * starts (Steam's own Play button starts it with Proton). Once SteamVR's start of such a game has failed and nothing
+ * of it runs, this asks Steam to start it as its Play button does (steam://rungameid/<game id>). SteamVR's start of
+ * Home after the failed one never finished (Home's process never connected), and while an application counts as
+ * starting SteamVR turns every game away (VRInitError_Init_AnotherAppLaunching, every 0.5 s, the game hung): until
+ * the game is SteamVR's scene application, any other start is cancelled.
+ *
+ * Nothing else is touched: Steam's own games (SteamVR starts them through Steam), a shortcut SteamVR could start (a
+ * Linux program, or an .exe the system runs with Wine), and anything started outside SteamVR's library.
+ */
+class ShortcutLaunch
+{
+public:
+	explicit ShortcutLaunch(vr::IVRApplications *applications) : m_applications(applications) {}
+
+	//! Entries SteamVR starts through Steam already (ShortcutEntries): left alone.
+	void
+	leave(const std::vector<std::string> &keys)
+	{
+		m_leave = keys;
+	}
+
+	//! Every pass of the main loop: SteamVR's start of a game lasts a fraction of a second when it fails.
+	void
+	tick(double t)
+	{
+		if (m_applications == nullptr) {
+			return;
+		}
+		char key[vr::k_unMaxApplicationKeyLength] = {};
+		const bool starting = m_applications->GetStartingApplication(key, sizeof(key)) == vr::VRApplicationError_None &&
+		                      key[0] != '\0';
+		if (t < m_clear_until) {
+			clear_the_way(t, starting ? key : "");
+		}
+		if (starting && m_watching != key &&
+		    std::find(m_leave.begin(), m_leave.end(), std::string(key)) == m_leave.end()) {
+			uint32_t app_id = 0;
+			if (windows_shortcut(m_applications, key, app_id)) {
+				m_watching = key;
+				m_app_id = app_id;
+				m_seen_at = t;
+				m_pid = 0;
+			}
+		}
+		if (m_watching.empty()) {
+			return;
+		}
+		const uint32_t pid = m_applications->GetApplicationProcessId(m_watching.c_str());
+		if (pid != 0) {
+			m_pid = pid;
+		}
+		const bool still_starting = starting && m_watching == key;
+		const bool alive = running(m_pid);
+		if (still_starting && t - m_seen_at < kStartingForS) {
+			return;
+		}
+		if (!still_starting && !alive) {
+			hand_to_steam(t);
+		}
+		// Started after all, or still starting long after: SteamVR's own business.
+		m_watching.clear();
+	}
+
+private:
+	//! A start SteamVR still works on after this long is left alone.
+	static constexpr double kStartingForS = 10.0;
+	//! How long after handing a game to Steam the helper watches for it to become SteamVR's scene application.
+	static constexpr double kClearForS = 30.0;
+	//! The same game is handed to Steam at most once in this long (a game that fails under Proton too).
+	static constexpr double kAgainAfterS = 15.0;
+
+public:
+	//! A shortcut's application key (steam.app.<id>, Steam's shortcut ids have the top bit set) whose program, as
+	//! Steam told SteamVR, is a Windows file.
+	static bool
+	windows_shortcut(vr::IVRApplications *applications, const std::string &key, uint32_t &app_id)
+	{
+		const std::string prefix = "steam.app.";
+		if (key.rfind(prefix, 0) != 0) {
+			return false;
+		}
+		char *end = nullptr;
+		const unsigned long id = strtoul(key.c_str() + prefix.size(), &end, 10);
+		if (end == nullptr || *end != '\0' || id < 0x80000000ul || id > 0xFFFFFFFFul) {
+			return false;
+		}
+		if (property(applications, key, vr::VRApplicationProperty_LaunchType_String) != "binary") {
+			return false;
+		}
+		std::string binary = property(applications, key, vr::VRApplicationProperty_BinaryPath_String);
+		std::transform(binary.begin(), binary.end(), binary.begin(), [](unsigned char c) { return std::tolower(c); });
+		for (const char *ext : {".exe", ".bat", ".cmd", ".com", ".msi", ".lnk"}) {
+			const size_t n = strlen(ext);
+			if (binary.size() > n && binary.compare(binary.size() - n, n, ext) == 0) {
+				app_id = static_cast<uint32_t>(id);
+				return true;
+			}
+		}
+		return false;
+	}
+
+	//! A process that is there and has not ended (an ended one nobody collected yet is gone too).
+	static bool
+	running(uint32_t pid)
+	{
+		if (pid == 0 || kill(static_cast<pid_t>(pid), 0) != 0) {
+			return false;
+		}
+		char path[64];
+		snprintf(path, sizeof(path), "/proc/%u/stat", pid);
+		FILE *f = fopen(path, "r");
+		if (f == nullptr) {
+			return false;
+		}
+		char buf[512] = {};
+		const size_t n = fread(buf, 1, sizeof(buf) - 1, f);
+		fclose(f);
+		const char *close_paren = strrchr(buf, ')');
+		return n > 0 && close_paren != nullptr && close_paren[1] == ' ' && close_paren[2] != 'Z' &&
+		       close_paren[2] != 'X';
+	}
+
+	static std::string
+	property(vr::IVRApplications *applications, const std::string &key, vr::EVRApplicationProperty which)
+	{
+		char value[4096] = {};
+		vr::EVRApplicationError err = vr::VRApplicationError_None;
+		applications->GetApplicationPropertyString(key.c_str(), which, value, sizeof(value), &err);
+		return err == vr::VRApplicationError_None ? value : "";
+	}
+
+private:
+	std::string
+	property(const std::string &key, vr::EVRApplicationProperty which)
+	{
+		return property(m_applications, key, which);
+	}
+
+	//! Logs once the handed game is SteamVR's scene application. (Cancelling the Home start that hung after the
+	//! failed .exe start was tried: CancelApplicationLaunch refused it.)
+	void
+	clear_the_way(double t, const std::string &starting)
+	{
+		(void)starting;
+		if (m_applications->GetSceneApplicationState() != vr::EVRSceneApplicationState_Running) {
+			return;
+		}
+		char scene[vr::k_unMaxApplicationKeyLength] = {};
+		const uint32_t pid = m_applications->GetCurrentSceneProcessId();
+		if (pid != 0 &&
+		    m_applications->GetApplicationKeyByProcessId(pid, scene, sizeof(scene)) == vr::VRApplicationError_None &&
+		    m_handed_key == scene) {
+			fprintf(stderr, "riftlinux-notices: %s is SteamVR's game now (%.1f s after it was handed to Steam)\n",
+			        m_handed_name.c_str(), t - (m_clear_until - kClearForS));
+			m_clear_until = 0.0;
+		}
+	}
+
+	void
+	hand_to_steam(double t)
+	{
+		const std::string name = property(m_watching, vr::VRApplicationProperty_Name_String);
+		if (t - m_handed_at[m_watching] < kAgainAfterS) {
+			fprintf(stderr, "riftlinux-notices: SteamVR could not start %s again; not handed to Steam twice in a row\n",
+			        name.c_str());
+			return;
+		}
+		m_handed_at[m_watching] = t;
+		// Steam's game id of a shortcut: its 32-bit id above, 0x02000000 (a shortcut) below.
+		const uint64_t game_id = (static_cast<uint64_t>(m_app_id) << 32) | 0x02000000u;
+		const std::string link = "steam://rungameid/" + std::to_string(game_id);
+		std::string problem;
+		const bool ok = rl::steam::open_url(link, problem, {}, 3000);
+		if (ok) {
+			m_handed_key = m_watching;
+			m_handed_name = name;
+			m_clear_until = t + kClearForS;
+		}
+		fprintf(stderr,
+		        "riftlinux-notices: SteamVR could not start %s (%s, a Windows program added to Steam): %s %s%s%s\n",
+		        name.c_str(), m_watching.c_str(), ok ? "Steam starts it with its compatibility tool," : "could not hand",
+		        link.c_str(), problem.empty() ? "" : ": ", problem.c_str());
+	}
+
+	vr::IVRApplications *m_applications;
+	std::vector<std::string> m_leave;
+	std::string m_watching;
+	uint32_t m_app_id = 0;
+	uint32_t m_pid = 0;
+	double m_seen_at = 0.0;
+	std::map<std::string, double> m_handed_at;
+	//! The game last handed to Steam, until it is SteamVR's scene application or kClearForS passed.
+	std::string m_handed_key;
+	std::string m_handed_name;
+	double m_clear_until = 0.0;
+};
+
+
+/*!
+ * The same games as ShortcutLaunch, before SteamVR tries them: SteamVR is handed its own entry for each (OpenVR's
+ * AddApplicationManifest, a temporary manifest of this helper's), the same key and name, started through Steam
+ * (steam://rungameid/<game id>), as Steam lists its own games (steam://launch/<id>/VR). SteamVR's own try at the
+ * .exe went worse than failing: its launch through Steam's launcher service left Home's restart hanging (Home never
+ * connected), and while Home counted as starting SteamVR turned every game away. Checked at the start, whenever
+ * SteamVR's list changes (Steam writes its entries again) and every 10 s; ShortcutLaunch stays for an entry SteamVR
+ * does not take.
+ */
+class ShortcutEntries
+{
+public:
+	explicit ShortcutEntries(vr::IVRApplications *applications) : m_applications(applications) {}
+
+	//! The entries SteamVR starts through Steam now (its log showed Steam's own entry skipped for them).
+	const std::vector<std::string> &
+	taken() const
+	{
+		return m_taken;
+	}
+
+	void
+	check(double t, bool now)
+	{
+		if (m_applications == nullptr) {
+			return;
+		}
+		if (m_verify_at > 0.0 && t >= m_verify_at) {
+			verify();
+		}
+		if (!now && t - m_checked_at < kEveryS) {
+			return;
+		}
+		m_checked_at = t;
+		// SteamVR took Steam's entries over ours again (Steam registered its list anew): handed over again.
+		if (m_verify_at == 0.0 && !m_added_text.empty() && ours_skipped()) {
+			fprintf(stderr, "riftlinux-notices: SteamVR took Steam's own entries for %s again: handed over again\n",
+			        m_pending_names.c_str());
+			m_added_text.clear();
+			m_taken.clear();
+		}
+		struct Entry
+		{
+			std::string key, name;
+			uint64_t game_id;
+		};
+		std::vector<Entry> entries;
+		const uint32_t count = m_applications->GetApplicationCount();
+		for (uint32_t i = 0; i < count; i++) {
+			char key[vr::k_unMaxApplicationKeyLength] = {};
+			if (m_applications->GetApplicationKeyByIndex(i, key, sizeof(key)) != vr::VRApplicationError_None) {
+				continue;
+			}
+			uint32_t app_id = 0;
+			if (ShortcutLaunch::windows_shortcut(m_applications, key, app_id)) {
+				entries.push_back({key, ShortcutLaunch::property(m_applications, key, vr::VRApplicationProperty_Name_String),
+				                   (static_cast<uint64_t>(app_id) << 32) | 0x02000000u});
+			}
+		}
+		if (entries.empty()) {
+			return;
+		}
+		char starting[vr::k_unMaxApplicationKeyLength] = {};
+		if (m_applications->GetStartingApplication(starting, sizeof(starting)) == vr::VRApplicationError_None &&
+		    starting[0] != '\0') {
+			return;
+		}
+		char scene[vr::k_unMaxApplicationKeyLength] = {};
+		const uint32_t scene_pid = m_applications->GetCurrentSceneProcessId();
+		if (scene_pid != 0 &&
+		    m_applications->GetApplicationKeyByProcessId(scene_pid, scene, sizeof(scene)) == vr::VRApplicationError_None &&
+		    strncmp(scene, "steam.app.", 10) == 0) {
+			return;
+		}
+		std::string text = "{\n\t\"source\": \"steam\",\n\t\"applications\": [";
+		std::string names;
+		for (size_t i = 0; i < entries.size(); i++) {
+			text += std::string(i > 0 ? "," : "") + "\n\t\t{\"app_key\": \"" + json_escape(entries[i].key) +
+			        "\", \"launch_type\": \"url\", \"url\": \"steam://rungameid/" +
+			        std::to_string(entries[i].game_id) + "\", \"strings\": {\"en_us\": {\"name\": \"" +
+			        json_escape(entries[i].name) + "\"}}}";
+			names += std::string(i > 0 ? ", " : "") + entries[i].name;
+		}
+		text += "\n\t]\n}\n";
+		/*
+		 * Once per set of entries: SteamVR keeps them until it quits. This process's view of SteamVR's list is not
+		 * read again: it still shows Steam's own entries after SteamVR took ours (SteamVR 2.18; a new process sees
+		 * ours), so SteamVR's log tells what it took. A few hand-overs at most in one session.
+		 */
+		if (text == m_added_text || m_handovers >= kMaxHandovers) {
+			return;
+		}
+		m_added_text = text;
+		m_handovers++;
+		const std::string path = manifest_path();
+		FILE *f = fopen((path + ".new").c_str(), "w");
+		if (f == nullptr || fputs(text.c_str(), f) < 0 || fclose(f) != 0 || rename((path + ".new").c_str(), path.c_str()) != 0) {
+			fprintf(stderr, "riftlinux-notices: could not write %s\n", path.c_str());
+			return;
+		}
+		// The first manifest that describes an application key wins; a later one is skipped ("already described"), and
+		// Steam registers its list when it connects. So Steam's list goes out, ours in, Steam's back in right after:
+		// every other game comes from Steam's list as before, these entries are skipped there.
+		const std::vector<std::string> steams = steam_manifests(entries.front().key, path);
+		m_ours = path;
+		m_log_at = log_size();
+		for (const std::string &s : steams) {
+			m_applications->RemoveApplicationManifest(s.c_str());
+		}
+		m_applications->RemoveApplicationManifest(path.c_str());
+		const vr::EVRApplicationError e = m_applications->AddApplicationManifest(path.c_str(), true);
+		for (const std::string &s : steams) {
+			vr::EVRApplicationError back = m_applications->AddApplicationManifest(s.c_str(), false);
+			if (back != vr::VRApplicationError_None) {
+				back = m_applications->AddApplicationManifest(s.c_str(), false);
+			}
+			if (back != vr::VRApplicationError_None) {
+				fprintf(stderr, "riftlinux-notices: SteamVR did not take Steam's list %s back (%s): Steam's games show "
+				        "again when Steam or SteamVR starts again\n", s.c_str(),
+				        m_applications->GetApplicationsErrorNameFromEnum(back));
+			}
+		}
+		// Read in SteamVR's log a little later.
+		m_pending.clear();
+		for (const Entry &entry : entries) {
+			m_pending.push_back(entry.key);
+		}
+		m_pending_names = names;
+		m_pending_detail = std::string(m_applications->GetApplicationsErrorNameFromEnum(e)) + "; Steam's list " +
+		                   (steams.empty() ? "not found" : steams.front());
+		m_verify_at = t + kVerifyAfterS;
+	}
+
+private:
+	//! SteamVR's log since the hand-over: for each entry whether Steam's was skipped (ours taken) or ours.
+	void
+	verify()
+	{
+		m_verify_at = 0.0;
+		m_watch_at = m_log_at;
+		const std::string log = log_since(m_watch_at);
+		m_taken.clear();
+		size_t lost = 0;
+		for (const std::string &key : m_pending) {
+			if (log.find(" - App " + key + " was already described in manifest " + m_ours + ". Skipping") !=
+			    std::string::npos) {
+				m_taken.push_back(key);
+			} else if (log.find(m_ours + " - App " + key + " was already described in manifest ") != std::string::npos) {
+				lost++;
+			}
+		}
+		char line[1024];
+		snprintf(line, sizeof(line), "games added to Steam with a Windows program (%s): %s (%zu of %zu; %s)",
+		         m_pending_names.c_str(),
+		         m_taken.size() == m_pending.size() ? "SteamVR starts them through Steam now"
+		         : lost > 0                         ? "SteamVR kept Steam's own entry"
+		                                            : "SteamVR's log does not say which entry it kept",
+		         m_taken.size(), m_pending.size(), m_pending_detail.c_str());
+		if (m_logged != line) {
+			m_logged = line;
+			fprintf(stderr, "riftlinux-notices: %s\n", line);
+		}
+	}
+
+	//! SteamVR's log shows one of our entries skipped since the last look (Steam's list came first again).
+	bool
+	ours_skipped()
+	{
+		const std::string log = log_since(m_watch_at);
+		for (const std::string &key : m_taken) {
+			if (log.find(m_ours + " - App " + key + " was already described in manifest ") != std::string::npos) {
+				return true;
+			}
+		}
+		return false;
+	}
+
+	static std::string
+	log_path()
+	{
+		return rl::steam::steamvr_log_dir() + "/vrserver.txt";
+	}
+
+	static long
+	log_size()
+	{
+		struct stat st = {};
+		return stat(log_path().c_str(), &st) == 0 ? (long)st.st_size : 0;
+	}
+
+	//! SteamVR's log from @p at on (all of it when it was started anew since), at most its last 4 MB; @p at moves
+	//! to its end.
+	static std::string
+	log_since(long &at)
+	{
+		std::string out;
+		FILE *f = fopen(log_path().c_str(), "r");
+		if (f == nullptr) {
+			return out;
+		}
+		fseek(f, 0, SEEK_END);
+		const long size = ftell(f);
+		long from = size < at ? 0 : at;
+		if (size - from > (4L << 20)) {
+			from = size - (4L << 20);
+		}
+		fseek(f, from, SEEK_SET);
+		char buf[65536];
+		size_t n;
+		while ((n = fread(buf, 1, sizeof(buf), f)) > 0) {
+			out.append(buf, n);
+		}
+		fclose(f);
+		at = from + (long)out.size();
+		return out;
+	}
+
+	static constexpr double kEveryS = 10.0;
+	//! How long after handing SteamVR the entries its log is read.
+	static constexpr double kVerifyAfterS = 3.0;
+	//! Hand-overs in one session at most (SteamVR taking Steam's entries back again and again).
+	static constexpr int kMaxHandovers = 3;
+
+	static std::string
+	manifest_path()
+	{
+		const char *cache = getenv("XDG_CACHE_HOME");
+		const char *home = getenv("HOME");
+		const std::string dir = (cache != nullptr && cache[0] == '/' ? std::string(cache)
+		                                                              : std::string(home != nullptr ? home : "/tmp") + "/.cache") +
+		                        "/riftlinux";
+		mkdir(dir.c_str(), 0700);
+		return dir + "/steam-shortcuts.vrmanifest";
+	}
+
+	//! Steam's application list as SteamVR has it registered: the paths in SteamVR's appconfig.json (written exactly
+	//! as Steam added them) whose file describes key; else the usual Steam folders, resolved.
+	static std::vector<std::string>
+	steam_manifests(const std::string &key, const std::string &ours)
+	{
+		const char *h = getenv("HOME");
+		const std::string home = h != nullptr ? h : "";
+		const std::vector<std::string> roots = {
+		    home + "/.steam/root",
+		    home + "/.steam/steam",
+		    home + "/.steam/debian-installation",
+		    home + "/.local/share/Steam",
+		    home + "/.var/app/com.valvesoftware.Steam/.local/share/Steam",
+		    home + "/.var/app/com.valvesoftware.Steam/data/Steam",
+		    home + "/snap/steam/common/.local/share/Steam",
+		};
+		std::vector<std::string> found;
+		auto add = [&](const std::string &p) {
+			if (p.empty() || p == ours || std::find(found.begin(), found.end(), p) != found.end()) {
+				return;
+			}
+			if (read_file(p).find("\"" + key + "\"") != std::string::npos) {
+				found.push_back(p);
+			}
+		};
+		for (const std::string &root : roots) {
+			const std::string config = read_file(root + "/config/appconfig.json");
+			size_t at = config.find("\"manifest_paths\"");
+			const size_t end = at == std::string::npos ? at : config.find(']', at);
+			if (at == std::string::npos || end == std::string::npos) {
+				continue;
+			}
+			at = config.find('[', at);
+			while (at != std::string::npos && at < end) {
+				const size_t open = config.find('"', at + 1);
+				if (open == std::string::npos || open > end) {
+					break;
+				}
+				std::string p;
+				size_t i = open + 1;
+				for (; i < config.size() && config[i] != '"'; i++) {
+					if (config[i] == '\\' && i + 1 < config.size()) {
+						i++;
+					}
+					p += config[i];
+				}
+				add(p);
+				at = i;
+			}
+		}
+		if (found.empty()) {
+			for (const std::string &root : roots) {
+				char real[PATH_MAX];
+				if (realpath((root + "/config/steamapps.vrmanifest").c_str(), real) != nullptr) {
+					add(real);
+				}
+			}
+		}
+		return found;
+	}
+
+	static std::string
+	read_file(const std::string &path)
+	{
+		std::string out;
+		FILE *f = fopen(path.c_str(), "r");
+		if (f == nullptr) {
+			return out;
+		}
+		char buf[65536];
+		size_t n;
+		while ((n = fread(buf, 1, sizeof(buf), f)) > 0 && out.size() < (64u << 20)) {
+			out.append(buf, n);
+		}
+		fclose(f);
+		return out;
+	}
+
+	static std::string
+	json_escape(const std::string &in)
+	{
+		std::string out;
+		for (unsigned char c : in) {
+			if (c == '"' || c == '\\') {
+				out += '\\';
+				out += (char)c;
+			} else if (c < 0x20) {
+				char buf[8];
+				snprintf(buf, sizeof(buf), "\\u%04x", c);
+				out += buf;
+			} else {
+				out += (char)c;
+			}
+		}
+		return out;
+	}
+
+	vr::IVRApplications *m_applications;
+	double m_checked_at = -100.0;
+	std::string m_added_text;
+	int m_handovers = 0;
+	std::string m_ours;
+	long m_log_at = 0;
+	long m_watch_at = 0;
+	std::vector<std::string> m_taken;
+	std::string m_logged;
+	std::vector<std::string> m_pending;
+	std::string m_pending_names;
+	std::string m_pending_detail;
+	double m_verify_at = 0.0;
+};
+
+/*!
+ * SteamVR Home, when SteamVR started without it. SteamVR's start-up helper asks for Home once its compositor runs;
+ * right after Steam started, Steam's launcher service (SteamVR starts its compositor and monitor through it) once sat
+ * for eleven seconds on the compositor's start, SteamVR's helper lost its connection meanwhile, and Home never came:
+ * an empty grey room. With Home switched on in SteamVR (steamvr.enableHomeApp) and nothing running or starting 20 s
+ * after this helper connected, Home is started, once; from then on SteamVR keeps it (it starts Home again whenever
+ * a game ends).
+ */
+class HomeWatch
+{
+public:
+	HomeWatch(vr::IVRApplications *applications, vr::IVRSettings *settings, double connected_at)
+	    : m_applications(applications), m_settings(settings), m_connected_at(connected_at)
+	{}
+
+	void
+	tick(double t)
+	{
+		if (m_done || m_applications == nullptr || t - m_connected_at < kAfterS) {
+			return;
+		}
+		m_done = true;
+		vr::EVRSettingsError err = vr::VRSettingsError_None;
+		const bool home_on = m_settings != nullptr && m_settings->GetBool("steamvr", "enableHomeApp", &err) &&
+		                     err == vr::VRSettingsError_None;
+		char starting[vr::k_unMaxApplicationKeyLength] = {};
+		const bool something_starting =
+		    m_applications->GetStartingApplication(starting, sizeof(starting)) == vr::VRApplicationError_None &&
+		    starting[0] != '\0';
+		if (!home_on || something_starting ||
+		    m_applications->GetSceneApplicationState() != vr::EVRSceneApplicationState_None) {
+			return;
+		}
+		const vr::EVRApplicationError e = m_applications->LaunchApplication(kHome);
+		fprintf(stderr, "riftlinux-notices: SteamVR runs without Home or a game %.0f s after it started: %s Home (%s)\n",
+		        kAfterS, e == vr::VRApplicationError_None ? "starting" : "could not start",
+		        m_applications->GetApplicationsErrorNameFromEnum(e));
+	}
+
+private:
+	static constexpr double kAfterS = 20.0;
+	static constexpr const char *kHome = "openvr.tool.steamvr_environments";
+	vr::IVRApplications *m_applications;
+	vr::IVRSettings *m_settings;
+	double m_connected_at;
+	bool m_done = false;
+};
 
 //! Steam's main page in SteamVR's dashboard, where its menu button normally opens it.
 constexpr const char *kSteamMainTab = "valve.steam.gamepadui.main";
@@ -1042,12 +1657,17 @@ main(int argc, char **argv)
 	}
 	auto *overlay = static_cast<vr::IVROverlay *>(core->GetGenericInterface(vr::IVROverlay_Version, &err));
 	auto *system = static_cast<vr::IVRSystem *>(core->GetGenericInterface(vr::IVRSystem_Version, &err));
+	auto *applications =
+	    static_cast<vr::IVRApplications *>(core->GetGenericInterface(vr::IVRApplications_Version, &err));
 	FrameLock frame_lock(
 	    static_cast<vr::IVRCompositor *>(core->GetGenericInterface(vr::IVRCompositor_Version, &err)),
-	    static_cast<vr::IVRSettings *>(core->GetGenericInterface(vr::IVRSettings_Version, &err)),
-	    static_cast<vr::IVRApplications *>(core->GetGenericInterface(vr::IVRApplications_Version, &err)));
+	    static_cast<vr::IVRSettings *>(core->GetGenericInterface(vr::IVRSettings_Version, &err)), applications);
 	auto *chaperone = static_cast<vr::IVRChaperone *>(core->GetGenericInterface(vr::IVRChaperone_Version, &err));
 	[[maybe_unused]] Perf perf(static_cast<vr::IVRCompositor *>(core->GetGenericInterface(vr::IVRCompositor_Version, &err)));
+	ShortcutLaunch shortcut_launch(applications);
+	ShortcutEntries shortcut_entries(applications);
+	HomeWatch home_watch(applications,
+	                     static_cast<vr::IVRSettings *>(core->GetGenericInterface(vr::IVRSettings_Version, &err)), now_s());
 	// To the driver, on the socket it gave as stdin; never blocks, never raises SIGPIPE.
 	[[maybe_unused]] auto tell_driver = [](const char *line) {
 		const std::string text = std::string(line) + "\n";
@@ -1264,6 +1884,9 @@ main(int argc, char **argv)
 
 		vr::VREvent_t event;
 		while (system->PollNextEvent(&event, sizeof(event))) {
+			if (event.eventType == vr::VREvent_ApplicationListUpdated) {
+				shortcut_entries.check(now_s(), true);
+			}
 			if (event.eventType == vr::VREvent_Quit) {
 				frame_lock.restore();
 				core->Cleanup();
@@ -1278,6 +1901,30 @@ main(int argc, char **argv)
 		}
 
 		const double t = now_s();
+		shortcut_entries.check(t, false);
+		shortcut_launch.leave(shortcut_entries.taken());
+		shortcut_launch.tick(t);
+		home_watch.tick(t);
+		// The scene application, a game or not, for the driver ("game 1 <key>" / "game 0"): it closes Steam's
+		// menu over a game.
+		static double scene_checked_at = -10.0;
+		static uint32_t scene_pid = 0;
+		if (applications != nullptr && t - scene_checked_at >= 0.25) {
+			scene_checked_at = t;
+			const uint32_t pid = applications->GetSceneApplicationState() == vr::EVRSceneApplicationState_Running
+			                         ? applications->GetCurrentSceneProcessId()
+			                         : 0;
+			if (pid != scene_pid) {
+				scene_pid = pid;
+				char key[vr::k_unMaxApplicationKeyLength] = {};
+				if (pid != 0 &&
+				    applications->GetApplicationKeyByProcessId(pid, key, sizeof(key)) != vr::VRApplicationError_None) {
+					key[0] = '\0';
+				}
+				const std::string line = std::string("game 1 ") + (key[0] != '\0' ? key : "?");
+				tell_driver(pid != 0 && is_game_key(key) ? line.c_str() : "game 0");
+			}
+		}
 #ifdef RLN_HAVE_PULSE
 		frame_lock.tick(t, picture.smoothing);
 		// The Performance card, while its switch is on; what motion smoothing makes: our compositor shows every one

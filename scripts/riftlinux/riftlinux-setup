@@ -9,6 +9,15 @@
                                           set up everything that is missing, asking before each change
   riftlinux-setup repair [--yes]          what SteamVR updates or crashes undo: driver blocked by safe mode,
                                           compositor priority, room setup, direct mode switch out of step
+  riftlinux-setup fix [--yes]             the configuration RiftLinux is tested with, in one go (SteamVR closed): SteamVR
+                                          as the OpenXR and OpenVR runtime, this driver as SteamVR's only headset
+                                          driver, SteamVR's settings games need, direct mode on, the devices' rules and
+                                          power, and what other setups left (variables and launch options pointing
+                                          games elsewhere, other VR services holding the Rift, pairing mode); one
+                                          question for all of it
+  riftlinux-setup fix last-known [--yes]  RiftLinux's settings file when it cannot be read: kept aside, and the last
+                                          good one put back (the driver keeps it as settings.json.last-known); with
+                                          none, the settings start from the defaults and fix runs
   riftlinux-setup direct-mode on|off|status
                                           SteamVR's frames through our compositor (Auto-HDR, motion smoothing) or not
   riftlinux-setup nvidia-vrr status|conceal|restore
@@ -27,6 +36,44 @@
   riftlinux-setup record on|off|status    record SteamVR's sessions for a bug report (from its next start): the
                                           sensors' views, tracking and output, into ~/.cache/riftlinux, and the
                                           tracker's details in SteamVR's log; large files, turn it off after
+  riftlinux-setup autostart on|off|status Steam starts SteamVR when the Rift is put on or picked up (on by default;
+                                          off if you use RiftLinux's own runtime without SteamVR); at once
+  riftlinux-setup autostart trigger put-on|pick-up
+                                          what starts it: putting the Rift on only (its wear sensor), or also
+                                          picking it up (default)
+  riftlinux-setup autostart quit-unused on|off
+                                          a SteamVR started by picking the Rift up quits again when it is not put on
+                                          within two minutes (on by default); off lets it run on
+  riftlinux-setup controller-sleep 3|5|7|off|status
+                                          minutes after the headset is taken off before the Touch controllers may
+                                          go to sleep (5 by default); off keeps them awake while SteamVR runs; from
+                                          the next start
+  riftlinux-setup game-menu close|keep|status
+                                          Steam's menu, which Steam opens as a game starts: closed once the game
+                                          shows (default), or kept open; from SteamVR's next start
+  riftlinux-setup standby worn|pick-up|status
+                                          SteamVR's standby: ends when the headset is worn (worn, default), or also
+                                          when it moves, by SteamVR's own rule (pick-up, as on Windows: picked up,
+                                          or moved where it lies, a bed someone moves on too); the picture always
+                                          waits until the headset is worn; from SteamVR's next start
+  riftlinux-setup wear-sensor on|off|status|test
+  riftlinux-setup wear-sensor levels <worn above> <not worn below>|default
+  riftlinux-setup wear-sensor motion high|medium|low|<seconds>|off|on|default
+                                          the wear sensor (it switches the display off and tells SteamVR the headset
+                                          is off): test shows its readings live; off counts the headset as worn
+                                          whenever it runs; levels for a sensor that reads lower; motion: moving and
+                                          turning as on a head counts as worn, for a face shield or pad the sensor
+                                          cannot see through, after 8 s (high), 20 s (medium, default), 30 s (low)
+                                          or <seconds>; off counts the sensor alone; from the next start
+  riftlinux-setup display-off <seconds>|never|default|status
+                                          how long after the headset is taken off its display goes black or switches
+                                          off (default 5 s); never keeps the picture on (burn-in risk on a still
+                                          picture)
+  riftlinux-setup not-worn black [<minutes>|never]|off|default|status
+                                          a headset taken off: black (default) keeps its display on showing pure
+                                          black, so the desktop sees no monitor unplugged, and switches it off after
+                                          <minutes> black (default 10); off switches the display off at once (an
+                                          unplug and plug for the desktop at every take-off and put-on)
 
 Options: --package DIR (the driver package; default: the directory this tool is in), --json (machine-readable
 output for front ends), --yes (no questions), --print-root (only print the commands that need root).
@@ -45,9 +92,11 @@ import shutil
 import struct
 import subprocess
 import sys
+import time
 
 VENDOR = "2833"
-PRODUCTS = {"0031": "Rift CV1 headset", "0211": "Rift CV1 sensor", "0021": "Rift DK2 (not supported)"}
+PRODUCTS = {"0031": "Rift CV1 headset", "0211": "Rift CV1 sensor", "2031": "Rift CV1 hub", "3031": "Rift CV1 hub (USB 3)",
+            "0330": "Rift CV1 audio", "0021": "Rift DK2 (not supported)"}
 DRIVER_NAME = "monado"
 UNIVERSE = "2"
 UDEV_NAME = "70-rift-cv1.rules"
@@ -100,11 +149,207 @@ def write_json(path, data, indent="\t"):
     os.replace(tmp, os.path.realpath(path) if os.path.islink(path) else path)
 
 
+class BadSettings(Exception):
+    """settings.json is there but cannot be used: nothing gets written into it (written anew it would lose every other
+    setting in it)."""
+
+
+def load_settings(p):
+    """settings.json as a dict, {} when it is not there or empty; BadSettings when it cannot be used."""
+    try:
+        with open(p.settings) as f:
+            text = f.read()
+    except FileNotFoundError:
+        return {}
+    except OSError as e:
+        raise BadSettings(f"{p.settings} cannot be read ({e.strerror})")
+    if not text.strip():
+        return {}
+    try:
+        data = json.loads(text)
+    except ValueError as e:
+        where = f" (line {e.lineno}, column {e.colno}: {e.msg})" if hasattr(e, "lineno") else ""
+        raise BadSettings(f"{p.settings} is not valid JSON{where}")
+    if not isinstance(data, dict):
+        raise BadSettings(f"{p.settings} holds a JSON {type(data).__name__} instead of an object")
+    keep_last_known(p, text)
+    return data
+
+
+def last_known_path(p):
+    return p.settings + ".last-known"
+
+
+def keep_last_known(p, text):
+    """A settings file that could be used, kept as settings.json.last-known (as the driver keeps it)."""
+    path = last_known_path(p)
+    try:
+        with open(path) as f:
+            if f.read() == text:
+                return
+    except OSError:
+        pass
+    try:
+        tmp = path + ".tmp"
+        with open(tmp, "w") as f:
+            f.write(text)
+        os.replace(tmp, path)
+    except OSError:
+        pass
+
+
+def last_known(p):
+    """The last-known settings (a dict) and when they were kept, or (None, None)."""
+    path = last_known_path(p)
+    data = read_json(path)
+    if not isinstance(data, dict):
+        return None, None
+    return data, time.strftime("%Y-%m-%d %H:%M", time.localtime(os.path.getmtime(path)))
+
+
+# The keys this tool writes, as the driver reads them: (kind, low, high or choices, what the driver uses otherwise).
+SETTINGS_KEYS = {
+    ("steamvr", "start_when_put_on"): ("bool", None, None, "true"),
+    ("steamvr", "start_on_pick_up"): ("bool", None, None, "true"),
+    ("steamvr", "quit_if_not_put_on"): ("bool", None, None, "true"),
+    ("steamvr", "close_menu_for_games"): ("bool", None, None, "true"),
+    ("steamvr", "standby"): ("choice", None, ("worn", "pick-up"), '"worn"'),
+    ("controllers", "sleep_after_min"): ("number", None, 60, "5 (1 to 60; negative: kept awake)"),
+    ("headset", "wear_sensor"): ("bool", None, None, "true"),
+    ("headset", "worn_above"): ("number", 0, 65535, "30"),
+    ("headset", "unworn_below"): ("number", 0, 65535, "15"),
+    ("headset", "worn_by_motion"): ("bool", None, None, "true"),
+    ("headset", "worn_by_motion_after_s"): ("number", 1, 60, "20 (1 to 60)"),
+    ("headset", "display_off_after_s"): ("number", None, 86400, "5 (negative: never; at most a day)"),
+    ("headset", "not_worn"): ("choice", None, ("black", "off"), '"black"'),
+    ("headset", "black_then_off_min"): ("number", None, 10080, "10 (negative: never; at most a week)"),
+    ("display", "direct_mode"): ("bool", None, None, "true"),
+    ("diagnostics", "record"): ("bool", None, None, "false"),
+}
+
+
+def settings_problems(s):
+    """What in settings.json the driver cannot use as written (it takes its default for that key instead)."""
+    problems = []
+    for section in sorted({sec for sec, _ in SETTINGS_KEYS} | {"notices", "tracking", "tab"}):
+        if section in s and not isinstance(s[section], dict):
+            problems.append(f"\"{section}\" should be an object, is {json.dumps(s[section])}: every {section} setting is "
+                            "at its default")
+    for (section, key), (kind, low, high, default) in SETTINGS_KEYS.items():
+        sec = s.get(section)
+        if not isinstance(sec, dict) or key not in sec:
+            continue
+        v = sec[key]
+        name = f"{section}.{key}"
+        if kind == "bool" and not isinstance(v, bool):
+            problems.append(f"{name} should be true or false, is {json.dumps(v)}: the driver uses {default}")
+        elif kind == "choice" and v not in high:
+            problems.append(f"{name} should be " + " or ".join(f'"{c}"' for c in high) +
+                            f", is {json.dumps(v)}: the driver uses {default}")
+        elif kind == "number":
+            if isinstance(v, bool) or not isinstance(v, (int, float)):
+                problems.append(f"{name} should be a number, is {json.dumps(v)}: the driver uses {default}")
+            elif (low is not None and v < low) or (high is not None and v > high):
+                problems.append(f"{name} is {v:g}, out of range: the driver uses the nearest allowed value "
+                                f"(default {default})")
+    h = s.get("headset") if isinstance(s.get("headset"), dict) else {}
+    above, below = h.get("worn_above", 30), h.get("unworn_below", 15)
+    if all(isinstance(v, (int, float)) and not isinstance(v, bool) for v in (above, below)) and below > above:
+        problems.append(f"headset.unworn_below ({below:g}) is above headset.worn_above ({above:g}): the driver uses 30 "
+                        "and 15")
+    return problems
+
+
 def run(cmd):
     try:
         return subprocess.run(cmd, capture_output=True, text=True, timeout=10)
     except (OSError, subprocess.TimeoutExpired):
         return None
+
+
+def vdf_load(text):
+    """Steam's text key-value files (config.vdf, localconfig.vdf): nested dicts in file order."""
+    tokens = []
+    i, n = 0, len(text)
+    while i < n:
+        c = text[i]
+        if c in " \t\r\n":
+            i += 1
+        elif c == "/" and text.startswith("//", i):
+            j = text.find("\n", i)
+            i = n if j < 0 else j
+        elif c in "{}":
+            tokens.append(c)
+            i += 1
+        elif c == '"':
+            out = []
+            i += 1
+            while i < n and text[i] != '"':
+                if text[i] == "\\" and i + 1 < n:
+                    out.append({"n": "\n", "t": "\t"}.get(text[i + 1], text[i + 1]))
+                    i += 2
+                else:
+                    out.append(text[i])
+                    i += 1
+            tokens.append(("s", "".join(out)))
+            i += 1
+        else:
+            j = i
+            while j < n and text[j] not in " \t\r\n{}\"":
+                j += 1
+            tokens.append(("s", text[i:j]))
+            i = j
+    pos = 0
+
+    def block():
+        nonlocal pos
+        d = {}
+        while pos < len(tokens):
+            tok = tokens[pos]
+            if tok == "}":
+                pos += 1
+                return d
+            key = tok[1]
+            pos += 1
+            if pos < len(tokens) and tokens[pos] == "{":
+                pos += 1
+                d[key] = block()
+            elif pos < len(tokens):
+                d[key] = tokens[pos][1]
+                pos += 1
+        return d
+
+    return block()
+
+
+def vdf_dump(d, depth=0):
+    def q(s):
+        return '"' + s.replace("\\", "\\\\").replace('"', '\\"') + '"'
+    out = []
+    tab = "\t" * depth
+    for k, v in d.items():
+        if isinstance(v, dict):
+            out.append(f"{tab}{q(k)}\n{tab}{{\n{vdf_dump(v, depth + 1)}{tab}}}\n")
+        else:
+            out.append(f"{tab}{q(k)}\t\t{q(v)}\n")
+    return "".join(out)
+
+
+def vdf_get(d, *keys):
+    """A nested value by keys, Steam's keys are not case-sensitive; None when absent."""
+    for key in keys:
+        if not isinstance(d, dict):
+            return None
+        d = next((v for k, v in d.items() if k.lower() == key.lower()), None)
+    return d
+
+
+def write_text(path, text):
+    backup(path)
+    tmp = f"{path}.tmp-riftlinux"
+    with open(tmp, "w") as f:
+        f.write(text)
+    os.replace(tmp, path)
 
 
 def sysfs(path, name):
@@ -237,6 +482,258 @@ def check_registered(p, opts):
         detail.append("another driver named \"monado\" is registered too (only one can load): " + ", ".join(others) +
                       "; it will be unregistered (its files stay)")
     return result("registered", "Driver registered with SteamVR", "fix", "; ".join(detail) + ".", fix, "user")
+
+
+# Other headset drivers SteamVR may use for the headset instead of this one, left registered by another CV1 setup or a
+# streaming one: SteamVR-OpenHMD claims every system ("hmd_presence": ["*.*"]). Games then render to that driver's
+# headset and never reach this one. Only SteamVR's list (or its add-on switch) is changed; their files stay.
+OTHER_HMD_DRIVERS = {"openhmd": "SteamVR-OpenHMD", "alvr_server": "ALVR"}
+# SteamVR's own drivers (its drivers/ folder); one copied in next to them by a guide is switched off instead.
+VALVE_DRIVERS = {"frame_controller", "frame_hmd", "gamepad", "htc", "indexcontroller", "indexhmd", "lighthouse",
+                 "null", "oculus", "oculus_legacy", "prism", "tundra_labs", "vrlink"}
+
+
+def claims_rift(manifest):
+    """A driver manifest that offers a headset for this system: every system ("*.*") or Oculus' USB ids (2833)."""
+    presence = manifest.get("hmd_presence") or []
+    return any(str(e) == "*.*" or str(e).lower().startswith("2833") for e in presence)
+
+
+def steamvr_folder_drivers(p):
+    """Third-party headset drivers inside SteamVR's own drivers folder: (name, folder)."""
+    out = []
+    base = os.path.join(p.steamvr, "drivers") if p.steamvr else None
+    try:
+        names = sorted(os.listdir(base)) if base else []
+    except OSError:
+        names = []
+    for n in names:
+        m = read_json(os.path.join(base, n, "driver.vrdrivermanifest")) or {}
+        name = m.get("name") or n
+        if n not in VALVE_DRIVERS and name not in VALVE_DRIVERS and name != DRIVER_NAME and claims_rift(m):
+            out.append((name, os.path.join(base, n)))
+    return out
+
+
+def steamvr_busy():
+    return busy_runtime() in ("vrserver", "vrcompositor")
+
+
+def check_other_drivers(p, opts):
+    vp = read_json(p.openvrpaths) or {}
+    others = []
+    for d in vp.get("external_drivers", []) or []:
+        if os.path.realpath(d) == os.path.realpath(p.package):
+            continue
+        m = read_json(os.path.join(d, "driver.vrdrivermanifest")) or {}
+        name = m.get("name")
+        if name in OTHER_HMD_DRIVERS or (name != DRIVER_NAME and claims_rift(m)):
+            others.append((d, OTHER_HMD_DRIVERS.get(name, name or os.path.basename(d))))
+    vs = (read_json(p.vrsettings) or {}) if p.vrsettings else {}
+    forced = (vs.get("steamvr") or {}).get("forcedDriver")
+    forced_other = bool(forced) and forced != DRIVER_NAME
+    in_folder = [(n, d) for n, d in steamvr_folder_drivers(p) if (vs.get("driver_" + n) or {}).get("enable") is not False]
+    null_on = (vs.get("driver_null") or {}).get("enable") is True
+    title = "Other headset drivers in SteamVR"
+    if not others and not forced_other and not in_folder and not null_on:
+        return result("others", title, "ok", "None: SteamVR uses this driver for the headset.")
+
+    detail = []
+    if others:
+        detail.append("registered too: " + ", ".join(f"{name} ({d})" for d, name in others) +
+                      "; SteamVR can use its headset instead of this one, and games then don't reach the Rift")
+    if in_folder:
+        detail.append("in SteamVR's own drivers folder: " + ", ".join(f"{n} ({d})" for n, d in in_folder) +
+                      ", offering a headset too")
+    if null_on:
+        detail.append("SteamVR's test headset (the null driver) is switched on")
+    if forced_other:
+        detail.append(f"SteamVR's settings force the driver \"{forced}\" for the headset (steamvr.forcedDriver)")
+    if steamvr_busy():
+        return result("others", title, "warn", "; ".join(detail) + ". Close SteamVR and run this again to change it.")
+
+    def fix():
+        if others:
+            vp2 = read_json(p.openvrpaths) or {}
+            gone = {d for d, _ in others}
+            vp2["external_drivers"] = [d for d in vp2.get("external_drivers", []) or [] if d not in gone]
+            write_json(p.openvrpaths, vp2)
+        if forced_other or in_folder or null_on:
+            vs2 = read_json(p.vrsettings) or {}
+            if forced_other:
+                (vs2.get("steamvr") or {}).pop("forcedDriver", None)
+            for n, _ in in_folder:
+                vs2.setdefault("driver_" + n, {})["enable"] = False
+            if null_on:
+                vs2.setdefault("driver_null", {})["enable"] = False
+            write_json(p.vrsettings, vs2, indent=3)
+
+    what = []
+    if others:
+        what.append("unregistered (their files stay)")
+    if in_folder or null_on:
+        what.append("switched off in SteamVR's add-ons (their files stay)")
+    if forced_other:
+        what.append("the forced driver setting removed")
+    return result("others", title, "fix", "; ".join(detail) + ". They will be " + " and ".join(what) + ".", fix, "user")
+
+
+# SteamVR settings that keep games from SteamVR when changed from SteamVR's defaults (an earlier headset, a guide,
+# a tool): steamvr.forcedHmd names another headset, which SteamVR then waits for; requireHmd false lets SteamVR start
+# a session without the Rift; startCompositorFromAppLaunch false gives a game that starts SteamVR no compositor (a dark
+# headset); startMonitorFromAppLaunch and startDashboardFromAppLaunch false leave SteamVR without its window and menu.
+LAUNCH_DEFAULTS = {"requireHmd": True, "startCompositorFromAppLaunch": True, "startMonitorFromAppLaunch": True,
+                   "startDashboardFromAppLaunch": True}
+
+
+def check_steamvr_launch(p, opts):
+    title = "SteamVR settings games depend on"
+    vs = (read_json(p.vrsettings) or {}) if p.vrsettings else {}
+    steamvr = vs.get("steamvr") or {}
+    force = getattr(opts, "force", False)
+    changed = []
+    if steamvr.get("forcedHmd"):
+        changed.append(f"steamvr.forcedHmd is \"{steamvr['forcedHmd']}\" (SteamVR waits for that headset)")
+    for key, default in LAUNCH_DEFAULTS.items():
+        if key in steamvr and steamvr[key] != default:
+            changed.append(f"steamvr.{key} is {json.dumps(steamvr[key])} (SteamVR's default: {json.dumps(default)})")
+    # SteamVR's own direct display mode, which its compositor needs when this driver's direct mode is off.
+    direct_off = (vs.get("direct_mode") or {}).get("enable") is False
+    if direct_off:
+        changed.append("SteamVR's Direct Display Mode is off (its compositor then shows the headset as a desktop "
+                       "monitor when this driver's direct mode is off)")
+    # SteamVR 2.18 starts without SteamVR Home unless switched on; the tested setup has it on.
+    home_off = force and steamvr.get("enableHomeApp") is False
+    if home_off:
+        changed.append("SteamVR Home is switched off (steamvr.enableHomeApp)")
+    if not changed:
+        return result("launch", title, "ok", "SteamVR's defaults (no forced headset, a compositor for games).")
+    if steamvr_busy():
+        return result("launch", title, "warn", "; ".join(changed) + ". Close SteamVR and run this again to change it.")
+
+    def fix():
+        vs2 = read_json(p.vrsettings) or {}
+        section = vs2.get("steamvr") or {}
+        section.pop("forcedHmd", None)
+        for key in LAUNCH_DEFAULTS:
+            section.pop(key, None)
+        if home_off:
+            section["enableHomeApp"] = True
+        vs2["steamvr"] = section
+        if direct_off:
+            (vs2.get("direct_mode") or {}).pop("enable", None)
+        write_json(p.vrsettings, vs2, indent=3)
+
+    return result("launch", title, "fix", "; ".join(changed) + ". They will be set back to SteamVR's defaults.", fix,
+                  "user")
+
+
+# GPU fence handles (sync_file) a desktop session leaked: GNOME Shell 48 on NVIDIA was seen holding 125000 of them
+# after screen recordings, without close-on-exec, so every program started from the desktop (Steam, and SteamVR from
+# it) gets a copy; SteamVR Home then could not open any more files and crashed. Only logging out clears them.
+LEAKED_HANDLES_WARN = 10000
+
+
+def count_sync_files(pid):
+    n = 0
+    try:
+        fds = os.listdir(f"/proc/{pid}/fd")
+    except OSError:
+        return 0
+    for fd in fds:
+        try:
+            if os.readlink(f"/proc/{pid}/fd/{fd}") == "anon_inode:sync_file":
+                n += 1
+        except OSError:
+            pass
+    return n
+
+
+def check_leaked_handles(p, opts):
+    title = "Leaked GPU handles in the desktop session"
+    names = {"steam", "gnome-shell", "kwin_wayland", "kwin_x11", "Xwayland", "plasmashell"}
+    uid = os.getuid()
+    leaky = []
+    for pid in os.listdir("/proc"):
+        if not pid.isdigit():
+            continue
+        try:
+            if os.stat(f"/proc/{pid}").st_uid != uid:
+                continue
+            comm = open(f"/proc/{pid}/comm").read().strip()
+        except OSError:
+            continue
+        if comm in names:
+            n = count_sync_files(pid)
+            if n >= LEAKED_HANDLES_WARN:
+                leaky.append(f"{comm} {n}")
+    if not leaky:
+        return result("handles", title, "ok", "None found (Steam and the desktop shell).")
+    return result("handles", title, "warn",
+                  "Holding leaked GPU fence handles: " + ", ".join(leaky) + ". Every program started from this "
+                  "desktop gets a copy of them, and SteamVR Home or games can then fail to open files or crash. Log "
+                  "out and back in (or restart) before playing. Seen with GNOME on NVIDIA after screen recordings.")
+
+
+# Steam loads the driver's watchdog (bin/linux32, what starts SteamVR when the Rift is put on) as it starts and keeps
+# it until it quits: after an update it still runs the one from before (its file replaced, "(deleted)" in Steam's
+# memory map, another inode) until Steam is restarted, and the update's watchdog changes are not there yet.
+def check_watchdog_loaded(p, opts):
+    title = "SteamVR start watchdog in Steam"
+    current = os.path.join(p.package, "bin", "linux32", "driver_monado.so")
+    try:
+        inode = os.stat(current).st_ino
+    except OSError:
+        return result("watchdog", title, "info", "This driver package has no watchdog (bin/linux32).")
+    uid = os.getuid()
+    loaded = []
+    for pid in os.listdir("/proc"):
+        if not pid.isdigit():
+            continue
+        try:
+            if os.stat(f"/proc/{pid}").st_uid != uid or open(f"/proc/{pid}/comm").read().strip() != "steam":
+                continue
+            maps = open(f"/proc/{pid}/maps").read().splitlines()
+        except OSError:
+            continue
+        for line in maps:
+            if "/bin/linux32/driver_monado.so" in line:
+                fields = line.split()
+                loaded.append((fields[4], line.endswith("(deleted)")))
+                break
+    if not loaded:
+        return result("watchdog", title, "info", "Not loaded now (Steam is not running, SteamVR runs, or Steam has "
+                      "not loaded it yet: it does as it starts and after SteamVR quits).")
+    if any(deleted or str(ino) != str(inode) for ino, deleted in loaded):
+        return result("watchdog", title, "warn", "Steam still runs the watchdog from before the update: restart "
+                      "Steam (Steam menu, Exit, then start it again) to load the new one.")
+    return result("watchdog", title, "ok", "Steam runs this package's watchdog.")
+
+
+# The OpenVR runtime Steam's games load: the first entry of openvrpaths.vrpath's runtime list. Another one there
+# (WiVRn's xrizer, OpenComposite, left by an earlier setup) takes the games away from SteamVR while SteamVR itself and
+# OpenXR programs still work.
+def check_openvr_runtime(p, opts):
+    title = "OpenVR runtime (what Steam's games load)"
+    vp = read_json(p.openvrpaths) or {}
+    runtimes = [r for r in vp.get("runtime", []) or [] if os.path.isdir(r)]
+    if not p.steamvr:
+        return result("openvr", title, "info", "SteamVR not found.")
+    if runtimes and os.path.realpath(runtimes[0]) == p.steamvr:
+        return result("openvr", title, "ok", "SteamVR.")
+    first = runtimes[0] if runtimes else None
+    detail = (f"{first} comes first, so OpenVR games load it instead of SteamVR and don't reach the Rift" if first
+              else "none set")
+    if steamvr_busy():
+        return result("openvr", title, "warn", detail + ". Close SteamVR and run this again to change it.")
+
+    def fix():
+        vp2 = read_json(p.openvrpaths) or {}
+        rest = [r for r in vp2.get("runtime", []) or [] if os.path.realpath(r) != p.steamvr]
+        vp2["runtime"] = [p.steamvr] + rest
+        write_json(p.openvrpaths, vp2)
+
+    return result("openvr", title, "fix", detail + "; SteamVR will be put first (the others stay listed).", fix, "user")
 
 
 def check_sandboxed(p, opts):
@@ -551,11 +1048,41 @@ def check_devices(p, opts):
     return result("devices", "Rift connected", state, ", ".join(parts) + ".")
 
 
+def package_install_cmd(package):
+    """The distribution's command to install a package, or None when no known package manager is present."""
+    for tool, cmd in (("apt-get", f"apt-get install -y {package}"),
+                      ("pacman", f"pacman -S --needed --noconfirm {package}"),
+                      ("dnf", f"dnf install -y {package}"),
+                      ("zypper", f"zypper --non-interactive install {package}"),
+                      ("apk", f"apk add {package}")):
+        if shutil.which(tool):
+            return cmd
+    return None
+
+
+def check_lsusb(p, opts):
+    # SteamVR's client library answers Steam's "is a headset connected?" by matching the drivers' USB ids with the
+    # lsusb command. Without it Steam cannot know the Rift is there before SteamVR runs.
+    title = "Steam's headset detection"
+    if shutil.which("lsusb"):
+        return result("lsusb", title, "ok", "lsusb is installed; Steam can tell that the Rift is connected.")
+    detail = ("The lsusb command (package usbutils) is missing. SteamVR's client library runs it to tell Steam that a "
+              "headset is connected, so without it Steam does not know the Rift is there before SteamVR runs.")
+    cmd = package_install_cmd("usbutils")
+    if cmd:
+        return result("lsusb", title, "fix", detail + " It will be installed.", None, "root", [cmd])
+    return result("lsusb", title, "error", detail + " Install the usbutils package with your package manager.")
+
+
 def udev_rules_text():
     return ("# Oculus Rift CV1: headset, sensors and the Touch controllers' radio (USB vendor 2833), for the user at\n"
             "# the machine (uaccess; no group needed). Installed by riftlinux-setup.\n"
             f'SUBSYSTEM=="usb", ATTRS{{idVendor}}=="{VENDOR}", MODE="0660", TAG+="uaccess"\n'
-            f'SUBSYSTEM=="hidraw", ATTRS{{idVendor}}=="{VENDOR}", MODE="0660", TAG+="uaccess"\n')
+            f'SUBSYSTEM=="hidraw", ATTRS{{idVendor}}=="{VENDOR}", MODE="0660", TAG+="uaccess"\n'
+            "# No USB autosuspend, also after the camera driver (uvcvideo) binds to a sensor.\n"
+            f'SUBSYSTEM=="usb", ENV{{DEVTYPE}}=="usb_device", ATTR{{idVendor}}=="{VENDOR}", ATTR{{power/control}}="on"\n'
+            f'ACTION=="bind", SUBSYSTEM=="usb", ENV{{DEVTYPE}}=="usb_interface", DRIVER=="uvcvideo", '
+            f'ATTRS{{idVendor}}=="{VENDOR}", RUN+="/bin/sh -c \'echo on > /sys%p/../power/control\'"\n')
 
 
 def check_access(p, opts):
@@ -572,6 +1099,23 @@ def check_access(p, opts):
         return result("access", "Device access", "ok", f"{len(devs)} USB devices and {len(hid)} HID interfaces usable.")
     return result("access", "Device access", "fix", "No access to " + ", ".join(missing) + ": udev rules needed.",
                   None, "root", udev_root_cmds(p))
+
+
+def check_usb_power(p, opts):
+    title = "USB power saving"
+    devs = usb_devices()
+    if not devs:
+        return result("usbpower", title, "info", "Plug in the Rift to check.")
+    auto = [d for d in devs if sysfs(d["sysfs"], "power/control") == "auto"]
+    if not auto:
+        return result("usbpower", title, "ok", "Off for the Rift's devices.")
+    # The package's udev rules switch it off for devices that appear after they are installed (and again after the
+    # camera driver binds to a sensor); these were set before, or by an older rule.
+    cmds = [f"sh -c 'echo on > {d['sysfs']}/power/control'" for d in auto]
+    return result("usbpower", title, "fix",
+                  ", ".join(sorted({d["name"] for d in auto})) + " may be suspended when idle (USB autosuspend); "
+                  "it will be switched off for them.",
+                  None, "root", cmds)
 
 
 def udev_root_cmds(p):
@@ -646,8 +1190,8 @@ def check_openxr(p, opts):
         return result("openxr", "OpenXR runtime", "fix",
                       "None set: OpenXR games (PLAY'A VR and others) would open on the monitor; SteamVR will be set.",
                       fix, "user")
-    # Another runtime (Monado service, WiVRn, ALVR...): the user's choice, changed only when asked.
-    if want == "steamvr":
+    # Another runtime (Monado service, WiVRn, ALVR...): the user's choice, changed only when asked (fix asks for it).
+    if want == "steamvr" or getattr(opts, "force", False):
         return result("openxr", "OpenXR runtime", "fix", f"{kind} ({target}) will be replaced by SteamVR.", fix, "user")
     return result("openxr", "OpenXR runtime", "warn",
                   f"Another runtime is active ({kind}: {target}); OpenXR games will not use SteamVR. "
@@ -702,7 +1246,8 @@ def direct_mode_state(p):
     """(the driver's manifest lets it drive the display, settings.json's display.direct_mode). The setting is on
     unless it says false, as the driver reads it; the package's manifest always says yes, off is the setting alone."""
     m = read_json(p.manifest) or {}
-    s = read_json(p.settings) or {}
+    s = read_json(p.settings)
+    s = s if isinstance(s, dict) else {}
     v = s.get("display", {}).get("direct_mode")
     return bool(m.get("redirectsDisplay")), v is not False and v != 0
 
@@ -710,7 +1255,7 @@ def direct_mode_state(p):
 def set_direct_mode(p, on):
     """Direct mode on or off from SteamVR's next start: settings.json only. A driver folder of its own (a development
     build, not the package's copy) whose manifest does not let it drive the display gets that too when turned on."""
-    s = read_json(p.settings) or {}
+    s = load_settings(p)
     s.setdefault("display", {})["direct_mode"] = on
     write_json(p.settings, s)
     m = read_json(p.manifest) or {}
@@ -721,14 +1266,22 @@ def set_direct_mode(p, on):
 
 
 def check_settings(p, opts):
-    s = read_json(p.settings)
+    try:
+        s = load_settings(p) if os.path.exists(p.settings) else None
+    except BadSettings as e:
+        known, when = last_known(p)
+        return result("settings", "RiftLinux settings", "error",
+                      f"{e}: nothing is saved into it, and "
+                      + (f"the last good settings (from {when}) are used; fix it by hand, or put them back with "
+                         "riftlinux-setup fix last-known." if known is not None else
+                         "every RiftLinux setting is at its default; fix it by hand, or start over with riftlinux-setup "
+                         "fix last-known (the file is kept)."))
     want = getattr(opts, "direct_mode", None)
     man, sett = direct_mode_state(p) if os.path.exists(p.manifest) else (False, False)
-    if s is None and os.path.exists(p.settings):
-        return result("settings", "RiftLinux settings", "error", f"{p.settings} is not valid JSON; fix or move it.")
     if s is None and want not in ("on", "off"):
         return result("settings", "RiftLinux settings", "ok",
-                      "No settings yet: the defaults (notices on, direct mode on); the Rift tab writes them.")
+                      "No settings yet: the defaults (notices on, direct mode on, SteamVR starts when the Rift is put "
+                      "on, Steam's menu closes once a game shows); the Rift tab writes them.")
     if sett and not man:
         return result("settings", "RiftLinux settings", "warn",
                       f"Direct mode is on in the settings, but the driver's manifest ({p.manifest}) does not let it drive "
@@ -737,7 +1290,20 @@ def check_settings(p, opts):
     if want in ("on", "off") and (want == "on") != sett:
         return result("settings", "RiftLinux settings", "fix", f"Direct mode {want}.", lambda: set_direct_mode(p, want == "on"),
                       "user")
-    return result("settings", "RiftLinux settings", "ok", f"Direct mode {'on' if sett else 'off'}; {p.settings}.")
+    problems = settings_problems(s or {})
+    return result("settings", "RiftLinux settings", "warn" if problems else "ok",
+                  ("; ".join(problems) + ". " if problems else "") +
+                  f"Direct mode {'on' if sett else 'off'}; SteamVR starts by itself: "
+                  f"{autostart_text(s or {}) if autostart_on(s or {}) else 'off (riftlinux-setup autostart on)'}; "
+                  f"Steam's menu over a "
+                  f"starting game: {'closed' if game_menu_closed(s or {}) else 'kept (riftlinux-setup game-menu close)'}"
+                  f"; SteamVR's standby ends when the headset "
+                  f"{'moves or is worn' if standby_by_pick_up(s or {}) else 'is worn'}"
+                  f"; controllers sleep: "
+                  f"{'never' if controller_sleep_min(s or {}) is None else str(controller_sleep_min(s or {})) + ' min'}"
+                  f" after the headset is off; headset taken off: {not_worn_text(headset_settings(s or {}))}"
+                  f"; {motion_text(headset_settings(s or {}))}"
+                  f"; {p.settings}.")
 
 
 def check_display(p, opts):
@@ -873,9 +1439,329 @@ def check_native(p, opts):
     return result("native", title, "ok", f"{d}, every library found; start it with `riftlinux-runtime`")
 
 
-CHECKS = [check_arch, check_steam, check_package, check_registered, check_sandboxed, check_nvidia_vrr, check_enabled, check_devices, check_access, check_display,
-          check_priority, check_openxr, check_chaperone, check_settings, check_realtime, check_calibration, check_native]
-REPAIR = {"enabled", "priority", "room", "settings", "registered", "sandboxed"}
+# --------------------------------------------------------------------------------------------------------------------
+# What other setups leave behind that keeps games or the headset from SteamVR and this driver: variables that point
+# games at another runtime, the same in games' launch options, SteamVR itself forced onto Proton, programs still
+# holding the Rift's devices, a headset left in pairing mode.
+
+# Variables that take games or SteamVR elsewhere, and what they do then.
+ENV_OVERRIDES = {
+    "XR_RUNTIME_JSON": "OpenXR games use the runtime it names instead of SteamVR",
+    "VR_OVERRIDE": "OpenVR games load the runtime it names instead of SteamVR",
+    "VR_CONFIG_PATH": "SteamVR and games read their settings from another folder",
+    "VR_LOG_PATH": "SteamVR and games log to another folder",
+}
+# STEAM_RUNTIME=0 runs Steam's programs outside its runtime: SteamVR then misses libraries it brings.
+ENV_ONLY_IF = {"STEAM_RUNTIME": "0"}
+ENV_FILES = ["~/.config/environment.d/*.conf", "~/.profile", "~/.bash_profile", "~/.bash_login", "~/.bashrc",
+             "~/.zshenv", "~/.zprofile", "~/.zshrc", "~/.config/fish/config.fish", "~/.config/fish/conf.d/*.fish",
+             "~/.pam_environment", "~/.config/plasma-workspace/env/*.sh", "~/.xprofile", "~/.xsessionrc"]
+SYSTEM_ENV_FILES = ["/etc/environment", "/etc/environment.d/*.conf", "/etc/profile.d/*.sh"]
+
+
+def env_names():
+    return list(ENV_OVERRIDES) + list(ENV_ONLY_IF)
+
+
+def env_line_sets(line):
+    """The variable an environment or shell file's line sets, if one of ours (export X=, X=, set -gx X, setenv X)."""
+    s = line.strip()
+    if s.startswith("#"):
+        return None
+    for prefix in ("export ", "set -gx ", "set -x ", "setenv "):
+        if s.startswith(prefix):
+            s = s[len(prefix):].lstrip()
+            break
+    for name in env_names():
+        if s.startswith(name + "=") or s.startswith(name + " ") or s.startswith(name + "\t"):
+            value = s[len(name):].lstrip("= \t").strip("'\"")
+            if name in ENV_ONLY_IF and value != ENV_ONLY_IF[name]:
+                return None
+            return name
+    return None
+
+
+def process_env(pid):
+    try:
+        raw = open(f"/proc/{pid}/environ", "rb").read()
+    except OSError:
+        return {}
+    env = {}
+    for item in raw.split(b"\0"):
+        if b"=" in item:
+            k, v = item.split(b"=", 1)
+            env[k.decode(errors="replace")] = v.decode(errors="replace")
+    return env
+
+
+def check_env_overrides(p, opts):
+    title = "Variables that take games elsewhere"
+    pid = steam_process()
+    steam_env = process_env(pid) if pid else {}
+    live = [f"{k}={steam_env[k]}" for k in env_names() if k in steam_env and
+            (k not in ENV_ONLY_IF or steam_env[k] == ENV_ONLY_IF[k])]
+    files = []
+    for pattern in ENV_FILES:
+        for path in sorted(glob.glob(os.path.expanduser(pattern))):
+            try:
+                lines = open(path, errors="replace").read().splitlines()
+            except OSError:
+                continue
+            hits = [(i, env_line_sets(l)) for i, l in enumerate(lines)]
+            hits = [(i, name) for i, name in hits if name]
+            if hits:
+                files.append((path, hits))
+    system = []
+    for pattern in SYSTEM_ENV_FILES:
+        for path in sorted(glob.glob(pattern)):
+            try:
+                if any(env_line_sets(l) for l in open(path, errors="replace")):
+                    system.append(path)
+            except OSError:
+                pass
+    if not live and not files and not system:
+        return result("env", title, "ok", "None set (XR_RUNTIME_JSON, VR_OVERRIDE, VR_CONFIG_PATH, VR_LOG_PATH).")
+    detail = []
+    if live:
+        detail.append("Steam runs with " + ", ".join(live) + " (" +
+                      "; ".join(ENV_OVERRIDES.get(v.split("=")[0], "Steam's programs run outside its runtime")
+                                for v in live) + ")")
+    for path, hits in files:
+        detail.append(f"{path} sets " + ", ".join(sorted({n for _, n in hits})))
+    if system:
+        detail.append("system files set them too (root, remove by hand): " + ", ".join(system))
+    if live and not files and not system:
+        detail.append("set by how Steam was started (a launcher, script or desktop entry): start it from the "
+                      "desktop's own Steam entry")
+
+    def fix():
+        for path, hits in files:
+            lines = open(path, errors="replace").read().splitlines(keepends=True)
+            for i, _ in hits:
+                lines[i] = "# (riftlinux-setup) " + lines[i]
+            write_text(path, "".join(lines))
+
+    if not files:
+        return result("env", title, "warn", "; ".join(detail) + ".")
+    return result("env", title, "fix", "; ".join(detail) + ". Their lines in your files will be commented out "
+                  "(log out and back in afterwards).", fix, "user")
+
+
+def steam_config_vdf(p):
+    for root in p.steam_roots():
+        path = os.path.join(root, "config", "config.vdf")
+        if os.path.exists(path):
+            return path
+    return None
+
+
+def localconfig_files(p):
+    found = []
+    for root in p.steam_roots():
+        found += glob.glob(os.path.join(root, "userdata", "*", "config", "localconfig.vdf"))
+    seen, out = set(), []
+    for f in found:
+        if os.path.realpath(f) not in seen:
+            seen.add(os.path.realpath(f))
+            out.append(f)
+    return out
+
+
+def strip_overrides(options):
+    """Launch options without the variables of ENV_OVERRIDES (NAME=value, NAME="a b"), the rest as it was."""
+    import re
+    pattern = r'(?<![\w])(?:' + "|".join(ENV_OVERRIDES) + r')=(?:"[^"]*"|\'[^\']*\'|\S*)\s*'
+    return re.sub(pattern, "", options).strip()
+
+
+def check_launch_options(p, opts):
+    title = "Games' launch options"
+    found = []
+    for path in localconfig_files(p):
+        try:
+            d = vdf_load(open(path, errors="replace").read())
+        except (OSError, RecursionError):
+            continue
+        apps = vdf_get(d, "UserLocalConfigStore", "Software", "Valve", "Steam", "apps") or {}
+        for app_id, app in apps.items():
+            options = app.get("LaunchOptions") if isinstance(app, dict) else None
+            if options and strip_overrides(options) != options.strip():
+                found.append((path, app_id, options))
+    if not found:
+        return result("launchopts", title, "ok", "None point games at another VR runtime.")
+    names = ", ".join(sorted({f"app {a} ({o})" for _, a, o in found}))
+    detail = f"{names}: those variables take the game away from SteamVR"
+    if steam_process():
+        return result("launchopts", title, "warn", detail + ". Close Steam and run this again to change them (Steam "
+                      "writes its settings back as it quits).")
+
+    def fix():
+        for path in sorted({f for f, _, _ in found}):
+            d = vdf_load(open(path, errors="replace").read())
+            apps = vdf_get(d, "UserLocalConfigStore", "Software", "Valve", "Steam", "apps") or {}
+            for app_id, app in apps.items():
+                if isinstance(app, dict) and app.get("LaunchOptions"):
+                    app["LaunchOptions"] = strip_overrides(app["LaunchOptions"])
+            write_text(path, vdf_dump(d))
+
+    return result("launchopts", title, "fix", detail + "; they will be removed from the launch options (the rest "
+                  "stays).", fix, "user")
+
+
+def check_steamvr_tool(p, opts):
+    """SteamVR is a Linux program run in Steam's own runtime: a compatibility tool forced on it (Proton) runs the
+    Windows SteamVR instead, which has no Linux drivers."""
+    title = "SteamVR's compatibility tool"
+    path = steam_config_vdf(p)
+    mapping = None
+    if path:
+        try:
+            d = vdf_load(open(path, errors="replace").read())
+            mapping = vdf_get(d, "InstallConfigStore", "Software", "Valve", "Steam", "CompatToolMapping", "250820")
+        except (OSError, RecursionError):
+            mapping = None
+    tool = (mapping or {}).get("name") if isinstance(mapping, dict) else None
+    if not tool:
+        return result("steamvr-tool", title, "ok", "None forced (SteamVR runs as a Linux program).")
+    detail = (f"Steam is told to run SteamVR with \"{tool}\" (SteamVR, Properties, Compatibility), which runs the "
+              "Windows SteamVR without this driver")
+    if steam_process():
+        return result("steamvr-tool", title, "warn", detail + ". Close Steam and run this again, or untick it there.")
+
+    def fix():
+        d2 = vdf_load(open(path, errors="replace").read())
+        m2 = vdf_get(d2, "InstallConfigStore", "Software", "Valve", "Steam", "CompatToolMapping") or {}
+        for k in [k for k in m2 if k == "250820"]:
+            del m2[k]
+        write_text(path, vdf_dump(d2))
+
+    return result("steamvr-tool", title, "fix", detail + "; it will be removed.", fix, "user")
+
+
+# Programs that may hold the Rift's devices: SteamVR and RiftLinux's own runtime while they run, and Steam (the
+# watchdog that starts SteamVR reads the headset). Other VR services left running keep the devices from the driver.
+OTHER_VR_SERVICES = {"monado-service": "Monado", "wivrn-server": "WiVRn", "ouvrtd": "ouvrt", "ouvrt": "ouvrt",
+                     "alvr_dashboard": "ALVR", "envision": "Envision", "survive-cli": "libsurvive"}
+
+
+def rift_nodes():
+    nodes = {h["node"] for h in hidraw_nodes()} | {d["node"] for d in usb_devices() if d["node"]}
+    try:
+        for n in os.listdir("/sys/class/video4linux"):
+            d = os.path.realpath(os.path.join("/sys/class/video4linux", n, "device"))
+            while d and d != "/":
+                if sysfs(d, "idVendor") == VENDOR:
+                    nodes.add("/dev/" + n)
+                    break
+                d = os.path.dirname(d)
+    except OSError:
+        pass
+    return nodes
+
+
+def rift_holders():
+    """(pid, name, exe, nodes) for this user's processes with the Rift's devices open, but SteamVR, Steam and this
+    package's own programs."""
+    nodes = rift_nodes()
+    out = []
+    if not nodes:
+        return out
+    uid = os.getuid()
+    for pid in os.listdir("/proc"):
+        if not pid.isdigit() or int(pid) == os.getpid():
+            continue
+        try:
+            if os.stat(f"/proc/{pid}").st_uid != uid:
+                continue
+            comm = open(f"/proc/{pid}/comm").read().strip()
+            exe = os.path.realpath(f"/proc/{pid}/exe")
+            held = set()
+            for fd in os.listdir(f"/proc/{pid}/fd"):
+                try:
+                    target = os.readlink(f"/proc/{pid}/fd/{fd}")
+                except OSError:
+                    continue
+                if target in nodes:
+                    held.add(target)
+        except OSError:
+            continue
+        if not held:
+            continue
+        ours = "/riftlinux/" in exe or exe.startswith(NATIVE_DIR) or os.path.basename(exe).startswith("riftlinux")
+        if comm in ("steam", "vrserver", "vrcompositor") or "/SteamVR/" in exe or ours:
+            continue
+        out.append((int(pid), comm, exe, sorted(held)))
+    return out
+
+
+def check_holders(p, opts):
+    title = "Other programs using the Rift"
+    holders = rift_holders()
+    if not holders:
+        return result("holders", title, "ok", "None (only SteamVR, Steam and RiftLinux use it).")
+    services = [h for h in holders if h[1] in OTHER_VR_SERVICES]
+    others = [h for h in holders if h[1] not in OTHER_VR_SERVICES]
+    detail = "; ".join(f"{OTHER_VR_SERVICES.get(c, c)} ({c}, pid {pid}) has {', '.join(n)} open"
+                       for pid, c, _, n in holders)
+    if others:
+        detail += "; close the programs named above (a camera app can hold a sensor)"
+
+    def fix():
+        import signal
+        import time
+        for pid, _, _, _ in services:
+            try:
+                os.kill(pid, signal.SIGTERM)
+            except OSError:
+                pass
+        time.sleep(2.0)
+
+    if services:
+        return result("holders", title, "fix", detail + ". The other VR services will be stopped.", fix, "user")
+    return result("holders", title, "warn", detail + ".")
+
+
+def check_headset_mode(p, opts):
+    """A headset restarted into the radio's pairing mode (an interrupted pairing) reports no tracking until it is
+    restarted into normal mode; SteamVR then sees a headset that never moves."""
+    title = "Headset mode"
+    if not any(d["product"] == "0031" for d in usb_devices()):
+        return result("headset", title, "info", "Plug in the Rift to check.")
+    node = cv1_hidraw(0)
+    if node is None:
+        return result("headset", title, "error",
+                      "The headset is on USB but the kernel made no HID interface for it (its HID driver usbhid is "
+                      "not bound: blacklisted, or claimed by another driver). Unplug it and plug it in again; if that "
+                      "does not help, `dmesg | grep -i 2833` says why.")
+    if busy_runtime():
+        return result("headset", title, "info", "In use by SteamVR or the runtime now (checked when they are closed).")
+    try:
+        fd = os.open(node, os.O_RDWR)
+    except OSError as e:
+        return result("headset", title, "info", f"{node} not opened ({e.strerror}): see Device access.")
+    try:
+        mode = boot_mode(fd)
+    except OSError:
+        os.close(fd)
+        return result("headset", title, "info", "Its mode could not be read.")
+    if mode == 0:
+        os.close(fd)
+        return result("headset", title, "ok", "Normal (not in pairing mode).")
+
+    def fix():
+        restart_headset(os.open(node, os.O_RDWR), 0)
+
+    os.close(fd)
+    return result("headset", title, "fix", f"Left in pairing mode (boot mode {mode}), so it reports no tracking; it "
+                  "will be restarted into normal mode.", fix, "user")
+
+
+CHECKS = [check_arch, check_steam, check_package, check_registered, check_other_drivers, check_sandboxed, check_nvidia_vrr, check_enabled, check_devices,
+          check_lsusb, check_access, check_usb_power, check_holders, check_headset_mode, check_display, check_priority,
+          check_openvr_runtime, check_steamvr_launch, check_steamvr_tool, check_env_overrides, check_launch_options,
+          check_leaked_handles, check_watchdog_loaded, check_openxr, check_chaperone,
+          check_settings, check_realtime, check_calibration, check_native]
+REPAIR = {"enabled", "priority", "room", "settings", "registered", "others", "sandboxed", "usbpower", "lsusb", "launch"}
 
 
 # --------------------------------------------------------------------------------------------------------------------
@@ -961,6 +1847,87 @@ def cmd_fix(p, opts, only=None):
     return 0
 
 
+def cmd_fix_last_known(p, opts):
+    """riftlinux-setup fix last-known: a settings.json that cannot be used is moved aside (kept) and the last good one
+    put back; without one, riftlinux-setup fix runs after the move. One question (none with --yes)."""
+    try:
+        load_settings(p)
+        print(f"{p.settings} can be used: nothing to put back.")
+        return 0
+    except BadSettings as e:
+        problem = str(e)
+    known, when = last_known(p)
+    aside = f"{p.settings}.broken-{STAMP}"
+    print(f"{problem}.")
+    if known is not None:
+        print(f"It is kept as {aside}, and the last good settings (from {when}) are put back; most of them apply "
+              "from the next start of SteamVR or the runtime.")
+    else:
+        print(f"There are no last good settings: it is kept as {aside}, the settings start from the defaults, and "
+              "riftlinux-setup fix then checks the rest (it asks before it changes anything).")
+    if not ask(opts, "\nGo ahead?"):
+        print("Nothing changed.")
+        return 1
+    os.replace(p.settings, aside)
+    if known is not None:
+        shutil.copy2(last_known_path(p), p.settings)
+        print(f"Done: {p.settings} is the last good one again; the broken one is {aside}.")
+        return 0
+    print(f"Done: the broken file is {aside}; the settings are at their defaults.\n")
+    return cmd_force(p, opts)
+
+
+def cmd_force(p, opts):
+    """riftlinux-setup fix: the configuration RiftLinux is tested with, all of it in one go: SteamVR's OpenXR and OpenVR
+    runtimes, this driver as SteamVR's only headset driver, SteamVR's settings, direct mode, the devices' rules and
+    power, and what other setups left behind. One question for everything (none with --yes)."""
+    opts.force = True
+    opts.openxr = "steamvr"
+    opts.direct_mode = "on"
+    if steamvr_busy():
+        print("Close SteamVR first (it writes its settings back as it quits), then run this again.")
+        return 1
+    results = [c(p, opts) for c in CHECKS]
+    if any(r["state"] == "error" and r["id"] in ("steam", "package") for r in results):
+        report(results, opts.json)
+        print("\nFix the errors above first.")
+        return 2
+    todo = [r for r in results if (r["fix"] or r["root_cmds"]) and r["state"] in ("fix", "warn")]
+    by_hand = [r for r in results if r["state"] in ("warn", "error") and r not in todo]
+    if not todo:
+        report(results, opts.json)
+        if by_hand:
+            print("\nNothing this tool can change; still to do (above): " + ", ".join(r["title"] for r in by_hand) + ".")
+            return 1
+        print("\nNothing to change: this computer has the configuration RiftLinux is tested with.")
+        return 0
+    print("These will be changed (every file is kept as <file>.bak-riftlinux-" + STAMP + "; nothing is deleted):")
+    for r in todo:
+        print(f"  - {r['title']}: {r['detail']}" + (" (needs root)" if r["root_cmds"] and not r["fix"] else ""))
+    if not ask(opts, "\nChange all of them?"):
+        print("Nothing changed.")
+        return 1
+    root = []
+    for r in todo:
+        if r["fix"]:
+            r["fix"]()
+            print(f"  done: {r['title']}")
+        else:
+            root += r["root_cmds"]
+    if root:
+        run_root(root, opts)
+    print("\nAfter the changes:")
+    after = [c(p, opts) for c in CHECKS]
+    report(after, False)
+    left = [r for r in after if r["state"] in ("warn", "error", "fix")]
+    if left:
+        print("\nStill to do (above): " + ", ".join(r["title"] for r in left) + ".")
+    if any(r["id"] in ("env",) for r in todo):
+        print("Log out and back in for the changed login files to count.")
+    print("Then start Steam from the desktop and put the headset on (SteamVR starts).")
+    return 0 if not left else 1
+
+
 def cmd_direct(p, opts):
     if opts.mode == "status":
         man, sett = direct_mode_state(p)
@@ -974,7 +1941,7 @@ def cmd_direct(p, opts):
 
 def cmd_record(p, opts):
     """settings.json diagnostics.record: SteamVR's sessions recorded (from its next start) for a bug report."""
-    s = read_json(p.settings) or {}
+    s = load_settings(p)
     diag = s.get("diagnostics") if isinstance(s.get("diagnostics"), dict) else {}
     where = os.path.join(XDG_CACHE, "riftlinux")
     if opts.mode == "status":
@@ -1002,6 +1969,432 @@ def cmd_record(p, opts):
               "record off")
     else:
         print("Recording off, from SteamVR's next start; recordings already made stay until you delete them.")
+    return 0
+
+
+def autostart_on(s):
+    """settings.json steamvr.start_when_put_on, read as the watchdog reads it: on unless set to false."""
+    steamvr = s.get("steamvr") if isinstance(s.get("steamvr"), dict) else {}
+    return steamvr.get("start_when_put_on", True) is not False
+
+
+def autostart_settings(s):
+    """(on, picked up too, quits again when not put on), as the watchdog and the driver read them."""
+    steamvr = s.get("steamvr") if isinstance(s.get("steamvr"), dict) else {}
+    return (steamvr.get("start_when_put_on", True) is not False, steamvr.get("start_on_pick_up", True) is not False,
+            steamvr.get("quit_if_not_put_on", True) is not False)
+
+
+def autostart_text(s):
+    on, pick_up, quit_unused = autostart_settings(s)
+    if not on:
+        return "off"
+    if not pick_up:
+        return "on, when the Rift is put on"
+    return ("on, when the Rift is put on or picked up; " +
+            ("quits again when it is not put on" if quit_unused else "runs on when it is not put on"))
+
+
+def cmd_autostart(p, opts):
+    """settings.json steamvr.start_when_put_on, start_on_pick_up, quit_if_not_put_on: the driver's watchdog in Steam
+    starts SteamVR when the Rift is put on or picked up (it reads them every second); a SteamVR a pick-up started
+    quits again when the Rift is not put on (read at SteamVR's start)."""
+    s = load_settings(p)
+    if opts.mode == "status":
+        print(f"SteamVR starts by itself: {autostart_text(s)}")
+        return 0
+    want = {"trigger": ("put-on", "pick-up"), "quit-unused": ("on", "off")}.get(opts.mode)
+    if want and opts.value not in want:
+        print(f"riftlinux-setup autostart {opts.mode} {'|'.join(want)}")
+        return 2
+    steamvr = s.get("steamvr") if isinstance(s.get("steamvr"), dict) else {}
+    if opts.mode == "trigger":
+        if opts.value == "pick-up":
+            steamvr.pop("start_on_pick_up", None)
+        else:
+            steamvr["start_on_pick_up"] = False
+    elif opts.mode == "quit-unused":
+        if opts.value == "on":
+            steamvr.pop("quit_if_not_put_on", None)
+        else:
+            steamvr["quit_if_not_put_on"] = False
+    elif opts.mode == "on":
+        steamvr.pop("start_when_put_on", None)
+    else:
+        steamvr["start_when_put_on"] = False
+    if steamvr:
+        s["steamvr"] = steamvr
+    else:
+        s.pop("steamvr", None)
+    write_json(p.settings, s)
+    if opts.mode == "trigger":
+        print("Putting the Rift on starts SteamVR; picking it up does not." if opts.value == "put-on" else
+              "Putting the Rift on or picking it up starts SteamVR.")
+        if opts.value == "put-on" and (s.get("headset") or {}).get("wear_sensor") is False:
+            print("The wear sensor is off (riftlinux-setup wear-sensor on): until it is on, picking the Rift up still "
+                  "starts SteamVR.")
+    elif opts.mode == "quit-unused":
+        print("A SteamVR started by picking the Rift up quits again when it is not put on (from SteamVR's next start)."
+              if opts.value == "on" else
+              "A SteamVR started by picking the Rift up runs on until you quit it (from SteamVR's next start).")
+    elif opts.mode == "on":
+        print("On: Steam starts SteamVR when the Rift is put on or picked up (while Steam runs).")
+    else:
+        print("Off: SteamVR starts only when you start it or a game; RiftLinux's own runtime can use the headset "
+              "without SteamVR starting.")
+    return 0
+
+
+def controller_sleep_min(s):
+    """settings.json controllers.sleep_after_min: minutes, 5 by default; negative: never (None)."""
+    c = s.get("controllers") if isinstance(s.get("controllers"), dict) else {}
+    v = c.get("sleep_after_min", 5)
+    return None if isinstance(v, (int, float)) and v < 0 else (int(v) if isinstance(v, (int, float)) else 5)
+
+
+def cmd_controller_sleep(p, opts):
+    """settings.json controllers.sleep_after_min: the driver keeps the Touch controllers awake while the headset is
+    worn and this many minutes after; then a controller drops to standby and a button wakes it."""
+    s = load_settings(p)
+    if opts.mode == "status":
+        m = controller_sleep_min(s)
+        print(f"The controllers may sleep {m} minutes after the headset is taken off" if m is not None else
+              "The controllers never sleep: kept awake while SteamVR runs")
+        return 0
+    c = s.get("controllers") if isinstance(s.get("controllers"), dict) else {}
+    if opts.mode == "5":
+        c.pop("sleep_after_min", None)
+    else:
+        c["sleep_after_min"] = -1 if opts.mode == "off" else int(opts.mode)
+    if c:
+        s["controllers"] = c
+    else:
+        s.pop("controllers", None)
+    write_json(p.settings, s)
+    if opts.mode == "off":
+        print("Off: the controllers stay awake while SteamVR runs, also with the headset taken off (their batteries "
+              "drain meanwhile); from the next start.")
+    else:
+        print(f"The controllers may sleep {opts.mode} minutes after the headset is taken off; a button wakes them "
+              "(from the next start).")
+    return 0
+
+
+def standby_by_pick_up(s):
+    """settings.json steamvr.standby, read as the driver reads it: "pick-up", else the wear sensor ("worn")."""
+    steamvr = s.get("steamvr") if isinstance(s.get("steamvr"), dict) else {}
+    return steamvr.get("standby") == "pick-up"
+
+
+def cmd_standby(p, opts):
+    """settings.json steamvr.standby: SteamVR's standby by the headset being worn (default) or also by its movement,
+    SteamVR's own rule; read at SteamVR's start."""
+    s = load_settings(p)
+    if opts.mode == "status":
+        when = ("moves (SteamVR's own rule: picked up, or moved where it lies) or is worn" if standby_by_pick_up(s)
+                else "is worn")
+        print(f"SteamVR's standby ends when the headset {when}.")
+        return 0
+    steamvr = s.get("steamvr") if isinstance(s.get("steamvr"), dict) else {}
+    if opts.mode == "worn":
+        steamvr.pop("standby", None)
+    else:
+        steamvr["standby"] = "pick-up"
+    if steamvr:
+        s["steamvr"] = steamvr
+    else:
+        s.pop("steamvr", None)
+    write_json(p.settings, s)
+    if opts.mode == "worn":
+        print("Worn: SteamVR's standby ends when the headset is worn; moving it where it lies does not wake SteamVR "
+              "(from SteamVR's next start).")
+    else:
+        print("Pick-up: SteamVR's standby also ends when the headset moves, by SteamVR's own rule (picked up, or moved "
+              "where it lies, a bed someone moves on too); the picture stays black until it is worn (from SteamVR's "
+              "next start).")
+    return 0
+
+
+def game_menu_closed(s):
+    """settings.json steamvr.close_menu_for_games, read as the driver reads it: closed unless set to false."""
+    steamvr = s.get("steamvr") if isinstance(s.get("steamvr"), dict) else {}
+    return steamvr.get("close_menu_for_games", True) is not False
+
+
+def cmd_game_menu(p, opts):
+    """settings.json steamvr.close_menu_for_games: the driver closes Steam's menu, which Steam opens as a game starts,
+    once the game shows; read at SteamVR's start."""
+    s = load_settings(p)
+    if opts.mode == "status":
+        print("Steam's menu when a game starts: "
+              f"{'closed once the game shows' if game_menu_closed(s) else 'kept open'}")
+        return 0
+    steamvr = s.get("steamvr") if isinstance(s.get("steamvr"), dict) else {}
+    if opts.mode == "close":
+        steamvr.pop("close_menu_for_games", None)
+    else:
+        steamvr["close_menu_for_games"] = False
+    if steamvr:
+        s["steamvr"] = steamvr
+    else:
+        s.pop("steamvr", None)
+    write_json(p.settings, s)
+    if opts.mode == "close":
+        print("Closed: Steam's menu closes once a game shows in the headset (from SteamVR's next start).")
+    else:
+        print("Kept: Steam's menu stays open when a game starts; close it with the menu button (from SteamVR's next "
+              "start).")
+    return 0
+
+
+WEAR_DEFAULTS = {"worn_above": 30, "unworn_below": 15}
+
+
+def headset_settings(s):
+    return s.get("headset") if isinstance(s.get("headset"), dict) else {}
+
+
+def save_headset_settings(p, s, headset):
+    if headset:
+        s["headset"] = headset
+    else:
+        s.pop("headset", None)
+    write_json(p.settings, s)
+
+
+def wear_test(p, seconds=20):
+    """The headset's wear sensor read for a while (SteamVR and the own runtime closed), one line a second."""
+    import select
+    import time
+    busy = busy_runtime()
+    if busy:
+        print(f"{busy} is running and has the headset: close SteamVR (or the runtime) first.")
+        return 1
+    path = cv1_hidraw(0)
+    if not path:
+        print("No Rift CV1 headset found (plug it in, or no access yet: riftlinux-setup check).")
+        return 1
+    try:
+        fd = os.open(path, os.O_RDWR | os.O_NONBLOCK)
+    except OSError as e:
+        print(f"Cannot open {path}: {e.strerror} (riftlinux-setup check shows the device rules).")
+        return 1
+    s = load_settings(p)
+    h = headset_settings(s)
+    worn_above = h.get("worn_above", WEAR_DEFAULTS["worn_above"])
+    unworn_below = h.get("unworn_below", WEAR_DEFAULTS["unworn_below"])
+    print(f"Reading the wear sensor for {seconds} s: put the headset on, then take it off. Worn above {worn_above}, "
+          f"not worn below {unworn_below} (the display stays off meanwhile).")
+    keep_alive = bytes([0x11, 0x00, 0x00, 0x0B, 0x10, 0x27])  # the driver's: sensor reports for 10 s
+    lo_all, hi_all = None, None
+    try:
+        hid_set_feature(fd, keep_alive)
+        start = last_keep_alive = second_start = time.monotonic()
+        lo = hi = None
+        while time.monotonic() - start < seconds:
+            now = time.monotonic()
+            if now - last_keep_alive > 9.5:
+                hid_set_feature(fd, keep_alive)
+                last_keep_alive = now
+            if now - second_start >= 1.0:
+                if lo is not None:
+                    state = "worn" if hi > worn_above else "not worn" if hi < unworn_below else "in between"
+                    print(f"  {now - start:4.0f} s  wear sensor {lo}-{hi}  ({state})")
+                lo = hi = None
+                second_start = now
+            ready, _, _ = select.select([fd], [], [], 0.2)
+            if not ready:
+                continue
+            try:
+                buf = os.read(fd, 64)
+            except BlockingIOError:
+                continue
+            if len(buf) < 64 or buf[0] != 0x0B:
+                continue
+            wear = buf[44] | (buf[45] << 8)
+            lo = wear if lo is None else min(lo, wear)
+            hi = wear if hi is None else max(hi, wear)
+            lo_all = wear if lo_all is None else min(lo_all, wear)
+            hi_all = wear if hi_all is None else max(hi_all, wear)
+    finally:
+        os.close(fd)
+    if lo_all is not None:
+        print(f"Lowest {lo_all}, highest {hi_all}. Worn readings should be above the first level and readings off "
+              "the head below the second: riftlinux-setup wear-sensor levels <worn above> <not worn below>, or "
+              "riftlinux-setup wear-sensor off.")
+    return 0
+
+
+
+def cmd_wear_sensor(p, opts):
+    """settings.json "headset": wear_sensor, worn_above, unworn_below; read when SteamVR or the runtime starts."""
+    if opts.mode == "test":
+        return wear_test(p)
+    s = load_settings(p)
+    h = headset_settings(s)
+    if opts.mode == "status":
+        if h.get("wear_sensor", True) is False:
+            print("Wear sensor: off; the headset counts as worn whenever SteamVR or the runtime runs (the display "
+                  "stays on until you quit).")
+        else:
+            print(f"Wear sensor: on; worn above {h.get('worn_above', WEAR_DEFAULTS['worn_above'])}, not worn below "
+                  f"{h.get('unworn_below', WEAR_DEFAULTS['unworn_below'])}; {motion_text(h)}.")
+        off = h.get("display_off_after_s")
+        print("Headset taken off: " + ("the picture stays on" if isinstance(off, (int, float)) and off < 0 else
+                                        f"after {off if isinstance(off, (int, float)) else 5:g} s {not_worn_text(h)}")
+              + ".")
+        return 0
+    if opts.mode == "motion":
+        value = opts.values[0] if len(opts.values) == 1 else ""
+        if value in MOTION_LEVELS:
+            value = str(MOTION_LEVELS[value])
+        if value in ("on", "default"):
+            h.pop("worn_by_motion", None)
+            if value == "default":
+                h.pop("worn_by_motion_after_s", None)
+        elif value == "off":
+            h["worn_by_motion"] = False
+        else:
+            try:
+                seconds = int(value)
+            except ValueError:
+                seconds = 0
+            if not 1 <= seconds <= 60:
+                print("riftlinux-setup wear-sensor motion high|medium|low|<seconds, 1 to 60>|off|on|default")
+                return 2
+            h.pop("worn_by_motion", None)
+            h["worn_by_motion_after_s"] = seconds
+        save_headset_settings(p, s, h)
+        print(f"{motion_text(h)[0].upper()}{motion_text(h)[1:]}; from the next start of SteamVR or the runtime.")
+        return 0
+    if opts.mode == "levels":
+        if len(opts.values) == 1 and opts.values[0] == "default":
+            h.pop("worn_above", None)
+            h.pop("unworn_below", None)
+        else:
+            try:
+                worn_above, unworn_below = (int(v) for v in opts.values)
+            except ValueError:
+                print("riftlinux-setup wear-sensor levels <worn above> <not worn below> (for example 25 10), or "
+                      "levels default")
+                return 2
+            if not 0 <= unworn_below <= worn_above:
+                print("The 'not worn below' level has to be at most the 'worn above' level.")
+                return 2
+            h["worn_above"], h["unworn_below"] = worn_above, unworn_below
+        save_headset_settings(p, s, h)
+        print(f"Wear sensor levels: worn above {h.get('worn_above', WEAR_DEFAULTS['worn_above'])}, not worn below "
+              f"{h.get('unworn_below', WEAR_DEFAULTS['unworn_below'])}; from the next start of SteamVR or the runtime.")
+        return 0
+    if opts.mode == "on":
+        h.pop("wear_sensor", None)
+        save_headset_settings(p, s, h)
+        print("Wear sensor on (from the next start of SteamVR or the runtime): the display switches off when the "
+              "headset is taken off.")
+    else:
+        h["wear_sensor"] = False
+        save_headset_settings(p, s, h)
+        print("Wear sensor off (from the next start of SteamVR or the runtime): the headset counts as worn whenever "
+              "it runs, the display no longer switches off by itself and SteamVR does not go to standby. The OLED "
+              "panel stays lit while SteamVR runs: quit SteamVR when you take the headset off for longer.")
+    return 0
+
+
+MOTION_LEVELS = {"high": 8, "medium": 20, "low": 30}
+
+
+def motion_text(h):
+    """Whether moving as on a head counts as worn, from settings.json "headset" (worn_by_motion, _after_s)."""
+    if h.get("worn_by_motion", True) is False:
+        return "moving as on a head does not count as worn (the wear sensor alone)"
+    seconds = h.get("worn_by_motion_after_s", 20)
+    seconds = seconds if isinstance(seconds, (int, float)) else 20
+    level = next((f" ({name})" for name, s in MOTION_LEVELS.items() if s == seconds), "")
+    return f"moving as on a head counts as worn after {seconds:g} s{level}, for a face shield or pad"
+
+
+
+def not_worn_text(h):
+    """How a headset taken off is shown, from settings.json "headset" (not_worn, black_then_off_min)."""
+    if h.get("not_worn") == "off":
+        return "display switched off"
+    minutes = h.get("black_then_off_min", 10)
+    if isinstance(minutes, (int, float)) and minutes < 0:
+        return "black, never switched off"
+    return f"black, switched off after {minutes if isinstance(minutes, (int, float)) else 10:g} min black"
+
+
+def cmd_not_worn(p, opts):
+    """settings.json headset.not_worn ("black" or "off") and headset.black_then_off_min (minutes; negative never)."""
+    s = load_settings(p)
+    h = headset_settings(s)
+    if opts.mode == "status":
+        print(f"Headset taken off: {not_worn_text(h)}.")
+        return 0
+    if opts.mode == "default":
+        h.pop("not_worn", None)
+        h.pop("black_then_off_min", None)
+    elif opts.mode == "off":
+        h["not_worn"] = "off"
+        h.pop("black_then_off_min", None)
+    else:
+        h.pop("not_worn", None)
+        h.pop("black_then_off_min", None)
+        if opts.minutes == "never":
+            h["black_then_off_min"] = -1
+        elif opts.minutes is not None:
+            try:
+                minutes = int(opts.minutes)
+            except ValueError:
+                print("riftlinux-setup not-worn black [<minutes>|never]|off|default|status")
+                return 2
+            if minutes < 1:
+                print("At least 1 minute (or never).")
+                return 2
+            h["black_then_off_min"] = minutes
+    save_headset_settings(p, s, h)
+    print(f"Headset taken off: {not_worn_text(h)}; from the next start of SteamVR or the runtime.")
+    if h.get("not_worn") == "off":
+        print("Each take-off and put-on is a monitor unplugged and plugged for the desktop (GNOME 48 on NVIDIA kept "
+              "GPU memory each time); `riftlinux-setup not-worn black` avoids it.")
+    elif h.get("black_then_off_min") == -1:
+        print("The display stays on showing black while SteamVR runs; quit SteamVR when you are done.")
+    return 0
+
+
+def cmd_display_off(p, opts):
+    """settings.json headset.display_off_after_s: seconds not worn before the display switches off; negative never."""
+    s = load_settings(p)
+    h = headset_settings(s)
+    if opts.when == "status":
+        off = h.get("display_off_after_s")
+        print("Headset taken off: " + ("the picture stays on" if isinstance(off, (int, float)) and off < 0 else
+                                        f"after {off if isinstance(off, (int, float)) else 5:g} s {not_worn_text(h)}")
+              + ".")
+        return 0
+    if opts.when == "default":
+        h.pop("display_off_after_s", None)
+    elif opts.when == "never":
+        h["display_off_after_s"] = -1
+    else:
+        try:
+            seconds = float(opts.when)
+        except ValueError:
+            print("riftlinux-setup display-off <seconds>|never|default|status")
+            return 2
+        if seconds < 1:
+            print("At least 1 second (or never).")
+            return 2
+        h["display_off_after_s"] = seconds
+    save_headset_settings(p, s, h)
+    off = h.get("display_off_after_s")
+    if off is None:
+        print(f"Headset taken off: after 5 s (the default) {not_worn_text(h)}; from the next start.")
+    elif off < 0:
+        print("The picture stays on when the headset is taken off, from the next start: the OLED panel stays lit "
+              "while SteamVR runs (risk of burn-in on a still picture); quit SteamVR when you are done.")
+    else:
+        print(f"Headset taken off: after {off:g} s {not_worn_text(h)}; from the next start.")
     return 0
 
 
@@ -1567,21 +2960,46 @@ def main():
     ap.add_argument("--yes", action="store_true")
     ap.add_argument("--print-root", action="store_true")
     sub = ap.add_subparsers(dest="cmd", required=True)
-    sub.add_parser("check")
+    ck = sub.add_parser("check")
+    ck.add_argument("--json", action="store_true", default=argparse.SUPPRESS)
     i = sub.add_parser("install")
+    i.add_argument("--yes", action="store_true", default=argparse.SUPPRESS)
     i.add_argument("--openxr", choices=["steamvr", "keep"])
     i.add_argument("--direct-mode", choices=["on", "off"])
-    sub.add_parser("repair")
+    # --yes after the command too, as the usage shows it.
+    rp = sub.add_parser("repair")
+    rp.add_argument("--yes", action="store_true", default=argparse.SUPPRESS)
+    fx = sub.add_parser("fix")
+    fx.add_argument("what", nargs="?", choices=["last-known"])
+    fx.add_argument("--yes", action="store_true", default=argparse.SUPPRESS)
     d = sub.add_parser("direct-mode")
     d.add_argument("mode", choices=["on", "off", "status"])
     nv = sub.add_parser("nvidia-vrr")
     nv.add_argument("action", choices=["status", "conceal", "restore"])
-    sub.add_parser("uninstall")
+    un = sub.add_parser("uninstall")
+    un.add_argument("--yes", action="store_true", default=argparse.SUPPRESS)
     rg = sub.add_parser("register")
     rg.add_argument("--quiet", action="store_true")
     sub.add_parser("recalibrate")
     rc = sub.add_parser("record")
     rc.add_argument("mode", choices=["on", "off", "status"])
+    au = sub.add_parser("autostart")
+    au.add_argument("mode", choices=["on", "off", "status", "trigger", "quit-unused"])
+    au.add_argument("value", nargs="?")
+    cs = sub.add_parser("controller-sleep")
+    cs.add_argument("mode", choices=["3", "5", "7", "off", "status"])
+    sb = sub.add_parser("standby")
+    sb.add_argument("mode", choices=["worn", "pick-up", "status"])
+    gm = sub.add_parser("game-menu")
+    gm.add_argument("mode", choices=["close", "keep", "status"])
+    ws = sub.add_parser("wear-sensor")
+    ws.add_argument("mode", choices=["on", "off", "status", "test", "levels", "motion"])
+    ws.add_argument("values", nargs="*")
+    do = sub.add_parser("display-off")
+    do.add_argument("when")
+    nw = sub.add_parser("not-worn")
+    nw.add_argument("mode", choices=["black", "off", "default", "status"])
+    nw.add_argument("minutes", nargs="?")
     pp = sub.add_parser("pair")
     pp.add_argument("--timeout", type=int, default=90)
     opts = ap.parse_args()
@@ -1592,6 +3010,8 @@ def main():
         return cmd_fix(p, opts)
     if opts.cmd == "repair":
         return cmd_fix(p, opts, REPAIR)
+    if opts.cmd == "fix":
+        return cmd_fix_last_known(p, opts) if opts.what == "last-known" else cmd_force(p, opts)
     if opts.cmd == "direct-mode":
         return cmd_direct(p, opts)
     if opts.cmd == "register":
@@ -1604,8 +3024,27 @@ def main():
         return cmd_pair(p, opts)
     if opts.cmd == "record":
         return cmd_record(p, opts)
+    if opts.cmd == "autostart":
+        return cmd_autostart(p, opts)
+    if opts.cmd == "controller-sleep":
+        return cmd_controller_sleep(p, opts)
+    if opts.cmd == "standby":
+        return cmd_standby(p, opts)
+    if opts.cmd == "game-menu":
+        return cmd_game_menu(p, opts)
+    if opts.cmd == "wear-sensor":
+        return cmd_wear_sensor(p, opts)
+    if opts.cmd == "display-off":
+        return cmd_display_off(p, opts)
+    if opts.cmd == "not-worn":
+        return cmd_not_worn(p, opts)
     return cmd_uninstall(p, opts)
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    try:
+        sys.exit(main())
+    except BadSettings as e:
+        print(f"{e}; the settings were not changed. Fix it by hand, or put the last good settings back with "
+              "riftlinux-setup fix last-known.", file=sys.stderr)
+        sys.exit(2)

@@ -31,8 +31,8 @@ A report we can act on has these parts:
    - the SteamVR version, and how many sensors, on which USB ports (USB 2 or 3).
 4. **The output of `riftlinux-setup --json check`**: it shows the state of everything the driver depends on.
 5. **SteamVR's logs** from the session with the problem: `~/.local/share/Steam/logs/vrserver.txt` (the driver's
-   lines start with `driver_monado`) and, for picture problems, `vrcompositor.txt`. Attach them or paste the part
-   around the problem.
+   lines start with `monado:`), the driver's own log `~/.steam/steam/logs/vrstartup-linux.txt` and, for picture
+   problems, `vrcompositor.txt`. Attach them or paste the part around the problem.
 6. **What you already tried** (optional, but it saves a round trip).
 
 The logs contain the serial numbers of your headset and sensors and your user name in file paths. That is fine to

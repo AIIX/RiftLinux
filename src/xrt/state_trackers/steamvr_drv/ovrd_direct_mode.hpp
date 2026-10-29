@@ -85,6 +85,20 @@ private:
 	void
 	destroy_set_locked(Set *set);
 	void
+	submit_frame(std::vector<std::array<SubmitLayerPerEye_t, 2>> layers, int fence, int64_t entered_ns, bool sync_given);
+
+	//! The frame Present took, handed to Monado in PostPresent (m_present_split).
+	struct PendingFrame
+	{
+		std::vector<std::array<SubmitLayerPerEye_t, 2>> layers;
+		int fence = -1;
+		int64_t entered_ns = 0;
+		bool sync_given = false;
+		bool valid = false;
+	};
+	PendingFrame m_pending;
+	int64_t m_no_post_present = 0;
+	void
 	acquire_locked(Set *set);
 
 	struct xrt_compositor_native *m_xcn;
@@ -146,6 +160,38 @@ public:
 	int m_hdr_test = 0;
 	//! Players' HDR descriptions used (display.hdr_players); off: kept but not put on their layers.
 	std::atomic<bool> m_players_hdr{true};
+	/*!
+	 * Monado waits for the GPU fences of SteamVR's images before it reads them, where the images carry any (they
+	 * are dma-bufs: AMD, Intel); display.direct_mode_fence. On every GPU the guard (m_guard_ms) also holds a frame
+	 * back from Monado that long after SteamVR presented it: NVIDIA's shared memory carries no fences, and SteamVR's
+	 * compositor's own drawing only placeholder ones.
+	 */
+	bool m_fence = true;
+	//! Present only takes the frame, PostPresent hands it to Monado (display.direct_mode_present_split); false: both
+	//! in Present.
+	bool m_present_split = true;
+	//! SteamVR entered standby (it presents about ten times a second without layers, or not at all); the next frame
+	//! with layers ends it.
+	void
+	enter_standby()
+	{
+		m_standby.store(true);
+	}
+	/*!
+	 * Whether SteamVR's compositor stopped presenting outside standby: it presented once and not for @p after_ns, or
+	 * its own set was made and nothing came for that long. Its GPU device lost (a GPU fault) leaves it running
+	 * without presenting, and SteamVR never starts it again.
+	 */
+	bool
+	compositor_stopped(int64_t now_ns, int64_t after_ns) const
+	{
+		if (m_standby.load()) {
+			return false;
+		}
+		const int64_t last = m_present_seen_ns.load();
+		const int64_t since = last != 0 ? last : m_compositor_set_ns.load();
+		return since != 0 && now_ns - since > after_ns;
+	}
 
 private:
 	void
@@ -198,6 +244,16 @@ private:
 	int64_t m_throttled = 0;
 	uint32_t m_throttle_max = 0;
 	uint32_t m_predict_max = 0;
+	//! When SteamVR last presented, entered standby, made its compositor's set (compositor_stopped).
+	std::atomic<int64_t> m_present_seen_ns{0};
+	std::atomic<bool> m_standby{false};
+	std::atomic<int64_t> m_compositor_set_ns{0};
+	//! Per 10 s: the longest Present, wait for Monado's frame, wait for an image to render into, present to commit.
+	int64_t m_present_max_ns = 0, m_submit_max_ns = 0, m_wait_max_ns = 0, m_acquire_max_ns = 0,
+	        m_commit_after_max_ns = 0;
+	//! Whether SteamVR's images give GPU fences (-1 not tried yet); frames handed over with a fence, held by the guard.
+	int m_fences_work = -1;
+	int64_t m_fenced = 0, m_guard_held = 0;
 	//! The HDR test chart's swapchain, made at the first frame.
 	struct xrt_swapchain *m_hdr_test_xsc = nullptr;
 	uint32_t m_hdr_test_w = 0, m_hdr_test_h = 0;

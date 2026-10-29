@@ -242,6 +242,7 @@ process_payload(struct uvc_fs *stream, unsigned char *payload, size_t len)
 		// This packet carries image data and was counted already: what came before it was the gap.
 		stream->gap_packets = stream->packets_since_frame - 1;
 		stream->gap_data_packets = stream->data_packets_since_frame - 1;
+		stream->gap_failed_packets = stream->failed_packets_since_frame;
 
 		if (stream->cur_frame == NULL) {
 			if (stream->skip_frame_start == 0) {
@@ -328,16 +329,19 @@ process_payload(struct uvc_fs *stream, unsigned char *payload, size_t len)
 		                                     now_ns - stream->last_frame_ns > 250 * U_TIME_1MS_IN_NS)) {
 			UVC_WARN(stream,
 			         "UVC device %u: images again after %.1f s (%" PRIu64 " packets in between, %" PRIu64
-			         " with image data)",
+			         " with image data, %" PRIu64 " failed)",
 			         libusb_get_device_address(libusb_get_device(stream->devh)),
-			         time_ns_to_s(now_ns - stream->last_frame_ns), stream->gap_packets, stream->gap_data_packets);
+			         time_ns_to_s(now_ns - stream->last_frame_ns), stream->gap_packets, stream->gap_data_packets,
+			         stream->gap_failed_packets);
 			stream->stall_logged_ns = 0;
 		}
 		stream->last_frame_ns = now_ns;
 		stream->packets_since_frame = 0;
 		stream->data_packets_since_frame = 0;
+		stream->failed_packets_since_frame = 0;
 		stream->gap_packets = 0;
 		stream->gap_data_packets = 0;
+		stream->gap_failed_packets = 0;
 		if (stream->sink) {
 			xrt_sink_push_frame(stream->sink, stream->cur_frame);
 		}
@@ -362,9 +366,11 @@ uvc_fs_check_stall(struct xrt_fs *fs)
 	    now_ns - stream->last_frame_ns <= U_TIME_1S_IN_NS) {
 		return;
 	}
-	UVC_WARN(stream, "UVC device %u: no image for %.1f s (%" PRIu64 " packets since, %" PRIu64 " with image data)",
+	UVC_WARN(stream,
+	         "UVC device %u: no image for %.1f s (%" PRIu64 " packets since, %" PRIu64 " with image data, %" PRIu64
+	         " failed)",
 	         libusb_get_device_address(libusb_get_device(stream->devh)), time_ns_to_s(now_ns - stream->last_frame_ns),
-	         stream->packets_since_frame, stream->data_packets_since_frame);
+	         stream->packets_since_frame, stream->data_packets_since_frame, stream->failed_packets_since_frame);
 	stream->stall_logged_ns = now_ns;
 }
 
@@ -408,6 +414,9 @@ iso_transfer_cb(struct libusb_transfer *transfer)
 		stream->packets_since_frame++;
 		if (payload_len > 12) {
 			stream->data_packets_since_frame++;
+		}
+		if (transfer->iso_packet_desc[i].status != LIBUSB_TRANSFER_COMPLETED) {
+			stream->failed_packets_since_frame++;
 		}
 		process_payload(stream, payload, payload_len);
 	}
@@ -549,8 +558,10 @@ uvc_fs_stream_start(struct xrt_fs *xfs,
 	stream->stall_logged_ns = 0;
 	stream->packets_since_frame = 0;
 	stream->data_packets_since_frame = 0;
+	stream->failed_packets_since_frame = 0;
 	stream->gap_packets = 0;
 	stream->gap_data_packets = 0;
+	stream->gap_failed_packets = 0;
 
 	// Allocate frames and put on the free list
 	stream->alloced_frames = calloc(min_frames, sizeof(struct xrt_frame));
@@ -726,6 +737,16 @@ uvc_fs_create(libusb_context *usb_ctx,
 	size_t num_packets = (stream->frame_size + packet_size - 1) / packet_size;
 	stream->num_transfers = (num_packets + 31) / 32;
 	num_packets = num_packets / stream->num_transfers;
+	/*
+	 * At least 160 packets in flight (20 ms of microframes, as the kernel's own UVC driver queues: 5 of 32): a CV1
+	 * sensor's frame took 3 transfers of 25, 9.4 ms, and one thread serves every sensor, so a delay of that thread over
+	 * 6 ms cut a piece out of both sensors' frames at once (157 times in a ten-hour session). More transfers add memory,
+	 * not delay: each still completes after its own packets.
+	 */
+	const size_t min_queued_packets = 160;
+	if (stream->num_transfers * num_packets < min_queued_packets) {
+		stream->num_transfers = (min_queued_packets + num_packets - 1) / num_packets;
+	}
 
 	stream->transfer = malloc(stream->num_transfers * sizeof(*stream->transfer));
 	if (!stream->transfer) {

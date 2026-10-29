@@ -85,7 +85,7 @@ Version: $VER
 Architecture: amd64
 Maintainer: Aditya Mehra <aix.m@outlook.com>
 Installed-Size: $SIZE
-Depends: python3, libc6 (>= 2.30), libudev1, libusb-1.0-0, libdbus-1-3, libvulkan1, libdrm2, libx11-6, libx11-xcb1,
+Depends: python3, usbutils, libc6 (>= 2.30), libudev1, libusb-1.0-0, libdbus-1-3, libvulkan1, libdrm2, libx11-6, libx11-xcb1,
  libxcb1, libxcb-randr0, libwayland-client0, libsdl2-2.0-0, libglx0
 Recommends: rtkit, libcap2-bin, libnotify-bin
 Section: misc
@@ -129,6 +129,8 @@ echo "RiftLinux installed. Plug in the Rift and start SteamVR from Steam."
 MISSING=$(ldd /usr/lib/riftlinux/native/monado-service /usr/lib/riftlinux/native/libopenxr_monado.so 2>/dev/null |
 	awk '/not found/ {print $1}' | sort -u | tr '\n' ' ')
 [ -z "$MISSING" ] || echo "For riftlinux-runtime (OpenXR without SteamVR), install your distribution's packages for: $MISSING"
+# SteamVR's client library tells Steam that a headset is connected by running lsusb.
+command -v lsusb >/dev/null 2>&1 || echo "Install the usbutils package (the lsusb command): Steam uses it to notice the Rift before SteamVR runs."
 INST
 cat > "$T/uninstall.sh" <<'UNIN'
 #!/bin/sh
@@ -176,7 +178,7 @@ pkgdesc="Oculus Rift CV1 driver for Linux (SteamVR and OpenXR): tracking, Touch,
 arch=('x86_64')
 url="$URL"
 license=('BSL-1.0')
-depends=('python' 'rtkit' 'glibc' 'systemd-libs' 'libusb' 'dbus' 'vulkan-icd-loader' 'libdrm' 'libx11' 'libxcb' 'wayland'
+depends=('python' 'usbutils' 'rtkit' 'glibc' 'systemd-libs' 'libusb' 'dbus' 'vulkan-icd-loader' 'libdrm' 'libx11' 'libxcb' 'wayland'
 	'sdl2' 'libglvnd')
 optdepends=('steam: SteamVR runs the driver' 'libnotify: notifications from the RiftLinux Runtime app entry')
 install=riftlinux.install
@@ -219,6 +221,7 @@ BuildArch:      x86_64
 # runtime's (riftlinux-runtime) are listed by library name, valid on Fedora and openSUSE alike.
 AutoReqProv:    no
 Requires:       python3
+Requires:       usbutils
 Requires:       libudev.so.1()(64bit) libusb-1.0.so.0()(64bit) libdbus-1.so.3()(64bit) libvulkan.so.1()(64bit)
 Requires:       libdrm.so.2()(64bit) libX11.so.6()(64bit) libX11-xcb.so.1()(64bit) libxcb.so.1()(64bit)
 Requires:       libxcb-randr.so.0()(64bit) libwayland-client.so.0()(64bit) libSDL2-2.0.so.0()(64bit) libGLX.so.0()(64bit)

@@ -30,7 +30,7 @@ SITE_DESCRIPTION = ("RiftLinux, the open-source Linux driver for the Oculus Rift
 # full title is for search results and its own heading).
 MENU = {"getting-started.md": "Getting started", "rift-tab.md": "Rift tab", "sensors.md": "Sensors",
         "controllers.md": "Controllers", "picture.md": "Picture", "openxr-without-steamvr.md": "OpenXR",
-        "troubleshooting.md": "Troubleshooting", "faq.md": "FAQ"}
+        "settings.md": "Settings", "troubleshooting.md": "Troubleshooting", "faq.md": "FAQ"}
 # The theme's header with the menu's labels from each page's "nav" (the theme shows titles, too long for a menu).
 HEADER = """<header class="site-header" role="banner">
   <div class="wrapper">

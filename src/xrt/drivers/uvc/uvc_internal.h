@@ -95,7 +95,10 @@ struct uvc_fs
 	timepoint_ns stall_logged_ns;
 	uint64_t packets_since_frame;
 	uint64_t data_packets_since_frame;
+	//! Of those, the packets the host controller marked failed (an empty packet is not a failed one).
+	uint64_t failed_packets_since_frame;
 	//! The counts above as the frame being collected started: what came in between, without that frame.
 	uint64_t gap_packets;
 	uint64_t gap_data_packets;
+	uint64_t gap_failed_packets;
 };

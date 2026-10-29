@@ -25,6 +25,7 @@
 #include "math/m_space.h"
 
 #include "util/u_misc.h"
+#include "util/u_notice.h"
 #include "util/u_trace_marker.h"
 #include "util/u_distortion_mesh.h"
 #include "util/u_sink.h"
@@ -135,6 +136,13 @@ struct comp_renderer
 	struct comp_settings *settings;
 
 	struct comp_mirror_to_debug_gui mirror_to_debug_gui;
+
+	/*!
+	 * RiftLinux: this frame shows the headset pure black, no layers (the headset not worn, its driver asked:
+	 * u_notice_display_black_requested), and whether the last frame presented did.
+	 */
+	bool black;
+	bool black_shown;
 
 	//! @}
 
@@ -1033,7 +1041,7 @@ dispatch_graphics(struct comp_renderer *r,
 
 	// Basics
 	const struct comp_layer *layers = c->base.layer_accum.layers;
-	uint32_t layer_count = c->base.layer_accum.layer_count;
+	uint32_t layer_count = r->black ? 0 : c->base.layer_accum.layer_count;
 
 	// Resources for the distortion render target.
 	struct render_gfx_target_resources *rtr = &r->rtr_array[r->acquired_buffer];
@@ -1105,7 +1113,7 @@ dispatch_compute(struct comp_renderer *r,
 
 	// Basics
 	const struct comp_layer *layers = c->base.layer_accum.layers;
-	uint32_t layer_count = c->base.layer_accum.layer_count;
+	uint32_t layer_count = r->black ? 0 : c->base.layer_accum.layer_count;
 
 	// Device view information.
 	struct xrt_fov fovs[XRT_MAX_VIEWS];
@@ -1208,7 +1216,9 @@ comp_renderer_draw(struct comp_renderer *r)
 	const uint32_t view_count = c->nr.view_count;
 	enum comp_target_fov_source fov_source = COMP_TARGET_FOV_SOURCE_DISTORTION;
 
-	bool fast_path = c->base.frame_params.one_projection_layer_fast_path;
+	// Pure black while the headset's driver asks for it: no layers, so no lens or panel processing either.
+	r->black = u_notice_display_black_requested();
+	bool fast_path = !r->black && c->base.frame_params.one_projection_layer_fast_path;
 	bool do_timewarp = !c->debug.atw_off;
 
 	// Consistency check.
@@ -1274,6 +1284,11 @@ comp_renderer_draw(struct comp_renderer *r)
 
 	bool present_success = renderer_present_swapchain_image(r, c->frame.rendering.desired_present_time_ns,
 	                                                        c->frame.rendering.present_slop_ns);
+	if (present_success && r->black != r->black_shown) {
+		r->black_shown = r->black;
+		u_notice_set_display_black(r->black);
+		COMP_INFO(c, "Headset %s", r->black ? "black (not worn)" : "showing the picture again");
+	}
 
 	// Save for timestamps below.
 	uint64_t frame_id = c->frame.rendering.id;

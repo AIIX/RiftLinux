@@ -13,7 +13,8 @@
 # libudev, D-Bus, Vulkan, X11, xcb, Wayland, libdrm, SDL2, zlib) stays dynamic.
 #
 # Usage: steamrt-build.sh <out dir>        (run on the build machine, with Docker; the fork is this script's ../..)
-# Result: <out dir>/package/rift-cv1-steamvr/ (driver.vrdrivermanifest, bin/linux64/driver_monado.so, resources/)
+# Result: <out dir>/package/rift-cv1-steamvr/ (driver.vrdrivermanifest, bin/linux64/driver_monado.so, the 32-bit
+#         watchdog bin/linux32/driver_monado.so, resources/)
 #         <out dir>/package/rift-cv1-native/  (monado-service, libopenxr_monado.so, openxr_riftlinux.json)
 set -e
 OUT=$(realpath -m "${1:?out dir}")
@@ -103,12 +104,22 @@ cmake -S /src -B /out/build -G Ninja -U "*WAYLAND_PROTOCOLS*" -U "JPEG_*" -U "*S
 	-DXRT_BUILD_DRIVER_ULV5=OFF -DXRT_BUILD_DRIVER_VF=OFF -DXRT_BUILD_DRIVER_VIVE=OFF \
 	-DXRT_BUILD_DRIVER_WMR=OFF -DXRT_BUILD_DRIVER_XREAL_AIR=OFF
 cmake --build /out/build -j$J --target driver_monado monado-service openxr_monado
+
+# The watchdog for Steam, which is 32-bit on Linux and loads it from bin/linux32/ while SteamVR is not running: one
+# file, the C++ library linked in (Steam brings its own, of an unknown version).
+mkdir -p /out/build/watchdog32
+g++ -m32 -std=c++17 -O2 -fPIC -shared -fvisibility=hidden -Wall -Wextra -Werror -pthread \
+	-static-libstdc++ -static-libgcc -Wl,--no-undefined \
+	-isystem /src/src/external/openvr_includes -I/src/src/xrt/state_trackers/steamvr_drv -I/src/src/xrt/auxiliary \
+	/src/src/xrt/targets/steamvr_drv/riftlinux_watchdog32.cpp -o /out/build/watchdog32/driver_monado.so
 '
 
 PKG="$OUT/package/rift-cv1-steamvr"
 rm -rf "$PKG"
 mkdir -p "$PKG"
 cp -r "$OUT/build/steamvr-monado/." "$PKG/"
+mkdir -p "$PKG/bin/linux32" && cp "$OUT/build/watchdog32/driver_monado.so" "$PKG/bin/linux32/"
+strip --strip-unneeded "$PKG/bin/linux32/driver_monado.so"
 # The setup tool and udev rules travel with the driver.
 cp "$SRC/scripts/riftlinux/riftlinux-setup" "$PKG/" && mkdir -p "$PKG/udev" && cp "$SRC/scripts/riftlinux/udev/70-rift-cv1.rules" "$PKG/udev/"
 strip --strip-unneeded "$PKG/bin/linux64/driver_monado.so"

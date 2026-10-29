@@ -18,16 +18,16 @@ replacement or second-hand controller has to be paired once:
 1. **Close SteamVR** (the headset restarts into pairing mode, which SteamVR must not hold).
 2. Run `riftlinux-setup pair` in a terminal.
 3. On the controller, **hold the Oculus button and Y** (left controller) **or B** (right controller) until its light
-   blinks.
+   blinks. On the Oculus Remote, **hold its back button**.
 4. The tool says when the controller is paired. Pair one controller at a time; run the tool again for the next.
 
 The headset goes back to normal by itself afterwards. Pairing follows the same steps as the Oculus software (checked
-against USB captures of it on Windows), and has been tested with both Touch controllers. The **Oculus Remote** uses
-the same pairing, but it has not been tested yet.
+against USB captures of it on Windows), and has been tested with both Touch controllers and the **Oculus Remote**.
 
 ## Waking a controller
 
-Controllers sleep when they lie still. Press any button to wake one. If one does not show up after you put the
+Controllers go to sleep five minutes after you take the headset off. Press any button to wake one. The minutes are a
+setting: [Settings](settings.md#when-the-controllers-go-to-sleep). If one does not show up after you put the
 headset on, a notice says which: press a button on it, or check its battery.
 
 ## Batteries

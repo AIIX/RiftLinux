@@ -12,21 +12,24 @@ Key facts:
   Constellation sensors, or three for room scale (tested; the headband's rear LEDs tracked); x86-64 Linux; Vulkan
   graphics (tested on NVIDIA; AMD and Intel expected to work, not yet tested).
 - Install: download the package from https://github.com/AIIX/RiftLinux/releases (.deb for Debian/Ubuntu/Mint/Pop!_OS,
-  pacman package for Arch/CachyOS/EndeavourOS/Manjaro, .rpm for Fedora, tarball for others), install it, plug in the
-  Rift, start SteamVR from Steam. The package registers the SteamVR driver for every user by itself.
+  pacman package for Arch/CachyOS/EndeavourOS/Manjaro, .rpm for Fedora, tarball for others), install it, restart
+  Steam once, plug in the Rift and put it on: SteamVR starts (with Steam running). The package registers the SteamVR
+  driver for every user by itself.
 - First start: put the headset on, face the sensors and slowly turn the head left and right, then up and down, until
   the measuring notice goes away; then press the right Oculus button and use "Set floor" in the Rift tab.
 - Tracking: Touch controllers tracked optically from every sensor; scored on the Oculus runtime's own camera frames,
   within 1-2 points of the Oculus runtime per movement. Sensors are measured from movement and placed again
   automatically when moved or knocked.
-- Pairing Touch controllers without Windows: `riftlinux-setup pair` (SteamVR closed; hold Oculus + Y or Oculus + B).
+- Pairing Touch controllers and the Oculus Remote without Windows: `riftlinux-setup pair` (SteamVR closed; hold
+  Oculus + Y or Oculus + B, on the Remote its back button).
 - Without SteamVR: RiftLinux's own OpenXR runtime: `riftlinux-run <program>`, the app menu entry "RiftLinux Runtime",
   or right-click "Run with the Rift" (KDE) / "Open With, RiftLinux Runtime" (GNOME).
 - Picture: CV1 lens distortion, true 1:1 render size, Auto-HDR, HDR games and video, motion smoothing like Oculus'
   ASW 1.0 (direct mode, the default in SteamVR).
 - Desktops: X11 and Wayland (GNOME and KDE Plasma tested; on Wayland the headset is leased from the desktop).
 - Help: `riftlinux-setup check` diagnoses an installation; `riftlinux-setup repair` fixes SteamVR's safe-mode block and
-  similar.
+  similar; `riftlinux-setup fix` puts the tested configuration in place in one go (SteamVR as the OpenXR and OpenVR
+  runtime, other headset drivers and runtime overrides from earlier setups switched off).
 - Compared with other options (October 2026): upstream Monado's CV1 driver is in no release yet and tracks the Touch
   controllers by rotation only; OpenHMD's CV1 position tracking is experimental and its controllers jitter with more
   than one sensor; ALVR and WiVRn stream to standalone headsets and do not drive a CV1.
@@ -46,9 +49,10 @@ Website (the user guide): https://aiix.github.io/RiftLinux/
 - [The Rift tab](https://github.com/AIIX/RiftLinux/blob/main/docs/rift-tab.md): the Oculus button menu and its settings
 - [The picture](https://github.com/AIIX/RiftLinux/blob/main/docs/picture.md): direct mode, Auto-HDR, HDR, motion smoothing
 - [OpenXR without SteamVR](https://github.com/AIIX/RiftLinux/blob/main/docs/openxr-without-steamvr.md): RiftLinux's own runtime, WayVR
+- [Settings](https://github.com/AIIX/RiftLinux/blob/main/docs/settings.md): SteamVR starting when the headset is put on, SteamVR's standby, Steam's menu when a game starts, the wear sensor (face shields, pads), the headset taken off, a settings file broken by hand
 
 ## Optional
 
 - [Packaging](https://github.com/AIIX/RiftLinux/blob/main/doc/riftlinux/PACKAGING.md): for distribution packagers
-- [Release notes 0.1.0](https://github.com/AIIX/RiftLinux/blob/main/doc/riftlinux/releases/0.1.0.md)
+- [Release notes 0.1.3](https://github.com/AIIX/RiftLinux/blob/main/doc/riftlinux/releases/0.1.3.md)
 - [Contributing](https://github.com/AIIX/RiftLinux/blob/main/CONTRIBUTING.md)

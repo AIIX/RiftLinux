@@ -867,6 +867,8 @@ struct rift_touch_controller
 		bool configured;
 		//! When its active timeout was last sent.
 		timepoint_ns keepalive_ns;
+		//! Its active timeout no longer sent again (the headset not in use): left to drop to standby.
+		bool keepalive_paused;
 		//! No report for over 1.5 s (logged on change, a diagnostic).
 		bool silent;
 	} radio_data;
@@ -1123,8 +1125,25 @@ struct rift_hmd
 
 	//! Worn: by the wear sensor, or moving as a head does (rift_head_motion_update); what the display and apps follow.
 	bool presence;
+	//! When it was last worn, or the driver's start: the Touch controllers are kept awake until a while after
+	//! (rift_radio_handle_config). Written by the reports' thread, read by the radio's.
+	timepoint_ns worn_last_ns;
 	//! CV1: worn by the wear sensor alone; what the tracker is told (the back strap is measured only while worn).
 	bool presence_sensor;
+
+	//! CV1: how the wear sensor is read (RIFT_WEAR_* options, from settings.json "headset"), set at creation.
+	struct
+	{
+		//! False: the headset counts as worn whenever it runs.
+		bool use_sensor;
+		//! Worn above this reading, not worn below the second; in between the last state stays.
+		int worn_above;
+		int unworn_below;
+		//! Moving as on a head counts as worn.
+		bool by_motion;
+		//! For that, seconds of moving as on a head first (picked up and held, a headset moves alike for a while).
+		int by_motion_after_s;
+	} wear;
 
 	/*!
 	 * CV1: whether the headset moves as one on a head does, from the gyro: the means of its 50 ms blocks over a
@@ -1144,7 +1163,15 @@ struct rift_hmd
 		struct xrt_vec3 accel_sum;
 		uint32_t accel_count;
 		//! The last windows, newest in bit 0: whether each moved as a head does.
-		uint16_t history;
+		uint64_t history;
+		//! The same, for windows that also turned (RIFT_HEAD_MOTION_TURN_DEG): what starts it.
+		uint64_t turning;
+		//! The gyro's own orientation, and its value at the end of the last windows (a ring, newest at turn_next - 1).
+		struct xrt_quat rot;
+		int64_t rot_ns;
+		struct xrt_quat turn_ring[10];
+		uint32_t turn_next;
+		uint32_t turn_count;
 		//! Moving like a head until then.
 		int64_t moving_until_ns;
 		bool logged;
@@ -1158,6 +1185,10 @@ struct rift_hmd
 	timepoint_ns display_power_failed_ns;
 	//! CV1: the panel stays on until then, worn or not, so a compositor starting up finds the display.
 	timepoint_ns display_on_until_ns;
+	//! CV1, headset.not_worn "black": when the compositor was asked for a black picture (0: not asked), and whether
+	//! the black display was logged.
+	timepoint_ns black_asked_ns;
+	bool black_logged;
 
 	bool imu_needs_calibration;
 	struct rift_imu_calibration imu_calibration;
@@ -1329,8 +1360,13 @@ rift_touch_stick_axis(uint16_t raw, const uint16_t range[2], const uint16_t dead
  * Worn sticks rest past their factory dead zone: a right Touch's at rest read +0.02 steadily, and a game that walks
  * you where you look, with no dead zone of its own, walked you slowly on. So a round dead zone on top: zero below
  * RIFT_TOUCH_STICK_DEAD_ZONE, then from zero at its edge to one at full push.
+ *
+ * Worn sticks also stop short of their factory range: a left Touch pushed fully right reached 0.95 at most (0.82-0.95
+ * over eleven pushes; left 0.98), and a game's snap turn missed two of ten pushes right. So the last
+ * RIFT_TOUCH_STICK_OUTER_ZONE of the range counts as fully pushed.
  */
 #define RIFT_TOUCH_STICK_DEAD_ZONE 0.10f
+#define RIFT_TOUCH_STICK_OUTER_ZONE 0.08f
 
 static inline struct xrt_vec2
 rift_touch_stick_dead_zone(struct xrt_vec2 stick)
@@ -1340,7 +1376,9 @@ rift_touch_stick_dead_zone(struct xrt_vec2 stick)
 	if (length <= RIFT_TOUCH_STICK_DEAD_ZONE) {
 		return out;
 	}
-	const float scaled = fminf((length - RIFT_TOUCH_STICK_DEAD_ZONE) / (1.0f - RIFT_TOUCH_STICK_DEAD_ZONE), 1.0f);
+	const float scaled = fminf((length - RIFT_TOUCH_STICK_DEAD_ZONE) /
+	                               (1.0f - RIFT_TOUCH_STICK_DEAD_ZONE - RIFT_TOUCH_STICK_OUTER_ZONE),
+	                           1.0f);
 	out.x = stick.x / length * scaled;
 	out.y = stick.y / length * scaled;
 	return out;

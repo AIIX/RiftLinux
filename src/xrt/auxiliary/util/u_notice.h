@@ -113,6 +113,39 @@ bool
 u_notice_get_recalibration(struct u_notice_recalibration *out_result);
 
 
+/*!
+ * The headset's display dark at once, whatever the wear sensor says (RiftLinux: the process ends without the driver's
+ * own shutdown, SteamVR's having stuck: no frozen picture left lit on the panel). Any thread; the headset's driver
+ * acts on it at its next report.
+ */
+void
+u_notice_request_display_off(void);
+
+//! Whether u_notice_request_display_off was called.
+bool
+u_notice_display_off_requested(void);
+
+/*!
+ * The headset's picture black while it is not worn (RiftLinux, headset.not_worn "black"): its driver asks, the compositor
+ * driving the headset's display shows pure black (no layers, no lens or panel processing) and says so. The display stays
+ * switched on: switched off, the CV1 leaves HDMI, and the desktop rebuilds its monitors at every unplug and plug (GNOME
+ * 48 on NVIDIA kept about 210 MiB of GPU memory each time). Any thread.
+ */
+void
+u_notice_request_display_black(bool black);
+
+//! Whether the headset's driver wants the picture black (u_notice_request_display_black).
+bool
+u_notice_display_black_requested(void);
+
+//! The compositor: it shows the headset black now, or the picture again.
+void
+u_notice_set_display_black(bool black);
+
+//! Whether a compositor shows the headset black.
+bool
+u_notice_display_black(void);
+
 #ifdef __cplusplus
 }
 #endif

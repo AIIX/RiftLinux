@@ -13,6 +13,7 @@
 #include "math/m_space.h"
 #include "math/m_vec3.h"
 
+#include "util/u_debug.h"
 #include "util/u_device.h"
 #include "util/u_var.h"
 #include "util/u_file.h"
@@ -1955,6 +1956,14 @@ rift_radio_handle_haptics(struct rift_hmd *hmd)
 #define RIFT_RADIO_SYNC_PERIOD_US 19200
 //! How often the Oculus runtime re-sends a Touch controller's active timeout.
 #define RIFT_TOUCH_KEEPALIVE_NS (30LL * U_TIME_1S_IN_NS)
+/*!
+ * The active timeout is sent again only while the headset is worn or was within this many minutes (settings.json
+ * "controllers": {"sleep_after_min"}: 3, 5 or 7; negative, all session long). Sent all session long, the controllers
+ * never dropped to standby: in a ten-hour SteamVR session with the headset lying unworn both drained their batteries
+ * to nothing (the left 96 % to 0 in six hours, the right 85 % in three). Not sent, a controller drops to standby after
+ * its active timeout (60 s) and a button wakes it; worn again, each is set up again from the start.
+ */
+DEBUG_GET_ONCE_NUM_OPTION(rift_touch_sleep_after_min, "RIFT_TOUCH_SLEEP_AFTER_MIN", 5)
 
 static void
 rift_radio_queue_config(struct rift_hmd *hmd, uint8_t a, uint8_t b, uint8_t c, const uint8_t *data, uint8_t length)
@@ -2016,6 +2025,30 @@ rift_radio_handle_config(struct rift_hmd *hmd)
 
 		const uint8_t type = (uint8_t)controller->device_type;
 		const uint8_t active_timeout_s[] = {60};
+		const int64_t sleep_after_min = debug_get_num_option_rift_touch_sleep_after_min();
+		const int64_t awake_ns = (sleep_after_min < 1 ? 1 : sleep_after_min > 60 ? 60 : sleep_after_min) * 60LL *
+		                         U_TIME_1S_IN_NS;
+		const bool in_use = sleep_after_min < 0 ||
+		                    now - __atomic_load_n(&hmd->worn_last_ns, __ATOMIC_RELAXED) <= awake_ns;
+		static bool told_setting = false;
+		if (!told_setting && sleep_after_min != 5) {
+			told_setting = true;
+			if (sleep_after_min < 0) {
+				HMD_WARN(hmd, "Touch controllers (settings): kept awake all session.");
+			} else {
+				HMD_WARN(hmd, "Touch controllers (settings): asleep %d minutes after the headset is taken off.",
+				         (int)(awake_ns / (60LL * U_TIME_1S_IN_NS)));
+			}
+		}
+		if (!in_use && controller->radio_data.configured && !controller->radio_data.keepalive_paused) {
+			controller->radio_data.keepalive_paused = true;
+			HMD_INFO(hmd, "Touch controller %d: the headset lay unworn for %d minutes, the controller may sleep.",
+			         type, (int)(awake_ns / (60LL * U_TIME_1S_IN_NS)));
+		} else if (in_use && controller->radio_data.keepalive_paused) {
+			controller->radio_data.keepalive_paused = false;
+			controller->radio_data.configured = false;
+			HMD_INFO(hmd, "Touch controller %d: the headset in use again.", type);
+		}
 		if (!controller->radio_data.configured) {
 			const uint8_t power_active[] = {0x02};
 			const uint8_t standby_timeout_min[] = {10080 & 0xff, 10080 >> 8};
@@ -2030,7 +2063,8 @@ rift_radio_handle_config(struct rift_hmd *hmd)
 			controller->radio_data.configured = true;
 			controller->radio_data.keepalive_ns = now;
 			HMD_INFO(hmd, "Setting up Touch controller %d: active mode, timeouts.", type);
-		} else if (now - controller->radio_data.keepalive_ns > RIFT_TOUCH_KEEPALIVE_NS) {
+		} else if (!controller->radio_data.keepalive_paused &&
+		           now - controller->radio_data.keepalive_ns > RIFT_TOUCH_KEEPALIVE_NS) {
 			rift_radio_queue_config(hmd, 0x02, 0x18, type, active_timeout_s, sizeof(active_timeout_s));
 			controller->radio_data.keepalive_ns = now;
 		}

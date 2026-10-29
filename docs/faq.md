@@ -63,8 +63,10 @@ firmware in years).
 
 ## Can I play SteamVR games with a Rift CV1 on Linux?
 
-Yes. Install the package, start SteamVR from Steam, and play: Linux VR games, Windows VR games through Proton, and
-OpenXR games through SteamVR. Tested with SteamVR Home, No Man's Sky VR, VTOL VR, PLAY'A VR and Bigscreen.
+Yes. Install the package, restart Steam once, put the headset on (SteamVR starts), and play: Linux VR games, Windows VR
+games through Proton, and OpenXR games through SteamVR. Tested with SteamVR Home, No Man's Sky VR, VTOL VR, VRChat,
+Beat Saber, PLAY'A VR and Bigscreen. Start a game once SteamVR runs: one started from Steam while SteamVR is not
+running opens on the monitor.
 
 ## Can I use OpenXR applications without SteamVR?
 
@@ -105,8 +107,9 @@ every other GPU.
 
 ## Can I pair a new Touch controller on Linux?
 
-Yes: close SteamVR, run `riftlinux-setup pair`, and hold the Oculus button and Y (left) or B (right). Tested with both
-Touch controllers; the Oculus Remote is not tested yet. See [Touch controllers and pairing](controllers.md).
+Yes: close SteamVR, run `riftlinux-setup pair`, and hold the Oculus button and Y (left) or B (right); on the Oculus
+Remote, its back button. Tested with both Touch controllers and the Oculus Remote. See
+[Touch controllers and pairing](controllers.md).
 
 ## Can I use room scale?
 

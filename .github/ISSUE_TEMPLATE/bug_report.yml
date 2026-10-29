@@ -29,7 +29,7 @@ body:
     attributes:
       label: RiftLinux version
       description: "`cat /usr/lib/riftlinux/steamvr/rift-cv1/VERSION`"
-      placeholder: e.g. 0.1.0+git20261018.abcdef123
+      placeholder: e.g. 0.1.3
     validations:
       required: true
 
@@ -111,7 +111,7 @@ body:
     attributes:
       label: SteamVR's log (required)
       description: |
-        From the session with the problem: `~/.local/share/Steam/logs/vrserver.txt` (the driver's lines start with `driver_monado`); for picture problems also `vrcompositor.txt`. Attach the files or paste the part around the problem. They contain your headset's serial numbers and your user name in paths; remove anything you prefer to keep private.
+        From the session with the problem: `~/.local/share/Steam/logs/vrserver.txt` (the driver's lines start with `monado:`) and the driver's own log `~/.steam/steam/logs/vrstartup-linux.txt`; for picture problems also `vrcompositor.txt`. Attach the files or paste the part around the problem. They contain your headset's serial numbers and your user name in paths; remove anything you prefer to keep private.
       render: text
     validations:
       required: true

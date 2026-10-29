@@ -68,5 +68,7 @@ is not in RiftLinux yet.
 ## The panel itself
 
 - Brightness and persistence (how long each row is lit) are set as the Oculus runtime sets them.
-- The display switches off when you take the headset off (OLED burn-in) and on again at once when you put it on. The
-  light on the front is white while it is on, orange while it is off.
+- When you take the headset off its picture goes black, and the display stays on and connected, so the desktop does
+  not see a monitor unplugged; after a while black (10 minutes, a setting) it switches off (OLED burn-in). The
+  picture is back at once when you put it on. The light on the front is white while the display is on, orange while
+  it is off. [Settings](settings.md#when-the-headset-is-taken-off) has the choices.

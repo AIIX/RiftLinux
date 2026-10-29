@@ -317,17 +317,18 @@ apply_picture(struct rl_panel *p)
 void
 apply_floor(struct rl_panel *p, const cJSON *root)
 {
+	// Within reach of a room, as the SteamVR driver takes them (a file edited by hand may hold any number).
 	const cJSON *floor = rl::settings::item(root, "tracking", "floor_m");
-	const float raise = (float)rl::settings::number(root, "tracking", "height_cm", 0.0) / 100.0f;
+	const float raise =
+	    (float)std::clamp(rl::settings::number(root, "tracking", "height_cm", 0.0), -100.0, 100.0) / 100.0f;
 	p->floor_known = cJSON_IsNumber(floor);
-	p->floor_m = p->floor_known ? (float)floor->valuedouble : 0.0f;
+	p->floor_m = p->floor_known ? (float)std::clamp(floor->valuedouble, -3.0, 3.0) : 0.0f;
 	const cJSON *eye = rl::settings::item(root, "tracking", "eye_height_m");
 	if (cJSON_IsNumber(eye)) {
-		p->keeper.set_saved_eye((float)eye->valuedouble);
+		p->keeper.set_saved_eye((float)std::clamp(eye->valuedouble, 0.3, 2.5));
 	}
 	// The SteamVR driver's floor_m moves the world up by that much: the floor is at -floor_m in the tracker's space.
-	b_space_overseer_set_floor(p->s->xso, cJSON_IsNumber(floor), cJSON_IsNumber(floor) ? -(float)floor->valuedouble : 0.0f,
-	                           raise);
+	b_space_overseer_set_floor(p->s->xso, p->floor_known, -p->floor_m, raise);
 }
 
 //! The settings file into the compositor and the spaces, at start.
@@ -1367,6 +1368,10 @@ extern "C" void
 rl_panel_settings_to_env(void)
 {
 	cJSON *root = rl::settings::load();
+	const std::string headset = rl::settings::headset_to_env(root);
+	if (!headset.empty()) {
+		U_LOG_I("Headset settings: %s", headset.c_str());
+	}
 	const double scale = rl::settings::number(root, "display", "render_scale", 0.0);
 	if (scale >= 25.0 && scale <= 400.0 && getenv("XRT_COMPOSITOR_RENDER_SCALE") == nullptr) {
 		char text[32];

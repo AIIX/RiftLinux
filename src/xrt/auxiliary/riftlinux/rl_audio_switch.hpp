@@ -16,8 +16,11 @@
 
 #include <dlfcn.h>
 
+#include <sys/stat.h>
+
 #include <chrono>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <functional>
 #include <mutex>
@@ -289,8 +292,72 @@ rift_source_prefix(const char *hmd_serial)
 }
 
 /*!
+ * The defaults before the headset's, in a file while the headset's are set (~/.cache/riftlinux/audio-before, "sink
+ * <name>" and "source <name>" lines): a session that ended without putting them back (a crash, the computer switched
+ * off) left the headset's as the defaults, which the sound server keeps across restarts, so every later session found
+ * them "the default already" and nothing ever put the desktop's own back.
+ */
+inline std::string
+before_path()
+{
+	const char *xdg = getenv("XDG_CACHE_HOME");
+	const char *home = getenv("HOME");
+	const std::string dir =
+	    (xdg != nullptr && xdg[0] != '\0' ? std::string(xdg) : std::string(home != nullptr ? home : "/tmp") + "/.cache");
+	mkdir(dir.c_str(), 0700);
+	mkdir((dir + "/riftlinux").c_str(), 0700);
+	return dir + "/riftlinux/audio-before";
+}
+
+inline void
+before_read(std::string *sink, std::string *source)
+{
+	FILE *file = fopen(before_path().c_str(), "r");
+	if (file == nullptr) {
+		return;
+	}
+	char buf[512];
+	while (fgets(buf, sizeof(buf), file) != nullptr) {
+		std::string line(buf);
+		while (!line.empty() && (line.back() == '\n' || line.back() == '\r')) {
+			line.pop_back();
+		}
+		if (line.rfind("sink ", 0) == 0) {
+			*sink = line.substr(5);
+		} else if (line.rfind("source ", 0) == 0) {
+			*source = line.substr(7);
+		}
+	}
+	fclose(file);
+}
+
+//! Both empty: the file goes.
+inline void
+before_write(const std::string &sink, const std::string &source)
+{
+	const std::string path = before_path();
+	if (sink.empty() && source.empty()) {
+		remove(path.c_str());
+		return;
+	}
+	FILE *file = fopen(path.c_str(), "w");
+	if (file == nullptr) {
+		return;
+	}
+	if (!sink.empty()) {
+		fprintf(file, "sink %s\n", sink.c_str());
+	}
+	if (!source.empty()) {
+		fprintf(file, "source %s\n", source.c_str());
+	}
+	fclose(file);
+}
+
+/*!
  * Makes the headset's headphones and microphone the default output and input, keeping the ones before; tries for a
- * few seconds (the headset's USB audio can come up after it). @p log gets a line on what happened to each.
+ * few seconds (the headset's USB audio can come up after it). @p log gets a line on what happened to each. The
+ * headset's already the default with the file of a session that did not put the defaults back: those are put back
+ * after this one.
  */
 class Switch
 {
@@ -305,6 +372,8 @@ public:
 			return;
 		}
 		bool sink_done = false, source_done = source_prefix.empty();
+		std::string left_sink, left_source;
+		before_read(&left_sink, &left_source);
 		for (int i = 0; i < 10 && !(sink_done && source_done); i++) {
 			if (i > 0) {
 				std::this_thread::sleep_for(std::chrono::seconds(1));
@@ -315,7 +384,14 @@ public:
 				continue;
 			}
 			if (!sink_done && current_sink == sink) {
-				log("Audio: " + sink + " is the default output already");
+				if (!left_sink.empty() && left_sink != sink) {
+					m_previous = left_sink;
+					m_sink = sink;
+					log("Audio: " + sink + " is the default output already, left by a session that did not end; " +
+					    left_sink + " back after this one");
+				} else {
+					log("Audio: " + sink + " is the default output already");
+				}
 				sink_done = true;
 			} else if (!sink_done && pa.has_sink(sink) && pa.set_default_sink(sink)) {
 				m_previous = current_sink;
@@ -328,7 +404,14 @@ public:
 				std::lock_guard<std::mutex> lock(m_lock);
 				m_found_source = source;
 				if (current_source == source) {
-					log("Audio: " + source + " is the default input already");
+					if (!left_source.empty() && left_source != source) {
+						m_previous_source = left_source;
+						m_source = source;
+						log("Audio: " + source + " is the default input already, left by a session that did not " +
+						    "end; " + left_source + " back after this one");
+					} else {
+						log("Audio: " + source + " is the default input already");
+					}
 					source_done = true;
 				} else if (pa.set_default_source(source)) {
 					m_previous_source = current_source;
@@ -337,6 +420,9 @@ public:
 					source_done = true;
 				}
 			}
+		}
+		if (!m_sink.empty() || !m_source.empty()) {
+			before_write(m_sink.empty() ? std::string() : m_previous, m_source.empty() ? std::string() : m_previous_source);
 		}
 		if (!sink_done) {
 			log("Audio: could not make " + sink + " the default output");
@@ -375,6 +461,7 @@ public:
 		}
 		m_sink.clear();
 		m_source.clear();
+		before_write("", "");
 	}
 
 private:

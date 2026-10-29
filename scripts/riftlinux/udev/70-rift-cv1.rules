@@ -5,6 +5,11 @@
 # the user at the machine (uaccess, any systemd distribution; no group needed).
 SUBSYSTEM=="usb", ATTRS{idVendor}=="2833", MODE="0660", TAG+="uaccess"
 SUBSYSTEM=="hidraw", ATTRS{idVendor}=="2833", MODE="0660", TAG+="uaccess"
+# No USB autosuspend: the Rift's devices stay awake between sessions too. Set on the devices themselves.
+SUBSYSTEM=="usb", ENV{DEVTYPE}=="usb_device", ATTR{idVendor}=="2833", ATTR{power/control}="on"
+# The kernel's camera driver (uvcvideo) turns autosuspend on for a sensor as it binds to it, after the rule above: at
+# start-up, and each time SteamVR hands the sensors back to it. Off again once it has bound.
+ACTION=="bind", SUBSYSTEM=="usb", ENV{DEVTYPE}=="usb_interface", DRIVER=="uvcvideo", ATTRS{idVendor}=="2833", RUN+="/bin/sh -c 'echo on > /sys%p/../power/control'"
 # When the headset appears, every logged-in user's service manager registers the driver with that user's SteamVR
 # (riftlinux-register.service: riftlinux-setup register). Nothing to run by hand after installing the package.
 SUBSYSTEM=="usb", ENV{DEVTYPE}=="usb_device", ATTR{idVendor}=="2833", ATTR{idProduct}=="0031", TAG+="systemd", ENV{SYSTEMD_USER_WANTS}+="riftlinux-register.service"

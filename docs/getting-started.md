@@ -62,11 +62,12 @@ through RiftLinux's own compositor; see [The picture](picture.md)).
 
 ## The first start
 
-1. **Start Steam from your desktop**, then **SteamVR** from your Library (or `steam steam://rungameid/250820`). Start
-   Steam on the desktop itself, not from a remote (SSH) login: from there the Rift's tracking and display threads do
-   not get real-time priority. On its first start SteamVR may ask for your password once (for its compositor's
-   priority).
-2. **Put the headset on.** A welcome panel shows how the Oculus button works. It is shown once.
+1. **Restart Steam once after installing** (Steam, Exit, and start it again from your desktop): Steam loads the part
+   of RiftLinux that starts SteamVR as it starts. Start Steam on the desktop itself, not from a remote (SSH) login:
+   from there the Rift's tracking and display threads do not get real-time priority.
+2. **Put the headset on: SteamVR starts by itself** (or start it from your Library, or with
+   `steam steam://rungameid/250820`). On its first start SteamVR may ask for your password once (for its compositor's
+   priority). A welcome panel shows how the Oculus button works. It is shown once.
 3. **Measure the sensors.** A blue notice, *Measuring where the sensors are*, appears. **Face the sensors and slowly
    turn your head left and right, then up and down, and keep going until the notice goes away.** The sensors are
    placed from these views of the headset. Meanwhile the controllers are hidden and your view is kept level. When it
@@ -78,12 +79,13 @@ through RiftLinux's own compositor; see [The picture](picture.md)).
 5. **Recentre** whenever the view is not in front of you: **hold the right Oculus button for a second.**
 
 Now start a game from SteamVR's library or from Steam. Linux VR games, Windows VR games (through Proton) and OpenXR
-games all work the same way.
+games all work the same way. Start games once SteamVR runs: a VR game started from Steam while SteamVR is not running
+opens on the monitor (put the headset on first).
 
 ## Upgrade and remove
 
-- **Upgrade:** install the newer package the same way. Every user's copy of the driver follows at their next login or
-  when the headset is plugged in.
+- **Upgrade:** install the newer package the same way, then restart Steam once. Every user's copy of the driver
+  follows at their next login or when the headset is plugged in.
 - **Remove:** `sudo apt remove riftlinux`, `sudo pacman -R riftlinux`, `sudo dnf remove riftlinux`, or
   `sudo ./uninstall.sh` in the unpacked tarball's folder. The driver is unregistered from SteamVR. Your settings and
   the sensors' calibration stay in `~/.config/riftlinux` and `~/.config/monado`; delete those folders to remove them
