@@ -142,6 +142,11 @@ append_nvidia_entry_on_match(struct comp_window_direct_nvidia *w,
                              const char *wl_entry,
                              struct VkDisplayPropertiesKHR *disp)
 {
+	// A display may have no name (Vulkan allows NULL): it matches no entry.
+	if (disp->displayName == NULL) {
+		return false;
+	}
+
 	unsigned long wl_entry_length = strlen(wl_entry);
 	unsigned long disp_entry_length = strlen(disp->displayName);
 
@@ -291,6 +296,14 @@ static const char *instance_extensions[] = {
 static bool
 _match_allowlist_entry(const char *al_entry, VkDisplayPropertiesKHR *disp)
 {
+	/*
+	 * A display may have no name (Vulkan allows NULL): it matches no entry. RiftLinux: this probe runs inside SteamVR's
+	 * server when the desktop offers no display for lease, and a strlen on a NULL name there ends the server.
+	 */
+	if (disp->displayName == NULL) {
+		return false;
+	}
+
 	unsigned long al_entry_length = strlen(al_entry);
 	unsigned long disp_entry_length = strlen(disp->displayName);
 	if (disp_entry_length < al_entry_length)
@@ -373,7 +386,8 @@ _test_for_nvidia(struct comp_compositor *c, struct vk_bundle *vk)
 
 	u_pp(dg, "\n\t== Found Displays (%u) ==", display_count);
 	for (uint32_t i = 0; i < display_count; i++) {
-		u_pp(dg, "\n\t\t%s", display_props[i].displayName);
+		const char *name = display_props[i].displayName;
+		u_pp(dg, "\n\t\t%s", name != NULL ? name : "(no name)");
 	}
 
 	COMP_ERROR(c, "%s", sink.buffer);
@@ -450,6 +464,19 @@ static bool
 detect(const struct comp_target_factory *ctf, struct comp_compositor *c)
 {
 	bool detected = false;
+
+	/*
+	 * RiftLinux: in a Wayland session the X server is XWayland, which leases only what the Wayland desktop offers;
+	 * the Wayland target came first and found nothing to lease, so this target has nothing to take either. Its probe
+	 * (a Vulkan instance of its own and the GPU's display list) is not run inside SteamVR's server for nothing. The
+	 * session type counts too: a SteamVR started from another program may not have WAYLAND_DISPLAY.
+	 */
+	const char *wd = getenv("WAYLAND_DISPLAY");
+	const char *session = getenv("XDG_SESSION_TYPE");
+	if ((wd != NULL && wd[0] != '\0') || (session != NULL && strcmp(session, "wayland") == 0)) {
+		COMP_INFO(c, "Wayland session: no NVIDIA X11 direct mode (XWayland leases only what the desktop offers)");
+		return false;
+	}
 
 	if (!check_vulkan_caps(c, &detected)) {
 		return false;

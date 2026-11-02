@@ -1070,6 +1070,7 @@ render_resources_fini(struct render_resources *r)
 	struct vk_bundle *vk = r->vk;
 
 	render_motion_fini(r);
+	render_backdrop_fini(r);
 
 	D(Sampler, r->samplers.mock);
 	D(Sampler, r->samplers.repeat);

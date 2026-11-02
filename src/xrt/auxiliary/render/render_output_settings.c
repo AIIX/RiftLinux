@@ -52,6 +52,12 @@ DEBUG_GET_ONCE_BOOL_OPTION(hdr_bright, "XRT_COMPOSITOR_HDR_BRIGHT", false)
 DEBUG_GET_ONCE_FLOAT_OPTION(hdr_white_bright, "XRT_COMPOSITOR_HDR_WHITE_BRIGHT", 0.94f)
 
 /*
+ * Backdrop blur (frosted glass) for the layers an application asks it for with
+ * XR_MNDX_composition_layer_backdrop_blur; nothing else is touched. On by default; off: those layers without it.
+ */
+DEBUG_GET_ONCE_BOOL_OPTION(backdrop_blur, "XRT_COMPOSITOR_BACKDROP_BLUR", true)
+
+/*
  * The HDR parts' own switches, each on by default: float images taken as HDR (games through SteamVR), the content's
  * brightness metadata (from a player's description or an OpenXR application), the measured peak.
  */
@@ -88,6 +94,7 @@ from_environment(struct render_output_settings *s)
 	s->hdr_metadata = debug_get_bool_option_hdr_metadata();
 	s->hdr_measured_peak = debug_get_bool_option_hdr_measured_peak();
 	s->motion_smoothing = debug_get_bool_option_motion_smoothing();
+	s->backdrop_blur = debug_get_bool_option_backdrop_blur();
 	s->fast_path = debug_get_bool_option_fast_path();
 }
 

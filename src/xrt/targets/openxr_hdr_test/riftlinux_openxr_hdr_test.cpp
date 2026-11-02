@@ -16,6 +16,11 @@
  *   cll:N      linear, with MaxCLL N nits (HDR10 static)
  *   pq:N       the same cells encoded as PQ (SMPTE ST 2084), BT.709, MaxCLL N nits
  *   sdr        described as SDR: the float image clipped at white, as before HDR
+ *   probe      an instance and its system only, no session, held for the seconds given: as Proton's OpenXR check
+ *              does (run as d3ddriverquery64.exe to stand in for Steam's graphics driver check)
+ *   glass:N    the pattern (as none) with a translucent panel in front of it, rounded corners, whose backdrop is
+ *              blurred by N milliradians (XR_MNDX_composition_layer_backdrop_blur); glass:0 the same two layers
+ *              without the blur, for comparing
  * Logs to stdout once a second.
  */
 
@@ -28,6 +33,7 @@
 #include <openxr/openxr_platform.h>
 #include <openxr/openxr_loader_negotiation.h>
 #include <openxr/XR_MNDX_composition_layer_hdr.h>
+#include <openxr/XR_MNDX_composition_layer_backdrop_blur.h>
 
 #include <dlfcn.h>
 
@@ -114,6 +120,10 @@ struct Mode
 	XrHdrTransferMNDX transfer = XR_HDR_TRANSFER_LINEAR_MNDX;
 	float scene_nits = 0.0f;
 	float cll_nits = 0.0f;
+	//! glass:N: the panel's blur in milliradians; below 0: no panel.
+	float glass_mrad = -1.0f;
+	//! probe: an instance only.
+	bool probe = false;
 };
 
 bool
@@ -148,7 +158,40 @@ parse_mode(const char *text, Mode &m)
 		m.transfer = XR_HDR_TRANSFER_SDR_MNDX;
 		return true;
 	}
+	if (kind == "probe") {
+		m.describe = false;
+		m.probe = true;
+		return true;
+	}
+	if (kind == "glass" && value >= 0.0f) {
+		m.describe = false;
+		m.glass_mrad = value;
+		return true;
+	}
 	return false;
+}
+
+//! glass:N's panel: a light grey-blue at alpha 0.35 (unpremultiplied), rounded corners, alpha 0 around them.
+std::vector<uint16_t>
+make_panel()
+{
+	std::vector<uint16_t> px((size_t)kWidth * kHeight * 4);
+	const float r = 96.0f;
+	for (uint32_t y = 0; y < kHeight; y++) {
+		for (uint32_t x = 0; x < kWidth; x++) {
+			// Distance outside the rounded rectangle (negative inside), for a two-pixel soft edge.
+			const float cx = std::fmax(std::fabs((float)x + 0.5f - kWidth / 2.0f) - (kWidth / 2.0f - r), 0.0f);
+			const float cy = std::fmax(std::fabs((float)y + 0.5f - kHeight / 2.0f) - (kHeight / 2.0f - r), 0.0f);
+			const float d = std::sqrt(cx * cx + cy * cy) - r;
+			const float a = 0.35f * std::fmin(std::fmax(0.5f - d / 2.0f, 0.0f), 1.0f);
+			uint16_t *o = &px[((size_t)y * kWidth + x) * 4];
+			o[0] = half(0.85f);
+			o[1] = half(0.9f);
+			o[2] = half(1.0f);
+			o[3] = half(a);
+		}
+	}
+	return px;
 }
 
 //! The pattern as RGBA half floats: cells in pseudo-random colours (linear light, white 1.0), every fourth four
@@ -253,6 +296,11 @@ struct App
 	XrSwapchain swapchain = XR_NULL_HANDLE;
 	std::vector<XrSwapchainImageVulkan2KHR> images;
 	bool has_hdr_ext = false;
+	bool has_blur_ext = false;
+	//! glass:N's panel.
+	XrSwapchain panel_swapchain = XR_NULL_HANDLE;
+	std::vector<XrSwapchainImageVulkan2KHR> panel_images;
+	VkBuffer panel_staging = VK_NULL_HANDLE;
 
 	VkInstance vk_instance = VK_NULL_HANDLE;
 	VkPhysicalDevice phys = VK_NULL_HANDLE;
@@ -319,18 +367,26 @@ struct App
 		for (const auto &p : props) {
 			has_vk2 = has_vk2 || strcmp(p.extensionName, XR_KHR_VULKAN_ENABLE2_EXTENSION_NAME) == 0;
 			has_hdr_ext = has_hdr_ext || strcmp(p.extensionName, XR_MNDX_COMPOSITION_LAYER_HDR_EXTENSION_NAME) == 0;
+			has_blur_ext = has_blur_ext ||
+			               strcmp(p.extensionName, XR_MNDX_COMPOSITION_LAYER_BACKDROP_BLUR_EXTENSION_NAME) == 0;
 		}
 		if (!has_vk2) {
 			return fail("XR_KHR_vulkan_enable2 (runtime has none)");
 		}
 		printf("riftlinux-openxr-hdr-test: runtime %s XR_MNDX_composition_layer_hdr\n",
 		       has_hdr_ext ? "offers" : "does not offer");
+		if (mode.glass_mrad > 0.0f && !has_blur_ext) {
+			return fail("mode needs XR_MNDX_composition_layer_backdrop_blur");
+		}
 		if (mode.describe && !has_hdr_ext) {
 			return fail("mode needs XR_MNDX_composition_layer_hdr");
 		}
 		std::vector<const char *> exts = {XR_KHR_VULKAN_ENABLE2_EXTENSION_NAME};
 		if (mode.describe) {
 			exts.push_back(XR_MNDX_COMPOSITION_LAYER_HDR_EXTENSION_NAME);
+		}
+		if (mode.glass_mrad > 0.0f) {
+			exts.push_back(XR_MNDX_COMPOSITION_LAYER_BACKDROP_BLUR_EXTENSION_NAME);
 		}
 		XrInstanceCreateInfo ici = {};
 		ici.type = XR_TYPE_INSTANCE_CREATE_INFO;
@@ -444,16 +500,25 @@ struct App
 		}
 
 		// The pattern in a host-visible buffer, copied into each swapchain image as it is used.
-		const std::vector<uint16_t> px = make_pattern(mode);
+		if (!make_staging(make_pattern(mode), staging)) {
+			return false;
+		}
+		return mode.glass_mrad < 0.0f || make_staging(make_panel(), panel_staging);
+	}
+
+	//! @p px in a new host-visible buffer.
+	bool
+	make_staging(const std::vector<uint16_t> &px, VkBuffer &out)
+	{
 		VkBufferCreateInfo bci = {};
 		bci.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
 		bci.size = px.size() * sizeof(uint16_t);
 		bci.usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT;
-		if (vkCreateBuffer(device, &bci, nullptr, &staging) != VK_SUCCESS) {
+		if (vkCreateBuffer(device, &bci, nullptr, &out) != VK_SUCCESS) {
 			return fail("staging buffer");
 		}
 		VkMemoryRequirements mr;
-		vkGetBufferMemoryRequirements(device, staging, &mr);
+		vkGetBufferMemoryRequirements(device, out, &mr);
 		VkPhysicalDeviceMemoryProperties mp;
 		vkGetPhysicalDeviceMemoryProperties(phys, &mp);
 		uint32_t type = UINT32_MAX;
@@ -470,7 +535,7 @@ struct App
 		VkDeviceMemory mem = VK_NULL_HANDLE;
 		void *mapped = nullptr;
 		if (type == UINT32_MAX || vkAllocateMemory(device, &mai, nullptr, &mem) != VK_SUCCESS ||
-		    vkBindBufferMemory(device, staging, mem, 0) != VK_SUCCESS ||
+		    vkBindBufferMemory(device, out, mem, 0) != VK_SUCCESS ||
 		    vkMapMemory(device, mem, 0, VK_WHOLE_SIZE, 0, &mapped) != VK_SUCCESS) {
 			return fail("staging memory");
 		}
@@ -513,6 +578,15 @@ struct App
 		if (!has_float) {
 			return fail("R16G16B16A16_SFLOAT swapchain (runtime offers none)");
 		}
+		return make_swapchain(swapchain, images) &&
+		       (mode.glass_mrad < 0.0f || make_swapchain(panel_swapchain, panel_images));
+	}
+
+	//! A float swapchain of the pattern's size.
+	bool
+	make_swapchain(XrSwapchain &out, std::vector<XrSwapchainImageVulkan2KHR> &out_images)
+	{
+		uint32_t n = 0;
 		XrSwapchainCreateInfo swci = {};
 		swci.type = XR_TYPE_SWAPCHAIN_CREATE_INFO;
 		swci.usageFlags = XR_SWAPCHAIN_USAGE_COLOR_ATTACHMENT_BIT | XR_SWAPCHAIN_USAGE_TRANSFER_DST_BIT |
@@ -524,19 +598,19 @@ struct App
 		swci.faceCount = 1;
 		swci.arraySize = 1;
 		swci.mipCount = 1;
-		if (!xr_ok(xrCreateSwapchain(session, &swci, &swapchain), "xrCreateSwapchain")) {
+		if (!xr_ok(xrCreateSwapchain(session, &swci, &out), "xrCreateSwapchain")) {
 			return false;
 		}
-		xrEnumerateSwapchainImages(swapchain, 0, &n, nullptr);
-		images.assign(n, xr_struct<XrSwapchainImageVulkan2KHR>(XR_TYPE_SWAPCHAIN_IMAGE_VULKAN2_KHR));
-		return xr_ok(xrEnumerateSwapchainImages(swapchain, n, &n,
-		                                        reinterpret_cast<XrSwapchainImageBaseHeader *>(images.data())),
+		xrEnumerateSwapchainImages(out, 0, &n, nullptr);
+		out_images.assign(n, xr_struct<XrSwapchainImageVulkan2KHR>(XR_TYPE_SWAPCHAIN_IMAGE_VULKAN2_KHR));
+		return xr_ok(xrEnumerateSwapchainImages(out, n, &n,
+		                                        reinterpret_cast<XrSwapchainImageBaseHeader *>(out_images.data())),
 		             "swapchain images");
 	}
 
-	//! The pattern into swapchain image @p index, left as a colour attachment as the runtime expects.
+	//! @p buffer into swapchain image @p image, left as a colour attachment as the runtime expects.
 	void
-	fill_image(uint32_t index)
+	fill_image(VkImage image, VkBuffer buffer)
 	{
 		vkResetCommandBuffer(cmd, 0);
 		VkCommandBufferBeginInfo bi = {};
@@ -550,14 +624,14 @@ struct App
 		b.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
 		b.newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
 		b.srcQueueFamilyIndex = b.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-		b.image = images[index].image;
+		b.image = image;
 		b.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
 		vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr,
 		                     0, nullptr, 1, &b);
 		VkBufferImageCopy copy = {};
 		copy.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
 		copy.imageExtent = {kWidth, kHeight, 1};
-		vkCmdCopyBufferToImage(cmd, staging, images[index].image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &copy);
+		vkCmdCopyBufferToImage(cmd, buffer, image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &copy);
 		b.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
 		b.dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
 		b.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
@@ -628,8 +702,13 @@ struct App
 			quad.type = XR_TYPE_COMPOSITION_LAYER_QUAD;
 			XrCompositionLayerHdrMNDX hdr = {};
 			hdr.type = XR_TYPE_COMPOSITION_LAYER_HDR_MNDX;
-			const XrCompositionLayerBaseHeader *layers[1] = {
-			    reinterpret_cast<const XrCompositionLayerBaseHeader *>(&quad)};
+			XrCompositionLayerQuad panel = {};
+			panel.type = XR_TYPE_COMPOSITION_LAYER_QUAD;
+			XrCompositionLayerBackdropBlurMNDX blur = {};
+			blur.type = XR_TYPE_COMPOSITION_LAYER_BACKDROP_BLUR_MNDX;
+			const XrCompositionLayerBaseHeader *layers[2] = {
+			    reinterpret_cast<const XrCompositionLayerBaseHeader *>(&quad),
+			    reinterpret_cast<const XrCompositionLayerBaseHeader *>(&panel)};
 			uint32_t layer_count = 0;
 			if (fs.shouldRender) {
 				uint32_t index = 0;
@@ -642,7 +721,7 @@ struct App
 				ri.type = XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO;
 				if (xr_ok(xrAcquireSwapchainImage(swapchain, &ai, &index), "acquire") &&
 				    xr_ok(xrWaitSwapchainImage(swapchain, &wi), "wait image")) {
-					fill_image(index);
+					fill_image(images[index].image, staging);
 					xrReleaseSwapchainImage(swapchain, &ri);
 					quad.space = view_space;
 					quad.eyeVisibility = XR_EYE_VISIBILITY_BOTH;
@@ -661,6 +740,30 @@ struct App
 						quad.next = &hdr;
 					}
 					layer_count = 1;
+					uint32_t panel_index = 0;
+					if (mode.glass_mrad >= 0.0f &&
+					    xr_ok(xrAcquireSwapchainImage(panel_swapchain, &ai, &panel_index), "acquire panel") &&
+					    xr_ok(xrWaitSwapchainImage(panel_swapchain, &wi), "wait panel")) {
+						fill_image(panel_images[panel_index].image, panel_staging);
+						xrReleaseSwapchainImage(panel_swapchain, &ri);
+						panel.layerFlags = XR_COMPOSITION_LAYER_BLEND_TEXTURE_SOURCE_ALPHA_BIT |
+						                   XR_COMPOSITION_LAYER_UNPREMULTIPLIED_ALPHA_BIT;
+						panel.space = view_space;
+						panel.eyeVisibility = XR_EYE_VISIBILITY_BOTH;
+						panel.subImage.swapchain = panel_swapchain;
+						panel.subImage.imageRect = {{0, 0}, {(int32_t)kWidth, (int32_t)kHeight}};
+						panel.pose.orientation.w = 1.0f;
+						panel.pose.position.z = -1.0f;
+						panel.size = {0.6f, 0.6f * kHeight / kWidth};
+						if (mode.glass_mrad > 0.0f) {
+							blur.blurRadians = mode.glass_mrad / 1000.0f;
+							blur.saturation = 1.0f;
+							blur.tint = {1.0f, 1.0f, 1.0f, 0.0f};
+							blur.maskAlpha = 0.3f;
+							panel.next = &blur;
+						}
+						layer_count = 2;
+					}
 					shown++;
 				}
 			}
@@ -689,7 +792,7 @@ int
 main(int argc, char **argv)
 {
 	if (argc < 2) {
-		fprintf(stderr, "usage: %s <libopenxr_monado.so> [seconds, 60] [none|linear|scene:N|cll:N|pq:N|sdr]\n",
+		fprintf(stderr, "usage: %s <libopenxr_monado.so> [seconds, 60] [none|linear|scene:N|cll:N|pq:N|sdr|probe|glass:N]\n",
 		        argv[0]);
 		return 2;
 	}
@@ -701,12 +804,26 @@ main(int argc, char **argv)
 	}
 	setvbuf(stdout, nullptr, _IOLBF, 0);
 	printf("riftlinux-openxr-hdr-test: mode %s, %.0f s\n", app.mode.name.c_str(), seconds);
+	if (app.mode.probe) {
+		// As Proton's OpenXR check: an instance and its system, held, then gone.
+		if (!app.load_runtime(argv[1]) || !app.create_instance()) {
+			return 1;
+		}
+		printf("riftlinux-openxr-hdr-test: probe: instance made, holding it %.0f s\n", seconds);
+		struct timespec ts = {(time_t)seconds, 0};
+		nanosleep(&ts, nullptr);
+		app.xrDestroyInstance(app.instance);
+		return 0;
+	}
 	if (!app.load_runtime(argv[1]) || !app.create_instance() || !app.create_vulkan() || !app.create_session()) {
 		return 1;
 	}
 	const int ret = app.run(seconds);
 	app.vkDeviceWaitIdle(app.device);
 	app.xrDestroySwapchain(app.swapchain);
+	if (app.panel_swapchain != XR_NULL_HANDLE) {
+		app.xrDestroySwapchain(app.panel_swapchain);
+	}
 	app.xrDestroySpace(app.view_space);
 	app.xrDestroySession(app.session);
 	app.xrDestroyInstance(app.instance);

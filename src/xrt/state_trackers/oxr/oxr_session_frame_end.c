@@ -269,6 +269,39 @@ fill_in_hdr(struct oxr_session *sess, const XrCompositionLayerBaseHeader *layer,
 #endif
 }
 
+/*!
+ * A quad or cylinder layer's backdrop blur (XR_MNDX_composition_layer_backdrop_blur, RiftLinux), if the application
+ * chained one, into the layer data. Checked in verify_layer_backdrop_blur; zero radius: none.
+ */
+static void
+fill_in_backdrop_blur(struct oxr_session *sess,
+                      const XrCompositionLayerBaseHeader *layer,
+                      struct xrt_layer_data *xlayer_data)
+{
+#ifdef OXR_HAVE_MNDX_composition_layer_backdrop_blur
+	if (!sess->sys->inst->extensions.MNDX_composition_layer_backdrop_blur) {
+		return;
+	}
+	const XrCompositionLayerBackdropBlurMNDX *blur = OXR_GET_INPUT_FROM_CHAIN(
+	    layer->next, XR_TYPE_COMPOSITION_LAYER_BACKDROP_BLUR_MNDX, XrCompositionLayerBackdropBlurMNDX);
+	if (blur == NULL || blur->blurRadians <= 0.0f) {
+		return;
+	}
+	struct xrt_layer_backdrop_blur_data *d = &xlayer_data->backdrop_blur;
+	d->radians = blur->blurRadians;
+	d->saturation = blur->saturation;
+	d->mask_alpha = blur->maskAlpha;
+	d->tint.r = blur->tint.r;
+	d->tint.g = blur->tint.g;
+	d->tint.b = blur->tint.b;
+	d->tint.a = blur->tint.a;
+#else
+	(void)sess;
+	(void)layer;
+	(void)xlayer_data;
+#endif
+}
+
 static void
 fill_in_y_flip(struct oxr_session *sess, const XrCompositionLayerBaseHeader *layer, struct xrt_layer_data *xlayer_data)
 {
@@ -471,6 +504,53 @@ verify_layer_hdr(struct oxr_session *sess,
 			                 "not in 0..100000 nits",
 			                 layer_index, nits[i]);
 		}
+	}
+#else
+	(void)sess;
+	(void)log;
+	(void)layer_index;
+	(void)layer;
+#endif
+	return XR_SUCCESS;
+}
+
+/*!
+ * A chained XrCompositionLayerBackdropBlurMNDX (RiftLinux): finite values; a radius of 0 to 0.5 radians (0: none),
+ * saturation 0 to 2, tint 0 to 1 with alpha 0 to 1, mask alpha above 0 and at most 1.
+ */
+static XrResult
+verify_layer_backdrop_blur(struct oxr_session *sess,
+                           struct oxr_logger *log,
+                           uint32_t layer_index,
+                           const XrCompositionLayerBaseHeader *layer)
+{
+#ifdef OXR_HAVE_MNDX_composition_layer_backdrop_blur
+	if (!sess->sys->inst->extensions.MNDX_composition_layer_backdrop_blur) {
+		return XR_SUCCESS;
+	}
+	const XrCompositionLayerBackdropBlurMNDX *blur = OXR_GET_INPUT_FROM_CHAIN(
+	    layer->next, XR_TYPE_COMPOSITION_LAYER_BACKDROP_BLUR_MNDX, XrCompositionLayerBackdropBlurMNDX);
+	if (blur == NULL) {
+		return XR_SUCCESS;
+	}
+	const float values[] = {blur->blurRadians, blur->saturation, blur->tint.r, blur->tint.g,
+	                        blur->tint.b,      blur->tint.a,     blur->maskAlpha};
+	const float lo[] = {0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
+	const float hi[] = {0.5f, 2.0f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f};
+	const char *names[] = {"blurRadians", "saturation", "tint.r", "tint.g", "tint.b", "tint.a", "maskAlpha"};
+	for (size_t i = 0; i < ARRAY_SIZE(values); i++) {
+		if (!isfinite(values[i]) || values[i] < lo[i] || values[i] > hi[i]) {
+			return oxr_error(log, XR_ERROR_VALIDATION_FAILURE,
+			                 "(frameEndInfo->layers[%u]->next<XrCompositionLayerBackdropBlurMNDX>.%s == %f) not in "
+			                 "%g..%g",
+			                 layer_index, names[i], values[i], lo[i], hi[i]);
+		}
+	}
+	if (blur->blurRadians > 0.0f && blur->maskAlpha <= 0.0f) {
+		return oxr_error(log, XR_ERROR_VALIDATION_FAILURE,
+		                 "(frameEndInfo->layers[%u]->next<XrCompositionLayerBackdropBlurMNDX>.maskAlpha == %f) must "
+		                 "be above 0",
+		                 layer_index, blur->maskAlpha);
 	}
 #else
 	(void)sess;
@@ -1430,6 +1510,7 @@ submit_quad_layer(struct oxr_session *sess,
 	fill_in_sub_image(sc, &quad->subImage, &data.quad.sub);
 	fill_in_color_scale_bias(sess, (XrCompositionLayerBaseHeader *)quad, &data);
 	fill_in_hdr(sess, (XrCompositionLayerBaseHeader *)quad, &data);
+	fill_in_backdrop_blur(sess, (XrCompositionLayerBaseHeader *)quad, &data);
 	fill_in_y_flip(sess, (XrCompositionLayerBaseHeader *)quad, &data);
 	fill_in_blend_factors(sess, (XrCompositionLayerBaseHeader *)quad, &data);
 	fill_in_layer_settings(sess, (XrCompositionLayerBaseHeader *)quad, &data);
@@ -1651,6 +1732,7 @@ submit_cylinder_layer(struct oxr_session *sess,
 	fill_in_sub_image(sc, &cylinder->subImage, &data.cylinder.sub);
 	fill_in_color_scale_bias(sess, (XrCompositionLayerBaseHeader *)cylinder, &data);
 	fill_in_hdr(sess, (XrCompositionLayerBaseHeader *)cylinder, &data);
+	fill_in_backdrop_blur(sess, (XrCompositionLayerBaseHeader *)cylinder, &data);
 	fill_in_y_flip(sess, (XrCompositionLayerBaseHeader *)cylinder, &data);
 	fill_in_blend_factors(sess, (XrCompositionLayerBaseHeader *)cylinder, &data);
 	fill_in_layer_settings(sess, (XrCompositionLayerBaseHeader *)cylinder, &data);
@@ -2004,6 +2086,10 @@ oxr_session_frame_end(struct oxr_logger *log, struct oxr_session *sess, const Xr
 			return res;
 		}
 		res = verify_layer_hdr(sess, log, i, layer);
+		if (res != XR_SUCCESS) {
+			return res;
+		}
+		res = verify_layer_backdrop_blur(sess, log, i, layer);
 		if (res != XR_SUCCESS) {
 			return res;
 		}

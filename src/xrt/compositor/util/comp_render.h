@@ -628,6 +628,7 @@ comp_render_cs_add_target_view(struct comp_render_dispatch_data *data,
  * @param target_image_view
  * @param target_view
  * @param do_timewarp
+ * @param fov The target view's field of view (RiftLinux: a backdrop blur's angle into pixels).
  */
 void
 comp_render_cs_layer(struct render_compute *render,
@@ -641,7 +642,8 @@ comp_render_cs_layer(struct render_compute *render,
                      VkImage target_image,
                      VkImageView target_image_view,
                      const struct render_viewport_data *target_view,
-                     bool do_timewarp);
+                     bool do_timewarp,
+                     const struct xrt_fov *fov);
 
 /*!
  * Dispatch the layer squasher, on any number of views.

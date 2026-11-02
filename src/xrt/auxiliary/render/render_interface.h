@@ -362,6 +362,9 @@ struct render_resources
 	//! Motion smoothing's state (RiftLinux, render_motion.c); NULL if unavailable.
 	struct render_motion *motion;
 
+	//! Backdrop blur's resources (RiftLinux, render_backdrop.c): made at its first use, NULL until then.
+	struct render_backdrop *backdrop;
+
 	/*
 	 * Loaded resources.
 	 */
@@ -1282,6 +1285,47 @@ struct render_compute
 /*!
  * One view of the application's frame, as the distortion pass would sample it (RiftLinux).
  */
+/*!
+ * Backdrop blur (RiftLinux, render_backdrop.c, XR_MNDX_composition_layer_backdrop_blur): the most layers of a view
+ * blurred behind (the lowest ones; more are shown without it).
+ */
+#define RENDER_BACKDROP_MAX_BLURS 4
+
+//! One layer of a view that asks for its backdrop blurred.
+struct render_backdrop_request
+{
+	//! The layer's index in the view's layer pass (as packed in its UBO).
+	uint32_t layer;
+	//! The Gaussian's standard deviation in the view's pixels.
+	float sigma_px;
+	float saturation;
+	float mask_alpha;
+	struct xrt_colour_rgba_f32 tint;
+};
+
+/*!
+ * The view's layer pass with the blurred backdrops of @p requests (in layer order) instead of
+ * @ref render_compute_layers: pre-passes, blurs, then the layer pass's second build. The source arrays are the layer
+ * pass's (padded to its size), @p used_images of them the layers'. False when nothing was recorded (it could not be
+ * set up, or no source image left): the caller then runs @ref render_compute_layers as usual.
+ */
+bool
+render_backdrop_layers(struct render_compute *render,
+                       uint32_t view_index,
+                       VkBuffer ubo,
+                       const VkSampler src_samplers[RENDER_MAX_IMAGES_SIZE],
+                       const VkImageView src_image_views[RENDER_MAX_IMAGES_SIZE],
+                       uint32_t used_images,
+                       const struct render_backdrop_request *requests,
+                       uint32_t request_count,
+                       VkImageView target_image_view,
+                       const struct render_viewport_data *view,
+                       bool do_timewarp);
+
+//! Frees what @ref render_backdrop_layers made, if anything.
+void
+render_backdrop_fini(struct render_resources *r);
+
 struct render_motion_source
 {
 	//! The image and the pose tell a new frame from one shown again.

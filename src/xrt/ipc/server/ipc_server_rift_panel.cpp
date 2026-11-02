@@ -346,6 +346,8 @@ load_settings(struct rl_panel *p)
 	rs.hdr_float_layers = rl::settings::boolean(root, "display", "hdr_float_layers", rs.hdr_float_layers);
 	rs.hdr_metadata = rl::settings::boolean(root, "display", "hdr_metadata", rs.hdr_metadata);
 	rs.hdr_measured_peak = rl::settings::boolean(root, "display", "hdr_measured_peak", rs.hdr_measured_peak);
+	// Frosted glass for the layers an application asks it for (XR_MNDX_composition_layer_backdrop_blur).
+	rs.backdrop_blur = rl::settings::boolean(root, "display", "backdrop_blur", rs.backdrop_blur);
 	render_output_settings_set(&rs);
 	p->base = rs;
 
@@ -1242,6 +1244,16 @@ frame(struct rl_panel *p)
 	const double t = now_s();
 	update_status(p, t);
 	perf_tick(p, t);
+	/*
+	 * HDR Bright acts on HDR content only: the Picture tab says whether there is any, as the SteamVR driver does.
+	 * On after the compositor showed an HDR layer, off 1.5 s after the last one.
+	 */
+	const int64_t hdr_seen_ns = render_output_last_hdr_layer_ns();
+	const bool hdr_content = hdr_seen_ns != 0 && os_monotonic_get_ns() - hdr_seen_ns < 1500LL * U_TIME_1MS_IN_NS;
+	if (hdr_content != p->state.picture.hdr_content) {
+		p->state.picture.hdr_content = hdr_content;
+		U_LOG_I("Rift panel: HDR content %s", hdr_content ? "on screen" : "gone");
+	}
 #ifdef RL_HAVE_PULSE
 	if (p->pulse_ok) {
 		p->state.volume = p->pulse.known ? p->pulse.percent : -1;

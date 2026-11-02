@@ -26,6 +26,7 @@
 #include "vk/vk_helpers.h"
 
 #include "render/render_interface.h"
+#include "render/render_output_settings.h"
 
 #include "layer_defines.inc.glsl"
 
@@ -653,7 +654,8 @@ comp_render_cs_layer(struct render_compute *render,
                      VkImage target_image,
                      VkImageView target_image_view,
                      const struct render_viewport_data *target_view,
-                     bool do_timewarp)
+                     bool do_timewarp,
+                     const struct xrt_fov *fov)
 {
 	VkSampler clamp_to_edge = render->r->samplers.clamp_to_edge;
 	VkSampler clamp_to_border_black = render->r->samplers.clamp_to_border_black;
@@ -687,6 +689,10 @@ comp_render_cs_layer(struct render_compute *render,
 
 	// RiftLinux: each HDR layer's histogram slot, in layer order, the same in every view.
 	int hdr_slot_next = 0;
+
+	// RiftLinux: the layers that ask for their backdrop blurred (render_backdrop.c); none: all as before.
+	struct render_backdrop_request blur_requests[RENDER_BACKDROP_MAX_BLURS];
+	uint32_t blur_count = 0;
 
 	for (uint32_t c_layer_i = 0; c_layer_i < layer_count; c_layer_i++) {
 		const struct comp_layer *layer = &layers[c_layer_i];
@@ -827,6 +833,23 @@ comp_render_cs_layer(struct render_compute *render,
 		apply_bias_and_scale_from_layer(data, &ubo_data->layers[cur_layer].color_scale,
 		                                &ubo_data->layers[cur_layer].color_bias);
 
+		// RiftLinux: a quad or cylinder layer asking for its backdrop blurred; the angle in this view's pixels.
+		if (data->backdrop_blur.radians > 0.0f && blur_count < RENDER_BACKDROP_MAX_BLURS &&
+		    (data->type == XRT_LAYER_QUAD || data->type == XRT_LAYER_CYLINDER)) {
+			const float across = tanf(fov->angle_right) - tanf(fov->angle_left);
+			const float down = tanf(fov->angle_up) - tanf(fov->angle_down);
+			const float px_per_rad = across > 0.0f && down > 0.0f
+			                             ? 0.5f * ((float)target_view->w / across + (float)target_view->h / down)
+			                             : 0.0f;
+			blur_requests[blur_count++] = (struct render_backdrop_request){
+			    .layer = cur_layer,
+			    .sigma_px = fminf(data->backdrop_blur.radians, 0.06f) * px_per_rad,
+			    .saturation = data->backdrop_blur.saturation,
+			    .mask_alpha = data->backdrop_blur.mask_alpha,
+			    .tint = data->backdrop_blur.tint,
+			};
+		}
+
 		// Finally okay to increment the current layer.
 		cur_layer++;
 	}
@@ -839,11 +862,25 @@ comp_render_cs_layer(struct render_compute *render,
 		ubo_data->layers[i].layer_data.layer_type = LAYER_COMP_TYPE_NOOP; // Explicit no-op.
 	}
 
+	// RiftLinux: the layers' own images; the backdrop blur puts its images after them.
+	const uint32_t used_images = cur_image;
+
 	//! @todo: If Vulkan 1.2, use VK_DESCRIPTOR_BINDING_PARTIALLY_BOUND_BIT and skip this
 	while (cur_image < render->r->compute.layer.image_array_size) {
 		src_samplers[cur_image] = clamp_to_edge;
 		src_image_views[cur_image] = render->r->mock.color.image_view;
 		cur_image++;
+	}
+
+	// RiftLinux: a layer asked for its backdrop blurred, and the blur is not switched off (render_backdrop.c).
+	if (blur_count > 0) {
+		struct render_output_settings out_settings;
+		render_output_settings_get(&out_settings);
+		if (out_settings.backdrop_blur &&
+		    render_backdrop_layers(render, view_index, ubo->buffer, src_samplers, src_image_views, used_images,
+		                           blur_requests, blur_count, target_image_view, target_view, do_timewarp)) {
+			return;
+		}
 	}
 
 	VkDescriptorSet descriptor_set = render->layer_descriptor_sets[view_index];
@@ -893,7 +930,8 @@ comp_render_cs_layers(struct render_compute *render,
 		    view->squash.image,              //
 		    view->squash.cs.storage_view,    //
 		    &view->squash.viewport_data,     //
-		    d->do_timewarp);                 //
+		    d->do_timewarp,                  //
+		    &view->fov);                     //
 	}
 
 	cmd_barrier_view_squash_images(            //

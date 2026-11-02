@@ -69,6 +69,7 @@ typedef __eglMustCastToProperFunctionPointerType (*PFNEGLGETPROCADDRESSPROC)(con
 #include "openxr/XR_MNDX_ball_on_a_stick_controller.h"
 #include "openxr/XR_MNDX_blubur_s1.h"
 #include "openxr/XR_MNDX_composition_layer_hdr.h"
+#include "openxr/XR_MNDX_composition_layer_backdrop_blur.h"
 #include "openxr/XR_MNDX_oculus_remote.h"
 #include "openxr/XR_MNDX_hydra.h"
 #include "openxr/XR_MNDX_psvr2_interaction.h"

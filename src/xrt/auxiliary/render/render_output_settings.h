@@ -56,6 +56,10 @@ struct render_output_settings
 	//! Motion smoothing: in-between frames when an application is late (render_motion.c).
 	bool motion_smoothing;
 
+	//! Backdrop blur for the layers that ask for it (XR_MNDX_composition_layer_backdrop_blur, render_backdrop.c);
+	//! off: those layers shown without it.
+	bool backdrop_blur;
+
 	//! A single projection layer read by the lens pass directly (comp_compositor.c); off: the layer renderer first.
 	bool fast_path;
 };

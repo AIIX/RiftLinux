@@ -74,6 +74,15 @@ constexpr int64_t kBlockMs = 50;
 //! This many moving blocks within the last 20 (one second) start SteamVR, after this long without one.
 constexpr int kMovingBlocks = 4;
 constexpr int64_t kStillBeforeMs = 5000;
+/*!
+ * And it turned this far away from where it lay (the gyro integrated from there, less its rate at rest): a headset
+ * picked up is turned on its way to a face; knocks, nudges and someone moving on the bed it lies on shake it without
+ * turning it away. Measured on a CV1 on a bed: nudges and bed movement up to 21.5 degrees, five pick-ups 50 to 87,
+ * each past 35 within a second of being lifted.
+ */
+constexpr double kPickUpTurnDeg = 35.0;
+//! The gyro's samples come every millisecond.
+constexpr double kSampleS = 0.001;
 //! After asking, nothing more for this long (SteamVR starting, or Steam not starting it).
 constexpr int64_t kAfterWakeMs = 60000;
 //! The headset streams its reports for 10 s after each keep-alive; sent again after 9.5 s, as the driver does.
@@ -199,8 +208,10 @@ struct Settings
 {
 	//! "steamvr": {"start_when_put_on"}: off, nothing starts SteamVR.
 	bool on = true;
-	//! "steamvr": {"start_on_pick_up"}: off, only putting the headset on does (the wear sensor).
+	//! "steamvr": {"start_on_pick_up"}: off, only putting the headset on does (the wear sensor). Not set: as
+	//! "headset": {"worn_by_motion"}, so "the wear sensor only" leaves movement out of both.
 	bool pick_up = true;
+	bool worn_by_motion = true;
 	//! "headset": the wear sensor and its levels, as the driver reads them; with the sensor off, put-on cannot be seen
 	//! and picking up starts SteamVR whatever start_on_pick_up says.
 	bool wear_sensor = true;
@@ -210,8 +221,8 @@ struct Settings
 	bool
 	operator!=(const Settings &o) const
 	{
-		return on != o.on || pick_up != o.pick_up || wear_sensor != o.wear_sensor || worn_above != o.worn_above ||
-		       unworn_below != o.unworn_below;
+		return on != o.on || pick_up != o.pick_up || worn_by_motion != o.worn_by_motion ||
+		       wear_sensor != o.wear_sensor || worn_above != o.worn_above || unworn_below != o.unworn_below;
 	}
 };
 
@@ -264,7 +275,8 @@ read_settings()
 	const std::string text = read_text(dir + "/riftlinux/settings.json");
 	Settings s;
 	s.on = setting_bool(text, "start_when_put_on", true);
-	s.pick_up = setting_bool(text, "start_on_pick_up", true);
+	s.worn_by_motion = setting_bool(text, "worn_by_motion", true);
+	s.pick_up = setting_bool(text, "start_on_pick_up", s.worn_by_motion);
 	s.wear_sensor = setting_bool(text, "wear_sensor", true);
 	s.worn_above = setting_int(text, "worn_above", kWornAbove);
 	s.unworn_below = setting_int(text, "unworn_below", kUnwornBelow);
@@ -381,6 +393,44 @@ finished_vrserver()
 	// The driver's line (ovrd_driver.cpp) can be followed by a few of SteamVR's in the half second before it ends.
 	const bool ended_by_driver = tail.find("this driver ends SteamVR's server") != std::string::npos;
 	return line.find("[vrserver] Graceful exit") != std::string::npos || ended_by_driver ? found : 0;
+}
+
+/*!
+ * SteamVR Home (steamtours) left running after SteamVR's server, compositor and monitor have all gone: it can stay
+ * after SteamVR quits (seen on KDE after Steam was started with -pipewire: one core busy, ignoring SIGTERM), and while
+ * it runs every later Home start fails at once. Without SteamVR it shows nothing. Returns its process id, else 0.
+ */
+inline pid_t
+leftover_steamvr_home()
+{
+	DIR *proc = opendir("/proc");
+	if (proc == nullptr) {
+		return 0;
+	}
+	pid_t home = 0;
+	bool steamvr = false;
+	struct dirent *entry;
+	while (!steamvr && (entry = readdir(proc)) != nullptr) {
+		if (entry->d_name[0] < '0' || entry->d_name[0] > '9') {
+			continue;
+		}
+		const std::string link = std::string("/proc/") + entry->d_name + "/exe";
+		char exe[PATH_MAX];
+		const ssize_t len = readlink(link.c_str(), exe, sizeof(exe) - 1);
+		if (len <= 0) {
+			continue;
+		}
+		exe[len] = '\0';
+		const char *base = strrchr(exe, '/');
+		base = base != nullptr ? base + 1 : exe;
+		if (strcmp(base, "vrserver") == 0 || strcmp(base, "vrcompositor") == 0 || strcmp(base, "vrmonitor") == 0) {
+			steamvr = true;
+		} else if (strcmp(base, "steamtours") == 0) {
+			home = (pid_t)atoi(entry->d_name);
+		}
+	}
+	closedir(proc);
+	return steamvr ? 0 : home;
 }
 
 /*!
@@ -613,6 +663,10 @@ private:
 	//! A vrserver that finished its shutdown but did not end, and since when (finished_vrserver).
 	pid_t m_finished_pid = 0;
 	int64_t m_finished_since_ms = 0;
+	//! SteamVR Home left without SteamVR (leftover_steamvr_home), since when, and when it was asked to end.
+	pid_t m_home_pid = 0;
+	int64_t m_home_since_ms = 0;
+	int64_t m_home_term_ms = 0;
 	int64_t m_unworn_since_ms = 0;
 	int64_t m_worn_since_ms = 0;
 	int64_t m_last_moving_ms = 0;
@@ -621,6 +675,10 @@ private:
 	int m_block_samples = 0;
 	uint32_t m_moving_bits = 0;
 	bool m_in_burst = false;
+	//! The headset's turn since it last lay still (w, x, y, z), its gyro's rate at rest (rad/s), and the turn at a start.
+	double m_turn_q[4] = {1, 0, 0, 0};
+	double m_rest_rate[3] = {0, 0, 0};
+	double m_turned_deg = 0;
 	//! As last read (run, once a second).
 	Settings m_settings;
 
@@ -645,6 +703,44 @@ private:
 		m_block_samples = 0;
 		m_moving_bits = 0;
 		m_in_burst = false;
+		turn_reset();
+	}
+
+	void
+	turn_reset()
+	{
+		m_turn_q[0] = 1;
+		m_turn_q[1] = m_turn_q[2] = m_turn_q[3] = 0;
+	}
+
+	//! One gyro sample (rad/s) into the turn since the headset lay still.
+	void
+	turn_add(const double gyro[3])
+	{
+		const double w[3] = {(gyro[0] - m_rest_rate[0]) * kSampleS, (gyro[1] - m_rest_rate[1]) * kSampleS,
+		                     (gyro[2] - m_rest_rate[2]) * kSampleS};
+		const double angle = std::sqrt(w[0] * w[0] + w[1] * w[1] + w[2] * w[2]);
+		if (angle <= 0) {
+			return;
+		}
+		const double c = std::cos(angle / 2), k = std::sin(angle / 2) / angle;
+		const double d[4] = {c, w[0] * k, w[1] * k, w[2] * k};
+		const double *q = m_turn_q;
+		double r[4] = {q[0] * d[0] - q[1] * d[1] - q[2] * d[2] - q[3] * d[3],
+		               q[0] * d[1] + q[1] * d[0] + q[2] * d[3] - q[3] * d[2],
+		               q[0] * d[2] - q[1] * d[3] + q[2] * d[0] + q[3] * d[1],
+		               q[0] * d[3] + q[1] * d[2] - q[2] * d[1] + q[3] * d[0]};
+		const double n = std::sqrt(r[0] * r[0] + r[1] * r[1] + r[2] * r[2] + r[3] * r[3]);
+		for (int i = 0; i < 4; i++) {
+			m_turn_q[i] = r[i] / n;
+		}
+	}
+
+	//! How far the headset turned away from where it lay, in degrees.
+	double
+	turned_away_deg() const
+	{
+		return 2 * std::acos(std::fmin(1.0, std::fabs(m_turn_q[0]))) * kDegPerRad;
 	}
 
 	void
@@ -690,30 +786,44 @@ private:
 				m_block_sum[k] += gyro[k];
 			}
 			m_block_samples++;
+			turn_add(gyro);
 		}
 		if (now - m_block_start_ms < kBlockMs) {
 			return nullptr;
 		}
 		bool moving = false;
+		double mean[3] = {0, 0, 0};
 		if (m_block_samples > 0) {
 			const double n = m_block_samples;
-			const double rate = std::sqrt(m_block_sum[0] * m_block_sum[0] + m_block_sum[1] * m_block_sum[1] +
-			                              m_block_sum[2] * m_block_sum[2]) /
-			                    n;
+			for (int k = 0; k < 3; k++) {
+				mean[k] = m_block_sum[k] / n;
+			}
+			const double rate = std::sqrt(mean[0] * mean[0] + mean[1] * mean[1] + mean[2] * mean[2]);
 			moving = rate * kDegPerRad > kMovingDegS;
 		}
 		m_block_start_ms = now;
 		m_block_sum[0] = m_block_sum[1] = m_block_sum[2] = 0;
 		m_block_samples = 0;
 		m_moving_bits = ((m_moving_bits << 1) | (moving ? 1u : 0u)) & 0xFFFFFu;
+		if (m_moving_bits == 0) {
+			// Lying still for a second: where it lies now, and its gyro's rate at rest.
+			turn_reset();
+			for (int k = 0; k < 3; k++) {
+				m_rest_rate[k] = 0.9 * m_rest_rate[k] + 0.1 * mean[k];
+			}
+		}
 		const bool armed = now - m_last_moving_ms >= kStillBeforeMs;
 		if (moving && !armed) {
 			// Still moving from before (taken off, put down): not a pick-up yet.
 			m_last_moving_ms = now;
 			m_moving_bits = 0;
+			turn_reset();
 			return nullptr;
 		}
-		if (__builtin_popcount(m_moving_bits) >= kMovingBlocks && (m_settings.pick_up || !m_settings.wear_sensor)) {
+		const double turned = turned_away_deg();
+		if (__builtin_popcount(m_moving_bits) >= kMovingBlocks && turned >= kPickUpTurnDeg &&
+		    (m_settings.pick_up || !m_settings.wear_sensor)) {
+			m_turned_deg = turned;
 			return "picked up";
 		}
 		if (moving) {
@@ -752,7 +862,9 @@ private:
 						log("RiftLinux watchdog: the wear sensor is off (headset.wear_sensor): picking the Rift up "
 						    "starts SteamVR");
 					} else if (read.on && !read.pick_up) {
-						log("RiftLinux watchdog: only putting the Rift on starts SteamVR (steamvr.start_on_pick_up)");
+						log("RiftLinux watchdog: only putting the Rift on starts SteamVR (%s)",
+						    read.worn_by_motion ? "steamvr.start_on_pick_up"
+						                        : "the wear sensor only: headset.worn_by_motion");
 					} else if (read.on && (read.worn_above != kWornAbove || read.unworn_below != kUnwornBelow)) {
 						log("RiftLinux watchdog: wear sensor levels %d and %d (headset.worn_above, unworn_below)",
 						    read.worn_above, read.unworn_below);
@@ -790,6 +902,24 @@ private:
 				} else if (finished != m_finished_pid) {
 					m_finished_pid = finished;
 					m_finished_since_ms = now;
+				}
+				// SteamVR Home left after SteamVR has gone: asked to end after 10 s, made to 3 s later.
+				const pid_t home = leftover_steamvr_home();
+				if (home == 0 || home != m_home_pid) {
+					m_home_pid = home;
+					m_home_since_ms = now;
+					m_home_term_ms = 0;
+				} else if (m_home_term_ms == 0 && now - m_home_since_ms >= 10000) {
+					kill(home, SIGTERM);
+					m_home_term_ms = now;
+					log("RiftLinux watchdog: SteamVR Home (process %d) was left running after SteamVR quit; asked it "
+					    "to end, so Home can start again",
+					    (int)home);
+				} else if (m_home_term_ms != 0 && now - m_home_term_ms >= 3000) {
+					const bool ended = kill(home, SIGKILL) == 0;
+					log("RiftLinux watchdog: SteamVR Home (process %d) did not end; %s", (int)home,
+					    ended ? "ended it" : "could not end it");
+					m_home_pid = 0;
 				}
 				// SteamVR the driver closed because its compositor stopped: started again once it is gone.
 				if (on && !headset_in_use() && take_restart_note()) {
@@ -873,8 +1003,14 @@ private:
 			if (reason == nullptr) {
 				continue;
 			}
-			log("RiftLinux watchdog: the Rift was %s (wear sensor %d): asking Steam to start SteamVR", reason,
-			    wear);
+			if (strcmp(reason, "picked up") == 0) {
+				log("RiftLinux watchdog: the Rift was picked up (wear sensor %d, turned %.0f degrees): asking "
+				    "Steam to start SteamVR",
+				    wear, m_turned_deg);
+			} else {
+				log("RiftLinux watchdog: the Rift was %s (wear sensor %d): asking Steam to start SteamVR", reason,
+				    wear);
+			}
 			close_headset();
 			note_start(reason);
 			if (!start_steamvr_like_a_click()) {

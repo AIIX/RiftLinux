@@ -1,0 +1,43 @@
+// SPDX-FileCopyrightText: 2026 Aditya Mehra <aix.m@outlook.com>
+// SPDX-License-Identifier: BSL-1.0
+// Author: Aditya Mehra <aix.m@outlook.com>
+//
+// Backdrop blur (RiftLinux, XR_MNDX_composition_layer_backdrop_blur): one direction of a Gaussian over the small
+// image a layer pre-pass made (linear light), run twice (across, then down). Only used for layers that ask for it.
+
+#version 460
+
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+
+layout(set = 0, binding = 0) uniform sampler2D src;
+layout(set = 0, binding = 1) uniform writeonly restrict image2D dst;
+
+layout(push_constant) uniform Params
+{
+	// The part of the images in use (the view at its small size).
+	ivec2 size;
+	// (1, 0) across or (0, 1) down.
+	ivec2 dir;
+	// The Gaussian's standard deviation and how many pixels each side it reaches, in the small image's pixels.
+	float sigma;
+	int radius;
+} p;
+
+void main()
+{
+	ivec2 xy = ivec2(gl_GlobalInvocationID.xy);
+	if (xy.x >= p.size.x || xy.y >= p.size.y) {
+		return;
+	}
+	float k = -0.5 / max(p.sigma * p.sigma, 1e-4);
+	vec4 sum = vec4(0.0);
+	float weights = 0.0;
+	for (int i = -p.radius; i <= p.radius; i++) {
+		// The view's edge repeats outwards.
+		ivec2 q = clamp(xy + p.dir * i, ivec2(0), p.size - 1);
+		float w = exp(k * float(i * i));
+		sum += texelFetch(src, q, 0) * w;
+		weights += w;
+	}
+	imageStore(dst, xy, sum / weights);
+}

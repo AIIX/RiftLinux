@@ -9,6 +9,7 @@
 
 add_library(
 	aux_render STATIC
+	render_backdrop.c
 	render_buffer.c
 	render_compute.c
 	render_distortion.c
@@ -34,4 +35,7 @@ if(XRT_MODULE_AUX_SHADERS)
 	add_subdirectory(cache)
 	target_link_libraries(aux_render PRIVATE aux_render_cache)
 	add_dependencies(aux_render render_shader_specialization)
+	# render_backdrop.c includes the generated shader headers.
+	add_dependencies(aux_render comp_shaders_headers)
+	target_include_directories(aux_render PRIVATE ${CMAKE_CURRENT_BINARY_DIR}/shaders)
 endif()

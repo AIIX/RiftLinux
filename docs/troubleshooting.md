@@ -79,10 +79,21 @@ wear sensor cannot see through. Held and turned in the hands for that long it co
 off` counts the wear sensor alone ([Settings](settings.md#the-wear-sensor-face-shields-pads-and-glasses)).
 
 **SteamVR starts when you pick up the headset, and you did not want it to.**
-Steam starts SteamVR when the Rift is put on or picked up; picked up only to put it away, SteamVR quits again by
-itself when the headset is not put on within two minutes. To have only putting it on start SteamVR:
-`riftlinux-setup autostart trigger put-on`. If you use RiftLinux's own runtime without SteamVR, or
+Steam starts SteamVR when the Rift is put on or picked up (handled and turned, not knocked); picked up only to put it
+away, SteamVR quits again by itself when the headset is not put on within two minutes. To have only putting it on
+start SteamVR: `riftlinux-setup autostart trigger put-on` (with `riftlinux-setup wear-sensor motion off` that is the
+default). If you use RiftLinux's own runtime without SteamVR, or
 start SteamVR yourself: `riftlinux-setup autostart off` ([Settings](settings.md#steamvr-starting-when-you-put-the-headset-on)).
+
+**SteamVR starts every time Steam starts, with nobody wearing the headset.**
+As it starts, Steam runs a graphics driver check through a Proton build; with some builds (seen with GE-Proton) that
+check's OpenXR test starts SteamVR. The driver quits that SteamVR again when the headset is not put on; `riftlinux-setup
+check` says whether it happens and through which Proton.
+
+**SteamVR Home does not open any more after SteamVR quit.**
+A SteamVR Home left running after SteamVR quit (seen on KDE after starting Steam with `-pipewire`) keeps every new
+Home from starting. The driver's watchdog in Steam ends it while Steam runs; `riftlinux-setup check` reports one and
+how to end it.
 
 **A game started from Steam runs on the monitor instead of in the headset.**
 SteamVR was not running when the game started. Put the headset on first (SteamVR then starts by itself), or start

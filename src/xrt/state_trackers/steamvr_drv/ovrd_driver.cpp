@@ -13,6 +13,7 @@
  * @ingroup st_ovrd
  */
 
+#include <cctype>
 #include <ctime>
 #include <cstring>
 #include <cassert>
@@ -2795,7 +2796,13 @@ static struct
 	std::string what;
 	int64_t since_ns = 0;
 	int worn_s = 0;
+	//! How long it waits to be put on: 2 minutes, 15 s for Proton's probe (proton_probe_connected).
+	int64_t limit_ns = 120LL * U_TIME_1S_IN_NS;
+	bool by_probe = false;
 } g_headset_start;
+
+//! When the driver started (Init), for telling a start by Proton's probe from a probe later in a session.
+static int64_t g_driver_start_ns = 0;
 
 static void
 headset_start_read()
@@ -2842,12 +2849,123 @@ headset_start_check(bool worn, int64_t now_ns)
 		ovrd_log("SteamVR started by the headset: %s, it stays\n", g_menu.game ? "a game started" : "put on");
 		return false;
 	}
-	if (now_ns - g_headset_start.since_ns < 120LL * U_TIME_1S_IN_NS) {
+	if (now_ns - g_headset_start.since_ns < g_headset_start.limit_ns) {
 		return false;
 	}
 	g_headset_start.watching = false;
-	ovrd_log("SteamVR started by the headset (%s), which was not put on: quitting\n", g_headset_start.what.c_str());
+	if (g_headset_start.by_probe) {
+		ovrd_log("SteamVR started by %s, with the headset not put on: quitting\n", g_headset_start.what.c_str());
+	} else {
+		ovrd_log("SteamVR started by the headset (%s), which was not put on: quitting\n",
+		         g_headset_start.what.c_str());
+	}
 	return true;
+}
+
+/*!
+ * SteamVR started by Steam's graphics driver check (d3ddriverquery) run through Proton: as Steam starts, it runs the
+ * check through a Proton build (seen with GE-Proton), whose OpenXR check starts SteamVR outside Steam, for nobody;
+ * Steam ends the check, and the SteamVR it started, about a minute later. When the process connecting is that check
+ * and the driver started moments before without the watchdog's note (not by the headset), SteamVR quits again as a
+ * headset start not put on does, after 15 s, unless the headset is put on or a game starts; quit_if_not_put_on false
+ * lets it run on. Called for each process that connects, and by proton_probe_scan for one that connected before the
+ * driver was loaded (the check that starts SteamVR is its first client).
+ */
+static void
+proton_probe_connected(uint32_t pid)
+{
+	if (g_headset_start.watching || g_headset_start.by_probe || g_driver_start_ns == 0 ||
+	    os_monotonic_get_ns() - g_driver_start_ns > 20LL * U_TIME_1S_IN_NS) {
+		return;
+	}
+	char path[64];
+	snprintf(path, sizeof(path), "/proc/%u/cmdline", pid);
+	std::string cmdline = rl::watchdog::read_text(path, 4096);
+	std::string lower = cmdline;
+	for (size_t i = 0; i < cmdline.size(); i++) {
+		cmdline[i] = cmdline[i] == '\0' ? ' ' : cmdline[i];
+		lower[i] = (char)tolower((unsigned char)cmdline[i]);
+	}
+	if (lower.find("d3ddriverquery") == std::string::npos) {
+		return;
+	}
+	// The Proton build: the folder holding the program (compatibilitytools.d/<it>/ or common/<it>/), from the
+	// process's program, else its command line (Proton's own script runs under python).
+	snprintf(path, sizeof(path), "/proc/%u/exe", pid);
+	char exe[PATH_MAX] = "";
+	const ssize_t len = readlink(path, exe, sizeof(exe) - 1);
+	exe[len > 0 ? len : 0] = '\0';
+	std::string proton = "Proton";
+	for (const std::string &e : {std::string(exe), cmdline}) {
+		bool found = false;
+		for (const char *marker : {"/compatibilitytools.d/", "/steamapps/common/"}) {
+			// Steam's own runtime folders (SteamLinuxRuntime_*) and SteamVR's come before the Proton one in a command
+			// line.
+			for (size_t at = e.find(marker); at != std::string::npos && !found; at = e.find(marker, at + 1)) {
+				const size_t from = at + strlen(marker);
+				const size_t end = e.find_first_of("/'\"", from);
+				const std::string name = e.substr(from, end == std::string::npos ? std::string::npos : end - from);
+				if (!name.empty() && name.rfind("SteamLinuxRuntime", 0) != 0 && name != "SteamVR") {
+					proton = name;
+					found = true;
+				}
+			}
+			if (found) {
+				break;
+			}
+		}
+		if (found) {
+			break;
+		}
+	}
+	g_headset_start.by_probe = true;
+	g_headset_start.what = "Steam's graphics driver check run through " + proton;
+	cJSON *settings = riftlinux_settings_load();
+	const bool quit = !cJSON_IsFalse(
+	    cJSON_GetObjectItemCaseSensitive(cJSON_GetObjectItemCaseSensitive(settings, "steamvr"), "quit_if_not_put_on"));
+	cJSON_Delete(settings);
+	if (!quit) {
+		ovrd_log("SteamVR started by %s (its OpenXR check starts SteamVR), not by the headset: it runs on "
+		         "(settings.json steamvr.quit_if_not_put_on)\n",
+		         g_headset_start.what.c_str());
+		return;
+	}
+	g_headset_start.watching = true;
+	g_headset_start.worn_s = 0;
+	g_headset_start.since_ns = os_monotonic_get_ns();
+	g_headset_start.limit_ns = 15LL * U_TIME_1S_IN_NS;
+	ovrd_log("Steam's graphics driver check: process %u\n", pid);
+	ovrd_log("SteamVR started by %s (its OpenXR check starts SteamVR), not by the headset: it quits again unless the "
+	         "headset is put on or a game starts\n",
+	         g_headset_start.what.c_str());
+}
+
+//! Once a second for the driver's first 20 s: a graphics driver check already running (proton_probe_connected).
+static void
+proton_probe_scan()
+{
+	if (g_headset_start.watching || g_headset_start.by_probe || g_driver_start_ns == 0 ||
+	    os_monotonic_get_ns() - g_driver_start_ns > 20LL * U_TIME_1S_IN_NS) {
+		return;
+	}
+	DIR *proc = opendir("/proc");
+	if (proc == nullptr) {
+		return;
+	}
+	const uid_t uid = getuid();
+	struct dirent *entry;
+	while ((entry = readdir(proc)) != nullptr && !g_headset_start.by_probe) {
+		if (entry->d_name[0] < '0' || entry->d_name[0] > '9') {
+			continue;
+		}
+		struct stat st = {};
+		const std::string dir = std::string("/proc/") + entry->d_name;
+		if (stat(dir.c_str(), &st) != 0 || st.st_uid != uid) {
+			continue;
+		}
+		proton_probe_connected((uint32_t)atoi(entry->d_name));
+	}
+	closedir(proc);
 }
 
 /*!
@@ -3742,6 +3860,7 @@ CServerDriver_Monado::Init(vr::IVRDriverContext *pDriverContext)
 	riftlinux_load_menu();
 	riftlinux_load_standby();
 	headset_start_read();
+	g_driver_start_ns = os_monotonic_get_ns();
 #endif
 
 #ifdef XRT_OS_LINUX
@@ -4280,6 +4399,7 @@ CServerDriver_Monado::RunFrame()
 			u_notice_sensors placed_now = {};
 			const bool placed_known = u_notice_get_sensors(&placed_now);
 			const bool worn_now = m_xhmd != nullptr && head_worn(m_xhmd);
+			proton_probe_scan();
 			if (headset_start_check(worn_now, now_ns)) {
 				g_quit_requested.store(true);
 			}
@@ -4498,6 +4618,9 @@ CServerDriver_Monado::RunFrame()
 			                                                                      : "process disconnected:";
 			ovrd_log("SteamVR event: %s pid %u (%s)%s\n", what, event.data.process.pid, comm,
 			         vr::VRServerDriverHost()->IsExiting() ? ", SteamVR exiting" : "");
+			if (event.eventType == vr::VREvent_ProcessConnected) {
+				proton_probe_connected(event.data.process.pid);
+			}
 			// SteamVR quitting: it is exiting, or its compositor or monitor is asked to quit (Home is asked to quit
 			// for a game too).
 			if (vr::VRServerDriverHost()->IsExiting() ||

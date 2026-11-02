@@ -81,4 +81,6 @@ what WayVR's bindings expect.
   `/usr/lib/riftlinux/native/monado-service`.
 - Interaction profile for the controllers: Oculus Touch (`/interaction_profiles/oculus/touch_controller`).
 - HDR layers: the `XR_MNDX_composition_layer_hdr` extension (provisional), described in the README.
+- Frosted glass (what is behind a quad or cylinder layer blurred): the `XR_MNDX_composition_layer_backdrop_blur`
+  extension (provisional), described in the README; `riftlinux-setup backdrop-blur off` switches it off.
 - Building the runtime from source: README, [Build](../README.md#build).

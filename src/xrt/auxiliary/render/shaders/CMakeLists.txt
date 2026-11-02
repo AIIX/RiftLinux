@@ -12,6 +12,7 @@ include(ShaderSpecialization)
 set(DEPENDS auto_hdr.inc.glsl blit.inc.glsl hsv.inc.glsl layer_defines.inc.glsl motion.inc.glsl srgb.inc.glsl)
 
 set(SHADERS
+    backdrop_blur.comp
     blit.comp
     blit_ms.comp
     clear.comp
@@ -71,6 +72,17 @@ spirv_shaders(
 	DEPENDS
 	${DEPENDS}
 	)
+
+# RiftLinux: layer.comp's second build, with the backdrop blur (RL_BACKDROP_BLUR, XR_MNDX_composition_layer_backdrop_blur),
+# used only for views with a layer that asks for it; the build above stays as it is.
+set(LAYER_BLUR_HEADER "${CMAKE_CURRENT_BINARY_DIR}/layer_blur.comp.h")
+add_custom_command(
+	OUTPUT ${LAYER_BLUR_HEADER}
+	COMMAND ${GLSLANGVALIDATOR_COMMAND} -V --target-env spirv1.0 -DRL_BACKDROP_BLUR=1
+		${CMAKE_CURRENT_SOURCE_DIR}/layer.comp --vn layer_blur_comp -o ${LAYER_BLUR_HEADER}
+	DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/layer.comp ${DEPENDS}
+	)
+list(APPEND SHADER_HEADERS ${LAYER_BLUR_HEADER})
 
 # Create a custom target that depends on the shader headers.
 # This ensures the headers are built before they're needed.

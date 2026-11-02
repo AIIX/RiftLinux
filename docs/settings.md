@@ -28,10 +28,11 @@ defaults, and `riftlinux-setup fix` then checks the rest.
 | Command | What it changes | Applies |
 | --- | --- | --- |
 | `riftlinux-setup autostart on\|off\|status` | Steam starts SteamVR when the Rift is put on or picked up (on by default) | At once |
-| `riftlinux-setup autostart trigger put-on\|pick-up` | What starts it: putting the Rift on only, or also picking it up (default) | At once |
+| `riftlinux-setup autostart trigger put-on\|pick-up\|default` | What starts it: putting the Rift on only, or also picking it up (handled and turned, not a knock); default: picking up too, unless movement is left out (`wear-sensor motion off`) | At once |
 | `riftlinux-setup autostart quit-unused on\|off` | A SteamVR started by picking the Rift up quits again when it is not put on (on by default) | Next start |
 | `riftlinux-setup controller-sleep 3\|5\|7\|off\|status` | Minutes after the headset is taken off before the Touch controllers may go to sleep (5 by default; the settings file takes 1 to 60); off keeps them awake | Next start |
 | `riftlinux-setup standby worn\|pick-up\|status` | When SteamVR's standby ends: the headset worn (default), or also moved, by SteamVR's own rule | Next start |
+| `riftlinux-setup backdrop-blur on\|off\|status` | RiftLinux's own runtime: frosted glass (what is behind a layer blurred) for the layers an application asks it for; on by default, off: those layers without it. Nothing else uses it | Next runtime start |
 | `riftlinux-setup game-menu close\|keep\|status` | Steam's menu, which Steam opens as a game starts: closed once the game shows (default), or kept open | Next start |
 | `riftlinux-setup wear-sensor test` | Nothing: shows what the headset's wear sensor reads while you put it on and take it off | - |
 | `riftlinux-setup wear-sensor on\|off\|status` | Whether the wear sensor is used; off counts the headset as worn whenever it runs | Next start |
@@ -60,9 +61,13 @@ With Steam running, SteamVR starts by itself when you put the Rift on or pick it
 Windows. A game you then start from Steam goes straight into the headset. Steam starts SteamVR the same way as when
 you click it in your library. Nothing happens while SteamVR or RiftLinux's own runtime is already using the headset,
 and quitting SteamVR with the headset on does not start it again: take the headset off or put it down first.
-Picking the headset up only to put it away starts SteamVR too; it quits again by itself when the headset is not
-put on within two minutes and no game starts (the same for a SteamVR that Steam started again after its compositor
-stopped).
+Picking the headset up counts when it is handled and turned as on its way to a face; a knock on the table or someone
+moving on the bed it lies on does not start SteamVR. Picking it up only to put it away starts SteamVR too; it quits
+again by itself when the headset is not put on within two minutes and no game starts (the same for a SteamVR that Steam
+started again after its compositor stopped).
+
+With movement left out of wearing (`riftlinux-setup wear-sensor motion off`, the wear sensor alone), picking the
+headset up does not start SteamVR either: only putting it on does.
 
 To have only putting the headset on start SteamVR (its wear sensor, at the levels set below), not picking it up:
 
@@ -71,7 +76,8 @@ riftlinux-setup autostart trigger put-on
 ```
 
 With the wear sensor turned off, putting the headset on cannot be seen, so picking it up still starts SteamVR.
-`riftlinux-setup autostart trigger pick-up` goes back to the default. To keep a SteamVR that picking the headset up
+`riftlinux-setup autostart trigger pick-up` makes picking it up start SteamVR whatever the wear-sensor setting;
+`riftlinux-setup autostart trigger default` goes back to the default (picking up counts unless movement is left out). To keep a SteamVR that picking the headset up
 started running even when the headset is not put on:
 
 ```
@@ -226,7 +232,7 @@ the file has its default.
 | Key | Default | What it does |
 | --- | --- | --- |
 | `steamvr.start_when_put_on` | `true` | Steam starts SteamVR when the Rift is put on or picked up |
-| `steamvr.start_on_pick_up` | `true` | `false`: only putting the Rift on starts it (with the wear sensor on) |
+| `steamvr.start_on_pick_up` | as `headset.worn_by_motion` (`true`) | `false`: only putting the Rift on starts it (with the wear sensor on); not set: picking up counts unless movement is left out of wearing |
 | `steamvr.quit_if_not_put_on` | `true` | A SteamVR that Steam started by itself (the Rift picked up, or SteamVR started again after its compositor stopped) quits again when the headset is not worn within two minutes and no game starts |
 | `steamvr.close_menu_for_games` | `true` | Steam's menu, opened as a game starts, closes once the game shows; `false` keeps it |
 | `steamvr.standby` | `"worn"` | SteamVR's standby ends when the headset is worn; `"pick-up"`: also when it moves, by SteamVR's own rule |
@@ -239,5 +245,6 @@ the file has its default.
 | `headset.not_worn` | `"black"` | `"black"`: the display stays on showing black while the headset is not worn; `"off"`: it switches off |
 | `headset.black_then_off_min` | `10` | With `"black"`: minutes black before the display switches off; negative: never |
 | `display.direct_mode` | `true` | SteamVR's frames through RiftLinux's compositor; `false`: SteamVR's own (`riftlinux-setup direct-mode`) |
+| `display.backdrop_blur` | `true` | RiftLinux's own runtime: frosted glass for the layers an application asks it for; `false`: those layers without it (`riftlinux-setup backdrop-blur`) |
 
 The picture, notice, tracking and recording keys are in the README's [settings table](../README.md#settings).

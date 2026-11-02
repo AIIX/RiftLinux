@@ -72,6 +72,38 @@ layout(set = 0, binding = 5, std430) buffer restrict HdrStats
 {
 	uint bins[];
 } hdr_stats;
+
+#ifdef RL_BACKDROP_BLUR
+/*
+ * Backdrop blur (RiftLinux, XR_MNDX_composition_layer_backdrop_blur): only in this shader's second build, which the
+ * compositor uses for a view only while one of its layers asks for the blur; the first build has none of this.
+ * A pre-pass (pass >= 0) composes the layers under blurred layer `pass` at 1/downsample of the resolution, four
+ * samples a pixel, into the target (a small image), which is then blurred into one of the source images; the main
+ * pass (pass < 0) mixes each blurred layer's blurred backdrop under it, by the layer's alpha over its mask alpha.
+ */
+#define RL_MAX_BACKDROP_BLURS 4
+struct Backdrop
+{
+	// x the blurred layer, y its blurred backdrop (source image), z the layers its pre-pass composes (those under x)
+	ivec4 index;
+	// x mask alpha, y saturation, zw the blurred image's coordinates for the view's (the part of it in use)
+	vec4 params;
+	// rgb mixed over the blurred backdrop by a
+	vec4 tint;
+};
+layout(set = 0, binding = 6, std140) uniform restrict BackdropConfig
+{
+	// x the number of blurred layers, y the pre-pass's downsampling (pixels a side)
+	ivec4 info;
+	Backdrop blurs[RL_MAX_BACKDROP_BLURS];
+} backdrop;
+layout(push_constant) uniform BackdropPass
+{
+	int pass;
+} backdrop_pass;
+// This invocation's place in the view, 0..1 (pixel centres), where the blurred backdrops are sampled.
+vec2 rl_pixel_uv;
+#endif
 struct Layer {
 	vec4 post_transform;
 
@@ -159,6 +191,10 @@ vec4 process_layer_colour(vec4 rgba, uint layer)
 			float y = dot(c, vec3(0.2126, 0.7152, 0.0722));
 			if (y > 1.0) {
 				uint bin = uint(min(floor(log2(y) * 4.0), 27.0));
+#ifdef RL_BACKDROP_BLUR
+				// The pre-passes' samples are not the view's pixels: not counted.
+				if (backdrop_pass.pass < 0)
+#endif
 				atomicAdd(hdr_stats.bins[uint(slot) * 32u + bin], 1u);
 			}
 		}
@@ -620,11 +656,38 @@ vec4 do_quad(vec2 view_uv, uint layer)
 	return vec4(colour);
 }
 
+#ifdef RL_BACKDROP_BLUR
+//! What is composed under @p layer so far, with the blurred backdrop mixed in where the layer asks for it.
+vec3 backdrop_under(vec3 accum, vec4 rgba, uint layer)
+{
+	for (int i = 0; i < backdrop.info.x; i++) {
+		if (backdrop.blurs[i].index.x != int(layer)) {
+			continue;
+		}
+		float w = clamp(rgba.a / backdrop.blurs[i].params.x, 0.0, 1.0);
+		if (w <= 0.0) {
+			return accum;
+		}
+		vec3 b = textureLod(source[backdrop.blurs[i].index.y], rl_pixel_uv * backdrop.blurs[i].params.zw, 0.0).rgb;
+		float luma = dot(b, vec3(0.2126, 0.7152, 0.0722));
+		b = max(mix(vec3(luma), b, backdrop.blurs[i].params.y), vec3(0.0));
+		b = mix(b, backdrop.blurs[i].tint.rgb, backdrop.blurs[i].tint.a);
+		return mix(accum, b, w);
+	}
+	return accum;
+}
+#endif
+
 vec4 do_layers(vec2 view_uv)
 {
 	vec4 accum = vec4(0, 0, 0, 0);
 
 	int layer_count = ubo.layer_count.x;
+#ifdef RL_BACKDROP_BLUR
+	if (backdrop_pass.pass >= 0) {
+		layer_count = min(layer_count, backdrop.blurs[backdrop_pass.pass].index.z);
+	}
+#endif
 	for (uint layer = 0; layer < layer_count; layer++) {
 		vec4 rgba = vec4(0, 0, 0, 0);
 
@@ -669,6 +732,10 @@ vec4 do_layers(vec2 view_uv)
 
 		rgba = process_layer_colour(rgba, layer);
 
+#ifdef RL_BACKDROP_BLUR
+		accum.rgb = backdrop_under(accum.rgb, rgba, layer);
+#endif
+
 		if (LAYER.layer_data.unpremultiplied_alpha != 0) {
 			// Unpremultipled blend factor of src.a.
 			accum.rgb = mix(accum.rgb, rgba.rgb, rgba.a);
@@ -689,6 +756,29 @@ void main()
 
 	ivec2 offset = ivec2(ubo.view.xy);
 	ivec2 extent = ivec2(ubo.view.zw);
+
+#ifdef RL_BACKDROP_BLUR
+	if (backdrop_pass.pass >= 0) {
+		// Pre-pass: one pixel of the small image from four samples of its square of the view, linear light.
+		int f = max(backdrop.info.y, 2);
+		ivec2 small = (extent + f - 1) / f;
+		if (ix >= small.x || iy >= small.y) {
+			return;
+		}
+		vec4 sum = vec4(0.0);
+		for (int sy = 0; sy < 2; sy++) {
+			for (int sx = 0; sx < 2; sx++) {
+				uint px = min(ix * uint(f) + uint(f / 4 + sx * (f / 2)), uint(extent.x - 1));
+				uint py = min(iy * uint(f) + uint(f / 4 + sy * (f / 2)), uint(extent.y - 1));
+				rl_pixel_uv = (vec2(px, py) + 0.5) / vec2(extent);
+				sum += do_layers(position_to_view_uv(extent, px, py));
+			}
+		}
+		imageStore(target, ivec2(ix, iy), sum * 0.25);
+		return;
+	}
+	rl_pixel_uv = (vec2(ix, iy) + 0.5) / vec2(extent);
+#endif
 
 	if (ix >= extent.x || iy >= extent.y) {
 		return;

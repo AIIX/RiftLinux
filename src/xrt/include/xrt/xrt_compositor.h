@@ -491,6 +491,23 @@ struct xrt_layer_hdr_data
 };
 
 /*!
+ * Backdrop blur of a quad or cylinder layer (RiftLinux, XR_MNDX_composition_layer_backdrop_blur): what the compositor
+ * shows behind the layer is blurred where the layer covers it. All zero: none, so producers that zero their layer data
+ * are unaffected. Plain data: it travels by value through IPC.
+ */
+struct xrt_layer_backdrop_blur_data
+{
+	//! The Gaussian's standard deviation as an angle seen from the eye, in radians; 0: no blur.
+	float radians;
+	//! Of the blurred backdrop: 1 as it is, 0 grey.
+	float saturation;
+	//! The layer's alpha from which the blur is full (fading out to none at alpha 0).
+	float mask_alpha;
+	//! Mixed over the blurred backdrop by its alpha; linear light, 1.0 white.
+	struct xrt_colour_rgba_f32 tint;
+};
+
+/*!
  * All the pure data values associated with a composition layer.
  *
  * The @ref xrt_swapchain references and @ref xrt_device are provided outside of
@@ -561,6 +578,11 @@ struct xrt_layer_data
 	 * HDR description (RiftLinux); all zero: SDR.
 	 */
 	struct xrt_layer_hdr_data hdr;
+
+	/*!
+	 * Backdrop blur (RiftLinux), quad and cylinder layers only; all zero: none.
+	 */
+	struct xrt_layer_backdrop_blur_data backdrop_blur;
 
 	/*!
 	 * Union of data values for the various layer types.

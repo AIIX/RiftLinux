@@ -20,6 +20,9 @@
                                           none, the settings start from the defaults and fix runs
   riftlinux-setup direct-mode on|off|status
                                           SteamVR's frames through our compositor (Auto-HDR, motion smoothing) or not
+  riftlinux-setup backdrop-blur on|off|status
+                                          RiftLinux's own runtime: frosted glass for the layers an application asks it
+                                          for (on by default; off: those layers without it); nothing else uses it
   riftlinux-setup nvidia-vrr status|conceal|restore
                                           NVIDIA on Wayland: a monitor offering adaptive sync (VRR) makes NVIDIA show
                                           the headset's frames without vsync (the lower part tears and lags); conceal
@@ -38,9 +41,10 @@
                                           tracker's details in SteamVR's log; large files, turn it off after
   riftlinux-setup autostart on|off|status Steam starts SteamVR when the Rift is put on or picked up (on by default;
                                           off if you use RiftLinux's own runtime without SteamVR); at once
-  riftlinux-setup autostart trigger put-on|pick-up
+  riftlinux-setup autostart trigger put-on|pick-up|default
                                           what starts it: putting the Rift on only (its wear sensor), or also
-                                          picking it up (default)
+                                          picking it up (handled and turned, not a knock); default: picking up too
+                                          unless movement is left out (wear-sensor motion off)
   riftlinux-setup autostart quit-unused on|off
                                           a SteamVR started by picking the Rift up quits again when it is not put on
                                           within two minutes (on by default); off lets it run on
@@ -88,6 +92,7 @@ import datetime
 import glob
 import json
 import os
+import re
 import shutil
 import struct
 import subprocess
@@ -210,7 +215,7 @@ def last_known(p):
 # The keys this tool writes, as the driver reads them: (kind, low, high or choices, what the driver uses otherwise).
 SETTINGS_KEYS = {
     ("steamvr", "start_when_put_on"): ("bool", None, None, "true"),
-    ("steamvr", "start_on_pick_up"): ("bool", None, None, "true"),
+    ("steamvr", "start_on_pick_up"): ("bool", None, None, "not set: as headset.worn_by_motion"),
     ("steamvr", "quit_if_not_put_on"): ("bool", None, None, "true"),
     ("steamvr", "close_menu_for_games"): ("bool", None, None, "true"),
     ("steamvr", "standby"): ("choice", None, ("worn", "pick-up"), '"worn"'),
@@ -224,6 +229,7 @@ SETTINGS_KEYS = {
     ("headset", "not_worn"): ("choice", None, ("black", "off"), '"black"'),
     ("headset", "black_then_off_min"): ("number", None, 10080, "10 (negative: never; at most a week)"),
     ("display", "direct_mode"): ("bool", None, None, "true"),
+    ("display", "backdrop_blur"): ("bool", None, None, "true"),
     ("diagnostics", "record"): ("bool", None, None, "false"),
 }
 
@@ -673,6 +679,90 @@ def check_leaked_handles(p, opts):
                   "Holding leaked GPU fence handles: " + ", ".join(leaky) + ". Every program started from this "
                   "desktop gets a copy of them, and SteamVR Home or games can then fail to open files or crash. Log "
                   "out and back in (or restart) before playing. Seen with GNOME on NVIDIA after screen recordings.")
+
+
+def own_processes_by_exe():
+    """{executable's base name: [process ids]} for this user's processes."""
+    uid = os.getuid()
+    found = {}
+    for pid in os.listdir("/proc"):
+        if not pid.isdigit():
+            continue
+        try:
+            if os.stat(f"/proc/{pid}").st_uid != uid:
+                continue
+            exe = os.path.basename(os.readlink(f"/proc/{pid}/exe"))
+        except OSError:
+            continue
+        found.setdefault(exe, []).append(int(pid))
+    return found
+
+
+def check_steamvr_home_leftover(p, opts):
+    """SteamVR Home (steamtours) still running after SteamVR quit: every later Home start fails while it runs (seen on
+    KDE after Steam was started with -pipewire). The watchdog in Steam ends it; this reports it."""
+    title = "SteamVR Home left running"
+    procs = own_processes_by_exe()
+    if any(name in procs for name in ("vrserver", "vrcompositor", "vrmonitor")) or "steamtours" not in procs:
+        return result("home", title, "ok", "None (SteamVR Home runs only with SteamVR).")
+    pids = " ".join(str(x) for x in procs["steamtours"])
+    return result("home", title, "warn",
+                  f"SteamVR Home (process {pids}) still runs although SteamVR has quit: while it does, SteamVR Home "
+                  "cannot start again. The driver's watchdog in Steam ends it while Steam runs; or end it yourself: "
+                  f"kill -9 {pids}")
+
+
+def check_test_leftovers(p, opts):
+    """Packages from a RiftLinux test that should not stay: our KWin VR Mode test build (kwin-vr) kept KWin from
+    updating, and under a newer Plasma it crashed KWin (screen sharing)."""
+    title = "Leftovers from RiftLinux tests"
+    found = []
+    if shutil.which("pacman") and subprocess.run(["pacman", "-Q", "kwin-vr"], capture_output=True).returncode == 0:
+        found.append("the kwin-vr package (a KWin VR Mode test build): sudo pacman -S kwin brings back your "
+                     "distribution's KWin")
+    if shutil.which("dpkg-query") and "install ok" in subprocess.run(
+            ["dpkg-query", "-W", "-f=${Status}", "kwin-vr"], capture_output=True, text=True).stdout:
+        found.append("the kwin-vr package (a KWin VR Mode test build): remove it and install your distribution's KWin")
+    try:
+        for line in open("/etc/pacman.conf"):
+            words = line.split("#", 1)[0].split()
+            if len(words) >= 2 and words[0] == "IgnorePkg" and any(w in ("kwin", "kwin-vr") for w in words[2:]):
+                found.append("KWin held back from updates (IgnorePkg in /etc/pacman.conf): remove kwin there")
+    except OSError:
+        pass
+    if not found:
+        return result("leftovers", title, "ok", "None found.")
+    return result("leftovers", title, "warn", "; ".join(found) + ".")
+
+
+def check_proton_probe(p, opts):
+    """Steam runs its graphics driver check (d3ddriverquery64.exe) through a Proton build as it starts; with some
+    builds (seen with GE-Proton) that check's OpenXR test starts SteamVR, for nobody, and Steam ends both about a
+    minute later ("Timeout calling process" in Steam's log). The driver quits such a SteamVR again; this says it
+    happens and through which Proton."""
+    title = "SteamVR started by Steam's driver check"
+    builds = {}
+    last = ""
+    for root in p.steam_roots():
+        for name in ("console_log.txt", "console-linux.txt"):
+            try:
+                text = open(os.path.join(root, "logs", name), errors="replace").read()
+            except OSError:
+                continue
+            for line in text.splitlines():
+                if "Timeout calling process" not in line or "d3ddriverquery" not in line.lower():
+                    continue
+                m = re.search(r"-- '([^']*)'/proton", line)
+                build = os.path.basename(m.group(1)) if m else "a Proton build"
+                builds[build] = builds.get(build, 0) + 1
+                last = line[1:20] if line.startswith("[") else last
+    if not builds:
+        return result("probe", title, "ok", "Not seen in Steam's log.")
+    which = ", ".join(f"{b} ({n} times)" for b, n in builds.items())
+    return result("probe", title, "info",
+                  f"Steam's graphics driver check, run through {which}, timed out (last {last}); with such a build "
+                  "its OpenXR test starts SteamVR as Steam starts. The driver quits that SteamVR again when the "
+                  "headset is not put on.")
 
 
 # Steam loads the driver's watchdog (bin/linux32, what starts SteamVR when the Rift is put on) as it starts and keeps
@@ -1759,7 +1849,8 @@ def check_headset_mode(p, opts):
 CHECKS = [check_arch, check_steam, check_package, check_registered, check_other_drivers, check_sandboxed, check_nvidia_vrr, check_enabled, check_devices,
           check_lsusb, check_access, check_usb_power, check_holders, check_headset_mode, check_display, check_priority,
           check_openvr_runtime, check_steamvr_launch, check_steamvr_tool, check_env_overrides, check_launch_options,
-          check_leaked_handles, check_watchdog_loaded, check_openxr, check_chaperone,
+          check_leaked_handles, check_steamvr_home_leftover, check_test_leftovers, check_proton_probe,
+          check_watchdog_loaded, check_openxr, check_chaperone,
           check_settings, check_realtime, check_calibration, check_native]
 REPAIR = {"enabled", "priority", "room", "settings", "registered", "others", "sandboxed", "usbpower", "lsusb", "launch"}
 
@@ -1979,9 +2070,13 @@ def autostart_on(s):
 
 
 def autostart_settings(s):
-    """(on, picked up too, quits again when not put on), as the watchdog and the driver read them."""
+    """(on, picked up too, quits again when not put on), as the watchdog and the driver read them. Picking up,
+    when not set: as headset.worn_by_motion (the wear sensor only leaves movement out of both)."""
     steamvr = s.get("steamvr") if isinstance(s.get("steamvr"), dict) else {}
-    return (steamvr.get("start_when_put_on", True) is not False, steamvr.get("start_on_pick_up", True) is not False,
+    headset = s.get("headset") if isinstance(s.get("headset"), dict) else {}
+    motion = headset.get("worn_by_motion", True) is not False
+    pick_up = steamvr.get("start_on_pick_up", motion)
+    return (steamvr.get("start_when_put_on", True) is not False, pick_up is not False,
             steamvr.get("quit_if_not_put_on", True) is not False)
 
 
@@ -1990,6 +2085,9 @@ def autostart_text(s):
     if not on:
         return "off"
     if not pick_up:
+        steamvr = s.get("steamvr") if isinstance(s.get("steamvr"), dict) else {}
+        if "start_on_pick_up" not in steamvr:
+            return "on, when the Rift is put on (movement is left out: wear-sensor motion off)"
         return "on, when the Rift is put on"
     return ("on, when the Rift is put on or picked up; " +
             ("quits again when it is not put on" if quit_unused else "runs on when it is not put on"))
@@ -2003,16 +2101,16 @@ def cmd_autostart(p, opts):
     if opts.mode == "status":
         print(f"SteamVR starts by itself: {autostart_text(s)}")
         return 0
-    want = {"trigger": ("put-on", "pick-up"), "quit-unused": ("on", "off")}.get(opts.mode)
+    want = {"trigger": ("put-on", "pick-up", "default"), "quit-unused": ("on", "off")}.get(opts.mode)
     if want and opts.value not in want:
         print(f"riftlinux-setup autostart {opts.mode} {'|'.join(want)}")
         return 2
     steamvr = s.get("steamvr") if isinstance(s.get("steamvr"), dict) else {}
     if opts.mode == "trigger":
-        if opts.value == "pick-up":
+        if opts.value == "default":
             steamvr.pop("start_on_pick_up", None)
         else:
-            steamvr["start_on_pick_up"] = False
+            steamvr["start_on_pick_up"] = opts.value == "pick-up"
     elif opts.mode == "quit-unused":
         if opts.value == "on":
             steamvr.pop("quit_if_not_put_on", None)
@@ -2028,8 +2126,11 @@ def cmd_autostart(p, opts):
         s.pop("steamvr", None)
     write_json(p.settings, s)
     if opts.mode == "trigger":
-        print("Putting the Rift on starts SteamVR; picking it up does not." if opts.value == "put-on" else
-              "Putting the Rift on or picking it up starts SteamVR.")
+        if opts.value == "default":
+            print(f"Default: SteamVR starts {autostart_text(s)[4:]}.")
+        else:
+            print("Putting the Rift on starts SteamVR; picking it up does not." if opts.value == "put-on" else
+                  "Putting the Rift on or picking it up (handled and turned, not a knock) starts SteamVR.")
         if opts.value == "put-on" and (s.get("headset") or {}).get("wear_sensor") is False:
             print("The wear sensor is off (riftlinux-setup wear-sensor on): until it is on, picking the Rift up still "
                   "starts SteamVR.")
@@ -2144,6 +2245,32 @@ def cmd_game_menu(p, opts):
     else:
         print("Kept: Steam's menu stays open when a game starts; close it with the menu button (from SteamVR's next "
               "start).")
+    return 0
+
+
+def cmd_backdrop_blur(p, opts):
+    """settings.json display.backdrop_blur: the own runtime blurs what is behind a layer when its application asks
+    for it (XR_MNDX_composition_layer_backdrop_blur); off: those layers are shown without it. Read at the runtime's
+    start."""
+    s = load_settings(p)
+    display = s.get("display") if isinstance(s.get("display"), dict) else {}
+    if opts.mode == "status":
+        on = display.get("backdrop_blur") is not False
+        print(f"Backdrop blur (frosted glass for applications that ask for it): {'on' if on else 'off'}")
+        return 0
+    if opts.mode == "on":
+        display.pop("backdrop_blur", None)
+    else:
+        display["backdrop_blur"] = False
+    if display:
+        s["display"] = display
+    else:
+        s.pop("display", None)
+    write_json(p.settings, s)
+    if opts.mode == "on":
+        print("On: applications that ask for frosted glass get it (from the runtime's next start).")
+    else:
+        print("Off: layers that ask for frosted glass are shown without it (from the runtime's next start).")
     return 0
 
 
@@ -2266,6 +2393,12 @@ def cmd_wear_sensor(p, opts):
             h["worn_by_motion_after_s"] = seconds
         save_headset_settings(p, s, h)
         print(f"{motion_text(h)[0].upper()}{motion_text(h)[1:]}; from the next start of SteamVR or the runtime.")
+        steamvr = s.get("steamvr") if isinstance(s.get("steamvr"), dict) else {}
+        if "start_on_pick_up" not in steamvr:
+            print("Picking the Rift up " + ("no longer starts SteamVR either, only putting it on does "
+                                            "(riftlinux-setup autostart trigger pick-up keeps it)."
+                                            if h.get("worn_by_motion") is False else
+                                            "starts SteamVR again (handled and turned, not a knock)."))
         return 0
     if opts.mode == "levels":
         if len(opts.values) == 1 and opts.values[0] == "default":
@@ -2992,6 +3125,8 @@ def main():
     sb.add_argument("mode", choices=["worn", "pick-up", "status"])
     gm = sub.add_parser("game-menu")
     gm.add_argument("mode", choices=["close", "keep", "status"])
+    bb = sub.add_parser("backdrop-blur")
+    bb.add_argument("mode", choices=["on", "off", "status"])
     ws = sub.add_parser("wear-sensor")
     ws.add_argument("mode", choices=["on", "off", "status", "test", "levels", "motion"])
     ws.add_argument("values", nargs="*")
@@ -3032,6 +3167,8 @@ def main():
         return cmd_standby(p, opts)
     if opts.cmd == "game-menu":
         return cmd_game_menu(p, opts)
+    if opts.cmd == "backdrop-blur":
+        return cmd_backdrop_blur(p, opts)
     if opts.cmd == "wear-sensor":
         return cmd_wear_sensor(p, opts)
     if opts.cmd == "display-off":

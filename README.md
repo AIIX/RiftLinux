@@ -36,7 +36,7 @@ in SteamVR, motion smoothing, Auto-HDR, and tracking measured against the Oculus
 <https://aiix.github.io/RiftLinux/>): [Getting started](docs/getting-started.md), [FAQ](docs/faq.md),
 [Troubleshooting](docs/troubleshooting.md).
 
-## Project status (29 October 2026, release 0.1.3)
+## Project status (2 November 2026, release 0.1.3, pre-release 0.1.4)
 
 Used daily on the maintainer's machine, which runs two systems: Ubuntu 25.04 (GNOME 48, X11 and Wayland) and CachyOS
 (KDE Plasma 6.8, Wayland), with an NVIDIA GPU (drivers 580 and 615), SteamVR 2.17 and 2.18 and two or three sensors. Every
@@ -209,6 +209,11 @@ ArchWiki, vronlinux.org, read in October 2026.
   `src/external/openxr_includes/openxr/XR_MNDX_composition_layer_hdr.h`; `riftlinux-openxr-hdr-test` is a working
   example). No player does either yet. Each HDR part has its own switch ([Settings](#settings)).
 - **HDR Bright**: HDR games and videos placed brighter, like a TV's bright picture mode (a Rift tab switch).
+- **Frosted glass** for native OpenXR applications: a quad or cylinder layer can ask for what is behind it (other
+  layers, other applications' included) to be blurred, with `XrCompositionLayerBackdropBlurMNDX` (extension
+  `XR_MNDX_composition_layer_backdrop_blur`, provisional, header
+  `src/external/openxr_includes/openxr/XR_MNDX_composition_layer_backdrop_blur.h`; `riftlinux-openxr-hdr-test
+  ... glass:20` is a working example). Layers that do not ask are composed as before.
 - **16-bit float compositing** and **dithering** to the panel's 8-bit link: no banding in dark gradients.
 - **One resampling** from the game's image to the panel (the lens pass reads it directly), and the layer renderer's
   images at the CV1's own resolution when overlays are shown: a sharper picture than resampling twice.
@@ -585,7 +590,7 @@ lists both. A file that cannot be read is left as it is and the last good one (`
 | Key | Default | What it does |
 | --- | --- | --- |
 | `steamvr.start_when_put_on` | `true` | ⚡ Steam starts SteamVR when the Rift is put on or picked up (the driver's watchdog, which Steam runs while SteamVR does not); `riftlinux-setup autostart on\|off` |
-| `steamvr.start_on_pick_up` | `true` | ⚡ `false`: only putting the Rift on starts SteamVR, not picking it up (with the wear sensor on); `riftlinux-setup autostart trigger put-on\|pick-up` |
+| `steamvr.start_on_pick_up` | as `headset.worn_by_motion` (`true`) | ⚡ `false`: only putting the Rift on starts SteamVR, not picking it up (handled and turned; with the wear sensor on); not set: picking up counts unless movement is left out; `riftlinux-setup autostart trigger put-on\|pick-up\|default` |
 | `steamvr.quit_if_not_put_on` | `true` | A SteamVR that Steam started by itself (the headset picked up, or SteamVR started again after its compositor stopped) quits again when the headset is not worn within two minutes and no game starts; `riftlinux-setup autostart quit-unused on\|off` |
 | `steamvr.close_menu_for_games` | `true` | Steam's menu, which Steam opens as a game starts, closes once the game shows (one opened with the menu button while the game runs stays); `false` keeps it; `riftlinux-setup game-menu close\|keep` |
 | `steamvr.standby` | `"worn"` | SteamVR's standby ends when the headset is worn (moving it where it lies does not wake SteamVR); `"pick-up"`: also when it moves, by SteamVR's own rule, as on Windows (the picture still waits until it is worn); `riftlinux-setup standby worn\|pick-up` |
@@ -630,6 +635,7 @@ lists both. A file that cannot be read is left as it is and the last good one (`
 | `display.hdr_measured_peak` | `true` | 🧪⚡ HDR content's peak measured while it is shown, when no metadata gives one; `false`: 1000 nits assumed, and a float image is taken as HDR whatever it holds |
 | `display.hdr_white` | `0.88` | 🧪⚡ HDR content's reference white as panel lightness (about sRGB 215); the room above it is for highlights |
 | `display.hdr_bright`, `display.hdr_white_bright` | `false`, `0.94` | 🧪⚡ HDR Bright: HDR content's white placed at this lightness instead of 0.88 (about sRGB 235 instead of 215), everything below it brighter, highlights with less room; set from the Rift tab |
+| `display.backdrop_blur` | `true` | Own runtime: frosted glass (what is behind a layer blurred) for the layers an application asks it for with `XR_MNDX_composition_layer_backdrop_blur`; `false`: those layers without it; nothing else is touched (`riftlinux-setup backdrop-blur`) |
 | `display.hdr_test` | off | 🧪 An HDR10 test chart in front of you: `"static"`, `"none"` or `"scene"` metadata |
 | `display.direct_mode_max_layers` | `16` | 🧪 At most this many of SteamVR's layers a frame (for finding a layer that misbehaves) |
 | `display.direct_mode_format_compositor`, `display.direct_mode_format_app` | sRGB | 🧪 `"unorm"`: SteamVR's compositor's or the application's images read as UNORM instead of sRGB (for comparing) |
