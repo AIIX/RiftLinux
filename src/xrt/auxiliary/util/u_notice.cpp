@@ -9,6 +9,7 @@
 #include "util/u_notice.h"
 
 #include <atomic>
+#include <cstring>
 #include <mutex>
 
 static std::mutex g_notice_lock;
@@ -132,5 +133,88 @@ extern "C" bool
 u_notice_display_black(void)
 {
 	return g_display_black.load();
+}
+
+static std::mutex g_ipd_lock;
+static bool g_ipd_set = false;
+static struct u_notice_ipd g_ipd = {};
+static std::atomic<float> g_manual_ipd{0.0f};
+
+extern "C" void
+u_notice_set_ipd(const struct u_notice_ipd *ipd)
+{
+	std::lock_guard<std::mutex> lock(g_ipd_lock);
+	g_ipd = *ipd;
+	g_ipd_set = true;
+}
+
+extern "C" bool
+u_notice_get_ipd(struct u_notice_ipd *out_ipd)
+{
+	std::lock_guard<std::mutex> lock(g_ipd_lock);
+	*out_ipd = g_ipd;
+	return g_ipd_set;
+}
+
+extern "C" void
+u_notice_set_manual_ipd(float mm)
+{
+	g_manual_ipd.store(mm > 0.0f ? mm : 0.0f);
+}
+
+extern "C" float
+u_notice_get_manual_ipd(void)
+{
+	return g_manual_ipd.load();
+}
+
+static std::mutex g_lens_lock;
+static bool g_lens_pattern = false;
+static int64_t g_lens_client = 0;
+static bool g_lens_centres_set = false;
+static int32_t g_lens_centres[2][2] = {};
+
+extern "C" void
+u_notice_set_lens_pattern(bool on, int64_t client)
+{
+	std::lock_guard<std::mutex> lock(g_lens_lock);
+	g_lens_pattern = on;
+	g_lens_client = on ? client : 0;
+}
+
+extern "C" void
+u_notice_drop_lens_pattern(int64_t client)
+{
+	std::lock_guard<std::mutex> lock(g_lens_lock);
+	if (g_lens_pattern && g_lens_client == client) {
+		g_lens_pattern = false;
+		g_lens_client = 0;
+	}
+}
+
+extern "C" bool
+u_notice_lens_pattern(void)
+{
+	std::lock_guard<std::mutex> lock(g_lens_lock);
+	return g_lens_pattern;
+}
+
+extern "C" void
+u_notice_set_lens_centres(int32_t left_x, int32_t left_y, int32_t right_x, int32_t right_y)
+{
+	std::lock_guard<std::mutex> lock(g_lens_lock);
+	g_lens_centres[0][0] = left_x;
+	g_lens_centres[0][1] = left_y;
+	g_lens_centres[1][0] = right_x;
+	g_lens_centres[1][1] = right_y;
+	g_lens_centres_set = true;
+}
+
+extern "C" bool
+u_notice_get_lens_centres(int32_t out_centres[2][2])
+{
+	std::lock_guard<std::mutex> lock(g_lens_lock);
+	memcpy(out_centres, g_lens_centres, sizeof(g_lens_centres));
+	return g_lens_centres_set;
 }
 

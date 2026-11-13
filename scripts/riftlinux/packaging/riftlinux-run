@@ -38,6 +38,35 @@ EOF
 	esac
 fi
 
+# The other applications using the runtime (from its client list, through libmonado; connections of libmonado's own,
+# this one's included, not counted): their number, or nothing when it cannot be told.
+others() {
+	python3 -I - "$D/libmonado.so" 2>/dev/null <<'PY'
+import ctypes, sys
+lib = ctypes.CDLL(sys.argv[1])
+P, U = ctypes.c_void_p, ctypes.c_uint32
+lib.mnd_root_create.argtypes = [ctypes.POINTER(P)]
+lib.mnd_root_destroy.argtypes = [ctypes.POINTER(P)]
+lib.mnd_root_update_client_list.argtypes = [P]
+lib.mnd_root_get_number_clients.argtypes = [P, ctypes.POINTER(U)]
+lib.mnd_root_get_client_id_at_index.argtypes = [P, U, ctypes.POINTER(U)]
+lib.mnd_root_get_client_name.argtypes = [P, U, ctypes.POINTER(ctypes.c_char_p)]
+root = P()
+if lib.mnd_root_create(ctypes.byref(root)) != 0 or lib.mnd_root_update_client_list(root) != 0:
+    sys.exit(1)
+n, count = U(), 0
+lib.mnd_root_get_number_clients(root, ctypes.byref(n))
+for i in range(n.value):
+    cid, name = U(), ctypes.c_char_p()
+    if lib.mnd_root_get_client_id_at_index(root, i, ctypes.byref(cid)) != 0:
+        sys.exit(1)
+    lib.mnd_root_get_client_name(root, cid.value, ctypes.byref(name))
+    count += name.value != b"libmonado"
+lib.mnd_root_destroy(ctypes.byref(root))
+print(count)
+PY
+}
+
 say() {
 	if [ -t 1 ]; then
 		echo "$1"
@@ -108,6 +137,14 @@ fi
 XR_RUNTIME_JSON="$D/openxr_riftlinux.json" "$@"
 RC=$?
 if [ "$started" -eq 1 ]; then
+	# Applications started after this one (a VR desktop, another game) keep the runtime: stopped once the last of them has
+	# ended; at once when none is left, or when that cannot be told.
+	kept=0
+	while n=$(others) && [ "${n:-0}" -gt 0 ] 2>/dev/null && [ "$(riftlinux-runtime --status)" = "running" ]; do
+		[ "$kept" -eq 1 ] || echo "$(date '+%F %T') $NAME ended; the runtime stays for $n other application(s)" >>"$LOG"
+		kept=1
+		sleep 2
+	done
 	riftlinux-runtime --stop >/dev/null 2>&1
 fi
 exit "$RC"

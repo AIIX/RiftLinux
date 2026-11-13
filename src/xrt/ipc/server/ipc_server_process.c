@@ -943,6 +943,26 @@ update_server_state_locked(struct ipc_server *s)
 		}
 	}
 
+	/*
+	 * RiftLinux: the application shown most recently that is still active comes back first (a VR desktop -> game 1 ->
+	 * game 2: game 2 ending shows game 1, game 1 ending shows the VR desktop); the highest slot only when none is.
+	 */
+	for (uint32_t r = 0; r < s->global_state.recent_count; r++) {
+		int found = -1;
+		for (uint32_t i = 0; i < IPC_MAX_CLIENTS; i++) {
+			volatile struct ipc_client_state *ics = &s->threads[i].ics;
+			if (ics->client_state.id == s->global_state.recent_ids[r] && ics->client_state.session_overlay == false &&
+			    ics->server_thread_index >= 0 && ics->client_state.session_active) {
+				found = (int)i;
+				break;
+			}
+		}
+		if (found >= 0) {
+			fallback_active_application = found;
+			break;
+		}
+	}
+
 	// if there is a currently-set active primary application and it is not
 	// actually active/displayable, use the fallback application
 	// instead.
@@ -1021,6 +1041,22 @@ get_client_app_state_locked(struct ipc_server *s, uint32_t client_id, struct ipc
 	return XRT_SUCCESS;
 }
 
+//! RiftLinux: @p client_id to the front of the most-recent list of primary applications.
+static void
+recent_push_locked(struct ipc_server *s, uint32_t client_id)
+{
+	uint32_t n = 0;
+	uint32_t ids[IPC_MAX_CLIENTS];
+	ids[n++] = client_id;
+	for (uint32_t i = 0; i < s->global_state.recent_count && n < IPC_MAX_CLIENTS; i++) {
+		if (s->global_state.recent_ids[i] != client_id) {
+			ids[n++] = s->global_state.recent_ids[i];
+		}
+	}
+	memcpy(s->global_state.recent_ids, ids, sizeof(uint32_t) * n);
+	s->global_state.recent_count = n;
+}
+
 static xrt_result_t
 set_active_client_locked(struct ipc_server *s, uint32_t client_id)
 {
@@ -1034,10 +1070,51 @@ set_active_client_locked(struct ipc_server *s, uint32_t client_id)
 
 	if (index != s->global_state.active_client_index) {
 		s->global_state.active_client_index = index;
+		recent_push_locked(s, client_id);
 		update_server_state_locked(s);
 	}
 
 	return XRT_SUCCESS;
+}
+
+/*!
+ * RiftLinux: the most recently shown application that is still active, other than the one shown now: its slot, or -1.
+ */
+static int
+previous_client_locked(struct ipc_server *s)
+{
+	for (uint32_t r = 0; r < s->global_state.recent_count; r++) {
+		for (uint32_t i = 0; i < IPC_MAX_CLIENTS; i++) {
+			volatile struct ipc_client_state *ics = &s->threads[i].ics;
+			if (ics->client_state.id == s->global_state.recent_ids[r] && (int)i != s->global_state.active_client_index &&
+			    ics->client_state.session_overlay == false && ics->server_thread_index >= 0 &&
+			    ics->client_state.session_active) {
+				return (int)i;
+			}
+		}
+	}
+	return -1;
+}
+
+bool
+ipc_server_has_previous_client(struct ipc_server *s)
+{
+	os_mutex_lock(&s->global_state.lock);
+	const bool has = previous_client_locked(s) >= 0;
+	os_mutex_unlock(&s->global_state.lock);
+	return has;
+}
+
+bool
+ipc_server_switch_to_previous_client(struct ipc_server *s)
+{
+	os_mutex_lock(&s->global_state.lock);
+	const int index = previous_client_locked(s);
+	if (index >= 0) {
+		set_active_client_locked(s, s->threads[index].ics.client_state.id);
+	}
+	os_mutex_unlock(&s->global_state.lock);
+	return index >= 0;
 }
 
 static xrt_result_t

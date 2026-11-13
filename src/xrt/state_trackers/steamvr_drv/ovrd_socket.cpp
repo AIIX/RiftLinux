@@ -8,6 +8,7 @@
 #include "ovrd_socket.hpp"
 #include "ovrd_log.hpp"
 
+
 #include <algorithm>
 #include <cerrno>
 #include <cmath>
@@ -282,7 +283,7 @@ handle_line(Client &c, const std::string &line)
 		}
 		reply(c, ok);
 	} else {
-		reply_error(c, "unknown request (\"hdr\", \"status\", \"recalibrate\" or \"quit\")");
+		reply_error(c, "unknown request (\"hdr\", \"status\", \"recalibrate\", \"controller_calibration\" or \"quit\")");
 	}
 	cJSON_Delete(req);
 }

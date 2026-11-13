@@ -8,6 +8,12 @@ EXPORTS
     mnd_root_get_client_name
     mnd_root_get_client_state
     mnd_root_set_client_primary
+    mnd_root_take_screenshot
+    mnd_root_set_lens_pattern
+    mnd_root_calibrate_controller
+    mnd_root_get_controller_calibration
+    mnd_root_forget_controller_calibration
+    mnd_root_set_controller_calibration_quiet
     mnd_root_set_client_focused
     mnd_root_toggle_client_io_active
     mnd_root_set_client_io_blocks

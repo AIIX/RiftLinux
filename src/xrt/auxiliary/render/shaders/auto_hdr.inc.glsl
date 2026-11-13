@@ -125,17 +125,29 @@ vec2 find_cusp(float a, float b)
  * the lightness is the tone mapping; out-of-range colours (BT.2020, bright highlights) are brought in toward the
  * lightness where their hue is most vivid, keeping as much colour as the panel can show.
  */
-vec3 auto_hdr_colour_and_gamut(vec3 lab, float L, vec4 p, bool keep_lightness, bool source_fits)
+vec3 auto_hdr_colour_and_gamut(vec3 lab, float L, vec4 p, bool keep_lightness, bool source_fits, float highlight)
 {
 	float C = length(lab.yz);
 	float hue = degrees(atan(lab.z, lab.y));
-	float coloured = smoothstep(0.01, 0.06, C) * (1.0 - 0.5 * smoothstep(0.15, 0.30, C));
+	/*
+	 * Vivid colours get half the boost (they would clip). HDR highlights (@p highlight 1, faded in just past white)
+	 * get all of it: they cannot clip, a boosted highlight over the panel's top is brought down in intensity instead.
+	 */
+	float coloured = smoothstep(0.01, 0.06, C) * (1.0 - 0.5 * (1.0 - highlight) * smoothstep(0.15, 0.30, C));
 	float skin = smoothstep(15.0, 35.0, hue) * (1.0 - smoothstep(75.0, 95.0, hue));
 	vec2 ab = lab.yz * (1.0 + p.z * coloured * (1.0 - 0.75 * skin));
 
 	vec3 out_rgb = oklab_to_linear_srgb(vec3(L, ab));
 	if (in_gamut(out_rgb) || L > 1.0) {
 		return max(out_rgb, vec3(0.0));
+	}
+	if (keep_lightness && source_fits && all(greaterThanEqual(out_rgb, vec3(-1e-4)))) {
+		/*
+		 * HDR, the extra colour only taking a channel over the panel's top (a bright highlight): brought down in
+		 * intensity, all channels alike, so highlights keep Auto-HDR's colour as the rest of the picture does;
+		 * where it just fits nothing changes (no step).
+		 */
+		return out_rgb / max(out_rgb.r, max(out_rgb.g, out_rgb.b));
 	}
 	if (keep_lightness && source_fits) {
 		/*
@@ -201,7 +213,7 @@ vec3 auto_hdr(vec3 rgb, vec4 p, float black_lift)
 		return rgb;
 	}
 	vec3 lab = linear_srgb_to_oklab(max(rgb, vec3(0.0)));
-	return auto_hdr_colour_and_gamut(lab, auto_hdr_lightness(lab.x, p, black_lift), p, false, false);
+	return auto_hdr_colour_and_gamut(lab, auto_hdr_lightness(lab.x, p, black_lift), p, false, false, 0.0);
 }
 
 /*
@@ -243,14 +255,27 @@ float auto_hdr_hdr_lightness(float x, vec4 p, vec4 range)
  */
 vec3 auto_hdr_hdr(vec3 rgb, vec4 p, vec4 range)
 {
+	/*
+	 * Highlights past white compressed by the largest channel (maxRGB, as HDR10+ and MaxCLL measure them), the same
+	 * factor on all three: hue and saturation stay as in the source and every highlight ends inside the panel's
+	 * range, so no colour has to be refitted there (a refit drew a hard ring around a sun in HDR video). A grey's
+	 * largest channel is its lightness: greys, and colours with no channel past white, map as before.
+	 */
+	float m = cbrt(max(rgb.r, max(rgb.g, rgb.b)));
+	float highlight = smoothstep(1.0, 1.15, m);
+	if (m > 1.0) {
+		float k = auto_hdr_hdr_lightness(m, p, range) / (range.x * m);
+		rgb *= k * k * k;
+	}
 	vec3 lab_in = linear_srgb_to_oklab(rgb);
 	if (lab_in.x <= 0.0) {
 		return vec3(0.0);
 	}
-	float r = auto_hdr_hdr_lightness(lab_in.x, p, range) / lab_in.x;
+	float y = lab_in.x <= 1.0 ? auto_hdr_hdr_lightness(lab_in.x, p, range) : range.x * lab_in.x;
+	float r = y / lab_in.x;
 	vec3 scaled = rgb * (r * r * r);
 	vec3 lab = linear_srgb_to_oklab(scaled);
-	return auto_hdr_colour_and_gamut(lab, lab.x, p, true, in_gamut(scaled));
+	return auto_hdr_colour_and_gamut(lab, lab.x, p, true, in_gamut(scaled), highlight);
 }
 
 /*

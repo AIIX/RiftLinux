@@ -66,7 +66,10 @@
 DEBUG_GET_ONCE_LOG_OPTION(rift_log, "RIFT_LOG", U_LOGGING_WARN)
 DEBUG_GET_ONCE_FLOAT_OPTION(rift_override_icd_mm, "RIFT_OVERRIDE_ICD", -1.0f)
 DEBUG_GET_ONCE_BOOL_OPTION(rift_distortion_render_fov, "RIFT_DISTORTION_RENDER_FOV", true)
+// The generic visibility mask (corner triangles) instead of none, for comparing.
+DEBUG_GET_ONCE_BOOL_OPTION(rift_generic_visibility_mask, "RIFT_GENERIC_VISIBILITY_MASK", false)
 DEBUG_GET_ONCE_BOOL_OPTION(rift_use_firmware_distortion, "RIFT_USE_FIRMWARE_DISTORTION", false)
+DEBUG_GET_ONCE_BOOL_OPTION(rift_test_ipd_sweep, "RIFTLINUX_TEST_IPD_SWEEP", false)
 DEBUG_GET_ONCE_BOOL_OPTION(rift_power_override, "RIFT_POWER_OVERRIDE", false)
 /*
  * A CV1's display report as the Oculus runtime sets it on every start (1.208.0, USB capture): brightness 255 and 264
@@ -401,6 +404,101 @@ rift_gyro_update(struct rift_hmd *hmd, int64_t timestamp_ns, const struct xrt_ve
 	os_mutex_unlock(&hmd->gyro.mutex);
 }
 
+/*
+ * The IPD slider's reading as millimetres. Oculus' own values for readings 0-2 (57.5342, 57.5378 and 57.5415 mm in its
+ * logs) give 57.534 mm and 0.00365 mm a step; the 12 bits then span 57.5-72.5 mm (Oculus' published range: 58-72).
+ */
+static float
+rift_ipd_slider_mm(uint16_t raw)
+{
+	return CLAMP(57.534f + 0.00365f * (float)raw, 57.5f, 72.5f);
+}
+
+/*!
+ * Test only (RIFTLINUX_TEST_IPD_SWEEP; never with the headset worn: the eyes move): a slider that moves by itself, for
+ * headsets whose sensor does not report. From 20 s on, every 30 s: to the widest over 3 s, held, back over 3 s.
+ */
+static uint16_t
+rift_ipd_test_raw(struct rift_hmd *hmd, timepoint_ns now_ns)
+{
+	const double t = time_ns_to_s(now_ns - hmd->ipd_test_start_ns) - 20.0;
+	if (t < 0.0) {
+		return 0;
+	}
+	const double c = fmod(t, 30.0);
+	const double f = c < 3.0 ? c / 3.0 : c < 10.0 ? 1.0 : c < 13.0 ? 1.0 - (c - 10.0) / 3.0 : 0.0;
+	return (uint16_t)(f * 4095.0);
+}
+
+/*!
+ * The distance between the eyes, at every report: the slider's reading, or the distance set by hand
+ * (u_notice_set_manual_ipd), told to the notice bus (the Rift tab) and, when it changes, posted as a notice (at most
+ * every 50 ms while the slider moves, the value it stops at always).
+ */
+static void
+rift_ipd_update(struct rift_hmd *hmd, uint16_t raw, timepoint_ns now_ns)
+{
+	if (debug_get_bool_option_rift_test_ipd_sweep()) {
+		raw = rift_ipd_test_raw(hmd, now_ns);
+	}
+	const float slider = rift_ipd_slider_mm(raw);
+	/*
+	 * At rest the reading jitters by a few steps (0.02 mm): a change counts from 0.1 mm and is followed at once while
+	 * the slider moves; where it stops, its exact reading is taken once that has held still (within the jitter) for
+	 * half a second.
+	 */
+	if (hmd->ipd_slider_mm == 0.0f) {
+		hmd->ipd_slider_mm = slider;
+		hmd->ipd_slider_first_mm = slider;
+		hmd->ipd_still_mm = slider;
+		hmd->ipd_still_ns = now_ns;
+	} else if (fabsf(slider - hmd->ipd_slider_mm) >= 0.1f) {
+		hmd->ipd_slider_mm = slider;
+		hmd->ipd_slider_moved = hmd->ipd_slider_moved || fabsf(slider - hmd->ipd_slider_first_mm) >= 0.5f;
+		hmd->ipd_still_mm = slider;
+		hmd->ipd_still_ns = now_ns;
+	} else if (fabsf(slider - hmd->ipd_still_mm) > 0.02f) {
+		hmd->ipd_still_mm = slider;
+		hmd->ipd_still_ns = now_ns;
+	} else if (now_ns - hmd->ipd_still_ns >= 500 * U_TIME_1MS_IN_NS &&
+	           fabsf(hmd->ipd_still_mm - hmd->ipd_slider_mm) >= 0.02f) {
+		hmd->ipd_slider_mm = hmd->ipd_still_mm;
+	}
+
+	const float manual = u_notice_get_manual_ipd();
+	struct u_notice_ipd ipd = {
+	    .mm = manual > 0.0f ? CLAMP(manual, 50.0f, 80.0f) : hmd->ipd_slider_mm,
+	    .slider_mm = hmd->ipd_slider_mm,
+	    .source = manual > 0.0f ? U_NOTICE_IPD_MANUAL : U_NOTICE_IPD_SLIDER,
+	    .slider_moved = hmd->ipd_slider_moved,
+	};
+	hmd->default_icd = ipd.mm / 1000.0f;
+
+	const bool first = hmd->ipd_told_mm == 0.0f;
+	if (first) {
+		HMD_INFO(hmd, "IPD: %.1f mm (%s)", ipd.mm, ipd.source == U_NOTICE_IPD_MANUAL ? "set by hand" : "the slider");
+	} else if (ipd.mm != hmd->ipd_told_mm) {
+		hmd->ipd_notice_due = true;
+		hmd->ipd_log_due = true;
+		hmd->ipd_changed_ns = now_ns;
+	}
+	if (first || ipd.mm != hmd->ipd_told.mm || ipd.slider_mm != hmd->ipd_told.slider_mm ||
+	    ipd.source != hmd->ipd_told.source || ipd.slider_moved != hmd->ipd_told.slider_moved) {
+		u_notice_set_ipd(&ipd);
+		hmd->ipd_told = ipd;
+		hmd->ipd_told_mm = ipd.mm;
+	}
+	if (hmd->ipd_notice_due && now_ns - hmd->ipd_notice_ns >= 50 * U_TIME_1MS_IN_NS) {
+		hmd->ipd_notice_due = false;
+		hmd->ipd_notice_ns = now_ns;
+		u_notice_post(U_NOTICE_IPD, "ipd", (int)lroundf(ipd.mm * 10.0f));
+	}
+	if (hmd->ipd_log_due && now_ns - hmd->ipd_changed_ns >= U_TIME_1S_IN_NS) {
+		hmd->ipd_log_due = false;
+		HMD_INFO(hmd, "IPD now %.1f mm (%s)", ipd.mm, ipd.source == U_NOTICE_IPD_MANUAL ? "set by hand" : "the slider");
+	}
+}
+
 static int
 rift_sensor_thread_tick(struct rift_hmd *hmd)
 {
@@ -505,14 +603,7 @@ rift_sensor_thread_tick(struct rift_hmd *hmd)
 				                                        hmd->constellation_device_id, hmd->presence);
 			}
 
-			// TODO: figure out the actual algorithm for this, this one is too silly
-			float iad_mm = (float)(report.cv1.iad_adc_value - 400) / 300.0f + 59.0f;
-
-			// round to nearest half mm
-			iad_mm = roundf(iad_mm * 2.0f) / 2.0f;
-
-			// convert to meters
-			hmd->default_icd = iad_mm / 1000.0f;
+			rift_ipd_update(hmd, report.cv1.iad_adc_value, recv_time_ns);
 		}
 
 		// if there's no samples, just do nothing.
@@ -1525,6 +1616,17 @@ rift_fill_in_distortion_inputs(struct rift_hmd *hmd)
 	    .max_r = data->max_r,
 	    .meters_per_tan_angle = data->meters_per_tan_angle_at_center,
 	};
+
+	// The lens test's pattern is drawn around each eye's lens centre (u_notice_set_lens_pattern), the CV1's only.
+	if (hmd->variant == RIFT_VARIANT_CV1) {
+		int32_t centres[2][2];
+		for (uint32_t view = 0; view < 2; view++) {
+			u_rift_lens_center_px(&hmd->panel, &hmd->eye_profile, view, &centres[view][0], &centres[view][1]);
+		}
+		u_notice_set_lens_centres(centres[0][0], centres[0][1], centres[1][0], centres[1][1]);
+		HMD_INFO(hmd, "Lens centres (panel pixels): left %d,%d right %d,%d", centres[0][0], centres[0][1],
+		         centres[1][0], centres[1][1]);
+	}
 }
 
 /*
@@ -1628,7 +1730,61 @@ rift_hmd_get_visibility_mask(struct xrt_device *xdev,
                              struct xrt_visibility_mask **out_mask)
 {
 	struct xrt_fov fov = xdev->hmd->distortion.fov[view_index];
-	u_visibility_mask_get_default(type, &fov, out_mask);
+
+	// RiftLinux: no hidden area, as the SteamVR path reports. The generic mask's corner triangles cut into what the
+	// CV1's lenses show at the bottom of each eye, and applications that skip drawing them showed black wedges there.
+	// The whole view is visible; RIFT_GENERIC_VISIBILITY_MASK=1 gives the generic mask, for comparing.
+	if (debug_get_bool_option_rift_generic_visibility_mask()) {
+		u_visibility_mask_get_default(type, &fov, out_mask);
+		return XRT_SUCCESS;
+	}
+
+	// The view's corners, from its left, right, up and down angles, as u_visibility_mask_get_default places its own.
+	const float tan_left = tanf(fov.angle_left);
+	const float tan_right = tanf(fov.angle_right);
+	const float tan_up = tanf(fov.angle_up);
+	const float tan_down = tanf(fov.angle_down);
+	const struct xrt_vec2 corners[4] = {
+	    {tan_left, -tan_up},
+	    {tan_right, -tan_up},
+	    {tan_right, -tan_down},
+	    {tan_left, -tan_down},
+	};
+	static const uint32_t visible_indices[6] = {0, 1, 2, 0, 2, 3};
+	static const uint32_t line_indices[4] = {0, 1, 2, 3};
+
+	uint32_t vertex_count = 0;
+	uint32_t index_count = 0;
+	const uint32_t *indices = NULL;
+	switch (type) {
+	case XRT_VISIBILITY_MASK_TYPE_HIDDEN_TRIANGLE_MESH: break;
+	case XRT_VISIBILITY_MASK_TYPE_VISIBLE_TRIANGLE_MESH:
+		vertex_count = 4;
+		index_count = 6;
+		indices = visible_indices;
+		break;
+	case XRT_VISIBILITY_MASK_TYPE_LINE_LOOP:
+		vertex_count = 4;
+		index_count = 4;
+		indices = line_indices;
+		break;
+	}
+
+	const size_t size =
+	    sizeof(struct xrt_visibility_mask) + sizeof(uint32_t) * index_count + sizeof(struct xrt_vec2) * vertex_count;
+	struct xrt_visibility_mask *mask = U_CALLOC_WITH_CAST(struct xrt_visibility_mask, size);
+	if (mask == NULL) {
+		*out_mask = NULL;
+		return XRT_ERROR_ALLOCATION;
+	}
+	mask->type = type;
+	mask->index_count = index_count;
+	mask->vertex_count = vertex_count;
+	if (index_count > 0) {
+		memcpy(xrt_visibility_mask_get_indices(mask), indices, sizeof(uint32_t) * index_count);
+		memcpy(xrt_visibility_mask_get_vertices(mask), corners, sizeof(struct xrt_vec2) * vertex_count);
+	}
+	*out_mask = mask;
 	return XRT_SUCCESS;
 }
 
@@ -1827,6 +1983,7 @@ rift_devices_create(struct os_hid_device *hmd_dev,
 	hmd->presence_told = -1;
 	// In use from the start: the controllers stay awake until it has lain unworn for a while.
 	hmd->worn_last_ns = os_monotonic_get_ns();
+	hmd->ipd_test_start_ns = hmd->worn_last_ns;
 	// How the wear sensor is read; levels that cross each other fall back to the defaults.
 	hmd->wear.use_sensor = debug_get_bool_option_rift_wear_sensor();
 	hmd->wear.worn_above = (int)debug_get_num_option_rift_wear_worn_above();

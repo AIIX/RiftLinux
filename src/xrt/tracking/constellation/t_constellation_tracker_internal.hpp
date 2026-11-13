@@ -51,6 +51,7 @@
 #include "optimizer/sensor_fusion.hpp"
 #include "loose_part.hpp"
 #include "level_watch.hpp"
+#include "t_touch_ekf.hpp"
 
 
 #define CT_TRACE(ct, ...) U_LOG_IFL_T(ct->log_level, __VA_ARGS__)
@@ -513,13 +514,19 @@ public: // Methods (t_constellation_tracker.cpp)
 	             const xrt_vec3 *&out_pos_tolerance,
 	             const xrt_vec3 *&out_rot_tolerance) const;
 
+	//! How far a solve may tilt from the device's IMU down: wider after its gyro clipped, see ImuTilt::clipped.
+	float
+	gravityTolerance(const Device *device) const;
+
 	//! Whether a pose agrees with a binding prior, true when there is none.
 	bool
 	poseMatchesPrior(Device *device,
 	                 const CameraSample &sample,
 	                 const DeviceState &device_state,
 	                 const xrt_pose &Tcv_cam_device,
-	                 SolveSource source);
+	                 SolveSource source,
+	                 uint32_t matched_blobs,
+	                 float rms_px);
 
 	//! Starts the device's fusion over when accepted solves keep disagreeing with it.
 	void
@@ -538,11 +545,34 @@ public: // Methods (t_constellation_tracker.cpp)
 	                 xrt_vec3 &out_device_gravity) const;
 
 	//! Whether a candidate pose agrees with the device's IMU on which way is down, true when that is unknown.
+	//! Counts a solve for @ref Device::imu_advice; changes nothing else.
+	void
+	countImuAdvice(Device *device,
+	               const CameraSample &sample,
+	               const xrt_pose &Tcv_cam_device,
+	               uint32_t matched_blobs);
+
+	//! A solve's down and the device's resting accelerometer reading as a pair for @ref Device::imu_align, and the
+	//! fit tried again when due (RiftLinux).
+	void
+	collectImuAlign(Device *device, const CameraSample &sample, const xrt_pose &Tcv_cam_device, uint32_t matched_blobs);
+
 	bool
 	poseMatchesGravity(Device *device,
 	                   const CameraSample &sample,
 	                   const xrt_pose &Tcv_cam_device,
-	                   SolveSource source);
+	                   SolveSource source,
+	                   uint32_t matched_blobs);
+
+	//! An IMU calibration's pair from a candidate pose, see Device::imu_calibration (RiftLinux).
+	void
+	collectImuCalibration(Device *device,
+	                      const CameraSample &sample,
+	                      const xrt_pose &Tcv_cam_device,
+	                      const xrt_vec3 &camera_gravity,
+	                      const xrt_vec3 &device_gravity,
+	                      float error_rad,
+	                      uint32_t matched_blobs);
 
 public: // Methods (constellation_debug_scribble.cpp)
 	void
@@ -602,6 +632,26 @@ public: // Methods
 	std::optional<xrt_vec3>
 	gravityAt(timepoint_ns when_ns) const;
 
+	//! Whether the device was resting (turning slower than resting) for at least @p rest_ns up to @p when_ns.
+	bool
+	restingAt(timepoint_ns when_ns, timepoint_ns rest_ns) const;
+
+	/*!
+	 * Whether the gyro hit the end of its range since the estimate was last set (RiftLinux): a hand turned faster than
+	 * that, what the gyro could not read is missing from the estimate, which a recorded fast turn left 10-12 degrees
+	 * off.
+	 */
+	bool
+	clipped() const;
+
+	//! The newest gyro rate, rad/s.
+	float
+	lastGyro() const;
+
+	//! Sets world up in the device frame (OpenXR) from a camera pose at @p when_ns and later; ends clipped().
+	void
+	reanchor(timepoint_ns when_ns, const xrt_vec3 &up_device);
+
 private: // Fields
 	struct Entry
 	{
@@ -624,6 +674,9 @@ private: // Fields
 	timepoint_ns last_moving_ns{0};
 	//! What the accelerometer reads at rest, learned: a CV1 Touch reads 10.1-10.5 m/s².
 	float rest_accel_len{static_cast<float>(MATH_GRAVITY_M_S2)};
+	//! See clipped() and lastGyro().
+	bool gyro_clipped{false};
+	float last_gyro_len{0.0f};
 
 	std::array<Entry, kHistorySize> history{};
 	size_t history_count{0};
@@ -670,6 +723,199 @@ public: // Fields
 
 	//! Which way is down from the device's IMU, to reject solves that disagree.
 	ImuTilt imu_tilt;
+	//! A Touch's IMU-driven filter, the camera checks' prediction when asked (CONSTELLATION_TRACKER_EKF_PRIOR).
+	TouchEkf touch_ekf;
+
+	/*!
+	 * The IMU's seat calibration (RiftLinux, t_constellation_tracker_calibrate_imu): while active, each candidate pose
+	 * that reaches the gravity check while the device rests gives a pair of down directions in the device's frame,
+	 * its IMU's and its solve's; once they cover enough orientations one rotation is fitted, the driver turns the
+	 * IMU's samples by it, and the next round fits what is left.
+	 */
+	struct
+	{
+		os::Mutex lock;
+		std::atomic<bool> active{false};
+		t_constellation_imu_calibration_status status{};
+		//! OpenCV coordinates in the device's frame: the accelerometer's resting reading, the solve's down.
+		std::vector<std::pair<xrt_vec3, xrt_vec3>> pairs;
+		std::array<uint32_t, 14> bins{};
+		//! Resting accelerometer readings (OpenXR coordinates, device frame), one per short still window, and per bin.
+		std::vector<xrt_vec3> rest_accel;
+		std::array<uint32_t, 14> rest_bins{};
+		//! Of those, taken with a hand's limits (the trigger held): a hand's readings spread more about the sphere.
+		uint32_t rest_hand{0};
+		//! Sets of the guided poses held in a row that gave no round (the readings did not fit yet).
+		uint32_t sets_without_round{0};
+		//! The last resting reading and when: a pair takes it, the tilt estimate leaves out what a bias makes look wrong.
+		xrt_vec3 last_rest{};
+		timepoint_ns last_rest_ns{0};
+		//! The still window being gathered.
+		xrt_vec3 window_sum{};
+		xrt_vec3 window_sum_sq{};
+		uint32_t window_count{0};
+		//! When something new was last measured, and the newest IMU sample seen.
+		timepoint_ns last_progress_ns{0};
+		timepoint_ns last_imu_ns{0};
+		//! Still windows spent in the orientation asked for with no solve to go with them, and those given up on.
+		std::array<uint32_t, 14> waited_windows{};
+		std::array<bool, 14> given_up{};
+		//! The LEDs matched on the latest solve, whichever sensor's, and when.
+		std::atomic<uint32_t> last_leds{0};
+		std::atomic<timepoint_ns> last_leds_ns{0};
+		//! Pairs count from here on: a round's correction has reached the samples by then.
+		timepoint_ns collect_from_ns{0};
+		//! When a round's fit was last tried.
+		timepoint_ns fit_tried_ns{0};
+		/*!
+		 * The guided steps: the person turns the device to the pose shown and holds the trigger (held); readings
+		 * taken meanwhile count for that step (step), which is then done or turned away (step_result 1 or 2, shown
+		 * until the trigger is let go). Each done step's up direction (OpenXR, device frame).
+		 */
+		std::atomic<bool> held{false};
+		int step{0};
+		uint32_t step_pairs{0};
+		uint32_t step_rests{0};
+		xrt_vec3 step_up_sum{};
+		int step_result{0};
+		std::array<bool, 6> step_done{};
+		std::array<xrt_vec3, 6> step_up{};
+		//! All poses done: pairs keep coming with a hand's stillness until the round fits.
+		std::atomic<bool> steps_complete{false};
+		//! "Come closer" (step -1): the share of its solves with enough LEDs (a running mean), and the latest solve.
+		float close_share{0.0f};
+		timepoint_ns close_last_ns{0};
+		//! A new round (or step) begun while the trigger was still held: nothing counts until it is let go.
+		bool wait_release{false};
+	} imu_calibration;
+	/*!
+	 * RiftLinux: how this device's solves at rest agree with its IMU on which way is down, by sensor and orientation.
+	 * Only counted, for t_constellation_tracker_imu_advice: nothing in tracking reads it.
+	 */
+	struct ImuAdvice
+	{
+		static constexpr size_t kSlots = 16;
+		static constexpr size_t kBins = 14;
+		struct Bin
+		{
+			std::atomic<uint32_t> samples{0};
+			std::atomic<uint32_t> off{0};
+			//! The sum of the errors, hundredths of a degree, for the log.
+			std::atomic<uint32_t> hundredths{0};
+			std::atomic<timepoint_ns> last_ns{0};
+		};
+		Bin bins[kSlots][kBins];
+	} imu_advice;
+	/*!
+	 * RiftLinux, the Oculus runtime's way with a controller whose IMU disagrees with its LEDs (GitHub issue #5): how
+	 * its IMU sits against its LEDs (a turn) and what its accelerometer reads off (a bias), learned in the background
+	 * from ordinary solves, no step for the user. Used, once it is clearly a fault, on the IMU's samples before the
+	 * gravity check, the fusion and the rig see them: the solves a turned or biased IMU turned away are then taken,
+	 * and the fusion works with what the IMU should have read. Never used on a device within the usual spread (our
+	 * pair: 1-2 degrees), whose tracking stays as it was.
+	 * Pairs in OpenXR coordinates, the device frame: the raw resting accelerometer reading, the solve's up.
+	 */
+	struct ImuAlign
+	{
+		static constexpr size_t kBins = 14;
+		static constexpr size_t kPerBin = 160;
+		struct Pair
+		{
+			xrt_vec3 accel;
+			xrt_vec3 up;
+			//! The sensor that saw it (mosaic * 4 + camera), for the headset's check of that sensor.
+			uint8_t slot;
+			//! When, for what the last seconds show (the provisional alignment).
+			timepoint_ns t;
+		};
+		//! Per sensor: the headset's own solves against its own IMU (only kept for the headset): a sensor that sees
+		//! the headset off too is not singling out a controller (a moved or misplaced sensor).
+		static constexpr size_t kSlots = 16;
+		static constexpr size_t kRefKept = 32;
+		float ref_err[kSlots][kRefKept]{};
+		uint32_t ref_count[kSlots]{};
+		timepoint_ns ref_last_ns[kSlots]{};
+		/*!
+		 * The turn alone, from the gyro: what it measures over a fraction of a second against the turn the solves of
+		 * one sensor show over the same time (a turned IMU turns its gyro's axes too; an accelerometer's bias does
+		 * nothing to them, so the two are told apart). The raw gyro's recent samples, each sensor's last solve, the
+		 * pairs of turns (the gyro's in its frame, the solves' in the device's, as rotation vectors).
+		 */
+		struct GyroSample
+		{
+			timepoint_ns t;
+			xrt_vec3 w;
+		};
+		static constexpr size_t kGyroKept = 2048;
+		GyroSample gyro[kGyroKept]{};
+		uint32_t gyro_count{0};
+		struct LastSolve
+		{
+			timepoint_ns t{0};
+			xrt_quat q{0.0f, 0.0f, 0.0f, 1.0f};
+		};
+		LastSolve last_solve[kSlots]{};
+		static constexpr size_t kTurnKept = 1000;
+		xrt_vec3 turn_imu[kTurnKept]{};
+		xrt_vec3 turn_dev[kTurnKept]{};
+		uint32_t turn_count{0};
+		os::Mutex lock;
+		//! The still window of raw samples being gathered (a hand's limits), and the last one's mean.
+		xrt_vec3 window_sum{};
+		xrt_vec3 window_sum_sq{};
+		uint32_t window_count{0};
+		xrt_vec3 last_rest{};
+		timepoint_ns last_rest_ns{0};
+		//! Pairs by orientation bin, each a ring of the newest; how many each bin has had.
+		Pair pairs[kBins][kPerBin]{};
+		uint32_t count[kBins]{};
+		timepoint_ns last_pair_ns[kBins]{};
+		timepoint_ns fit_tried_ns{0};
+		timepoint_ns logged_ns{0};
+		//! The first pair's time, for the log.
+		timepoint_ns first_ns{0};
+		//! A fit waiting for the next to agree before it is used.
+		bool have_candidate{false};
+		xrt_quat candidate_rot{0.0f, 0.0f, 0.0f, 1.0f};
+		xrt_vec3 candidate_bias{};
+		timepoint_ns candidate_ns{0};
+		//! In use: the turn and bias applied to what the gravity check compares with.
+		std::atomic<bool> applied{false};
+		/*!
+		 * What is in use (applied or provisional) centres the gravity check only, the fusion keeps the IMU as it reads:
+		 * set for a controller a few degrees off (a healthy one in a room read 3-5), clear for a fault (issue #5).
+		 */
+		std::atomic<bool> gate_only{false};
+		xrt_quat rot{0.0f, 0.0f, 0.0f, 1.0f};
+		xrt_vec3 bias{};
+		/*!
+		 * Provisional, until the above is known: the accelerometer's down turned onto the solves' down, from the
+		 * last seconds' resting readings. A controller the gravity check keeps refusing loses the solves the full
+		 * alignment learns from (frozen for minutes in a first session); this lets it be tracked within seconds.
+		 * The gyro is left as it is (a turn put on it wrongly would turn its rotations); never kept.
+		 */
+		/*!
+		 * For the provisional one also: every solve while turning slowly against the down the gravity check compares
+		 * it with (its IMU's tilt, see @ref imu_tilt), both as up in the device frame: a controller the check refuses
+		 * has few solves while resting, and these come with every one of them.
+		 */
+		struct QuickPair
+		{
+			xrt_vec3 imu_up;
+			xrt_vec3 up;
+			uint8_t slot;
+			timepoint_ns t;
+		};
+		static constexpr size_t kQuickKept = 64;
+		QuickPair quick[kQuickKept]{};
+		uint32_t quick_count{0};
+		timepoint_ns quick_last_ns{0};
+		std::atomic<bool> provisional{false};
+		xrt_quat prov_rot{0.0f, 0.0f, 0.0f, 1.0f};
+		timepoint_ns prov_tried_ns{0};
+		timepoint_ns prov_since_ns{0};
+		timepoint_ns prov_logged_ns{0};
+	} imu_align;
 	//! Candidate poses rejected for disagreeing with @ref imu_tilt, for the log, and in total.
 	RateLimitedCount gravity_rejections{};
 	//! Slow-search solves turned away for fitting their blobs too loosely.
@@ -684,6 +930,9 @@ public: // Fields
 	 */
 	std::atomic<int64_t> prior_disagree_since_ns{0};
 	std::atomic<uint32_t> prior_disagree_count{0};
+	//! The last solves the prior turned away that may reseed it (CONSTELLATION_TRACKER_RESEED_LEDS): under data_lock.
+	std::array<std::pair<int64_t, xrt_pose>, 3> reseed_left{};
+	uint32_t reseed_left_count{0};
 	RateLimitedCount prior_distrusts{};
 	/*!
 	 * Accepted solves in a row that the device's fusion disagrees with, see @ref Camera::checkFusionAgrees.
@@ -705,6 +954,9 @@ public: // Fields
 	std::atomic<uint64_t> fusion_resets_total{0};
 	//! The camera sample time of the newest pose from 4 or more LEDs, see Camera::tryDevicePoseFewLeds.
 	std::atomic<int64_t> last_full_solve_ns{0};
+	//! The newest pose from 5 or more LEDs: when, and where in the world (under data_lock).
+	std::atomic<int64_t> last_strong_solve_ns{0};
+	xrt_vec3 last_strong_position{};
 	RateLimitedCount fusion_resets{};
 
 	mutable os::Mutex data_lock;
@@ -790,6 +1042,24 @@ public: // Methods
 
 	void
 	pushImuSample(const xrt_imu_sample &sample);
+
+	//! An IMU calibration's resting accelerometer readings, see @ref imu_calibration (RiftLinux).
+	//! The status's fill and next orientation, from the counts. With its lock held.
+	void
+	refreshImuCalibrationStatus();
+	//! A guided step that has what it needs: done or turned away (lock held).
+	void
+	imuCalibrationStepCheck();
+	//! The guided steps from the first again (lock held).
+	void
+	imuCalibrationStepsRestart();
+
+	void
+	collectImuCalibrationRest(const xrt_imu_sample &sample);
+
+	//! The raw sample's still window for @ref imu_align, and the sample as @ref imu_tilt is to see it (RiftLinux).
+	xrt_imu_sample
+	imuAlignSample(const xrt_imu_sample &sample);
 
 	//! The direction of gravity in the device frame, OpenCV coordinates, see @ref ImuTilt::gravityAt.
 	std::optional<xrt_vec3>
@@ -891,6 +1161,13 @@ public: // Fields
 
 	//! How far a solve may be from a held prior's position, and for how long after the last solve it binds.
 	xrt_vec3 held_prior_tolerance_pos{};
+	/*!
+	 * A controller's held prior's orientation tolerance, growing with the time it was not seen (the orientation its gyro
+	 * kept drifts): see bindingPrior. Off (the fixed tolerance) with CONSTELLATION_TRACKER_HELD_PRIOR_ROT_GROWTH=0.
+	 */
+	static constexpr size_t kHeldRotSteps = 4;
+	xrt_vec3 held_prior_tolerance_rot[kHeldRotSteps]{};
+	bool held_prior_rot_growth{true};
 	timepoint_ns held_prior_ns{0};
 
 	//! After how long of solves leaving the prior, with none agreeing, the prior stops binding.

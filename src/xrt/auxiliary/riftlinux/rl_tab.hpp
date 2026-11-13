@@ -156,6 +156,9 @@ constexpr int kTabKnobR = 22;
 //! The height slider's range: the floor moved this far, centimetres.
 constexpr int kHeightMinCm = -50;
 constexpr int kHeightMaxCm = 50;
+//! The IPD slider's range, tenths of a millimetre (by hand it moves in steps of 0.5 mm).
+constexpr int kIpdMinTenths = 540;
+constexpr int kIpdMaxTenths = 760;
 //! The render scale slider's range, % of the CV1's 1:1 pixels (display.render_scale).
 constexpr int kScaleMin = 50;
 constexpr int kScaleMax = 200;
@@ -219,6 +222,8 @@ struct TabInfo
 	int perf_fps = -1, perf_avg = -1, perf_made = -1, perf_gpu_x10 = -1, perf_dropped = -1;
 	//! The runtime's own panel: an application is running (its Close button acts), and one is being closed.
 	bool app_running = false, app_closing = false;
+	//! Another application is connected that was shown before (the runtime's panel's Switch application).
+	bool other_app = false;
 
 	bool
 	operator==(const TabInfo &o) const
@@ -230,7 +235,7 @@ struct TabInfo
 		       scale_running == o.scale_running && fast_path == o.fast_path && native == o.native &&
 		       perf_on == o.perf_on && perf_fps == o.perf_fps && perf_avg == o.perf_avg &&
 		       perf_made == o.perf_made && perf_gpu_x10 == o.perf_gpu_x10 && perf_dropped == o.perf_dropped &&
-		       app_running == o.app_running && app_closing == o.app_closing;
+		       app_running == o.app_running && app_closing == o.app_closing && other_app == o.other_app;
 	}
 };
 
@@ -246,6 +251,9 @@ struct TabState
 	int mic = -1;
 	bool mic_muted = false;
 	int height_cm = 0;
+	//! The distance between the eyes in use, tenths of a millimetre (0: not known yet), and whether set by hand.
+	int ipd_tenths = 0;
+	bool ipd_manual = false;
 	//! "Set floor" lit for a moment after it is pressed.
 	bool floor_lit = false;
 	PictureRow picture;
@@ -255,7 +263,8 @@ struct TabState
 	operator==(const TabState &o) const
 	{
 		return page == o.page && volume == o.volume && muted == o.muted && mic == o.mic &&
-		       mic_muted == o.mic_muted && height_cm == o.height_cm &&
+		       mic_muted == o.mic_muted && height_cm == o.height_cm && ipd_tenths == o.ipd_tenths &&
+		       ipd_manual == o.ipd_manual &&
 		       floor_lit == o.floor_lit && picture == o.picture && info == o.info;
 	}
 };
@@ -277,6 +286,8 @@ enum class Ctl
 	Mic,
 	Floor,
 	Height,
+	//! The distance between the eyes: the headset's slider (Auto) or set by hand.
+	Ipd,
 	Recentre,
 	AutoHdr,
 	Strength,
@@ -300,6 +311,8 @@ enum class Ctl
 	PfSmooth,
 	PfGpu,
 	PfDropped,
+	//! The runtime's own panel: shows the application used before this one (a VR desktop or another).
+	SwitchApp,
 	//! The runtime's own panel: asks the running application to quit (SteamVR's dashboard has its own Quit).
 	CloseApp,
 };
@@ -323,7 +336,8 @@ constexpr bool kCardNeedsDirect[kCardCount] = {false, false, true, true, false, 
 constexpr RowSpec kRows[] = {
     {0, Ctl::Volume, Kind::Slider, "volume"},     {0, Ctl::Mic, Kind::Slider, "mic"},
     {1, Ctl::Floor, Kind::Button, "floor"},
-    {1, Ctl::Height, Kind::Slider, "height"},     {4, Ctl::Recentre, Kind::Note, "button"},
+    {1, Ctl::Height, Kind::Slider, "height"},     {1, Ctl::Ipd, Kind::Slider, "ipd"},
+    {4, Ctl::Recentre, Kind::Note, "button"},
     {2, Ctl::AutoHdr, Kind::Switch, "autohdr"},   {2, Ctl::Strength, Kind::Slider, "strength"},
     {2, Ctl::Colour, Kind::Slider, "colour"},     {2, Ctl::Bright, Kind::Switch, "bright"},
     {3, Ctl::Smoothing, Kind::Switch, "smoothing"},
@@ -335,7 +349,7 @@ constexpr RowSpec kRows[] = {
     {7, Ctl::PerfOn, Kind::Switch, "perf"},         {7, Ctl::PfGame, Kind::Info, "pf-game"},
     {7, Ctl::PfAvg, Kind::Info, "pf-avg"},          {7, Ctl::PfSmooth, Kind::Info, "pf-smooth"},
     {7, Ctl::PfGpu, Kind::Info, "pf-gpu"},          {7, Ctl::PfDropped, Kind::Info, "pf-dropped"},
-    {8, Ctl::CloseApp, Kind::Button, "closeapp"},
+    {8, Ctl::SwitchApp, Kind::Button, "switchapp"}, {8, Ctl::CloseApp, Kind::Button, "closeapp"},
 };
 constexpr int kRowCount = sizeof(kRows) / sizeof(kRows[0]);
 
@@ -411,7 +425,8 @@ struct Digits
 
 struct Pieces
 {
-	Image title, subtitle, needs_direct, mute, muted, setfloor, reset, measure, close, cm;
+	Image title, subtitle, needs_direct, mute, muted, setfloor, reset, measure, close, switch_app, cm, auto_ipd,
+	    cancel;
 	Digits digits, digits_small;
 	//! Under HDR Bright, the card's full width: what it needs, and whether there is HDR content on screen now.
 	Image bright_note, hdr_on, hdr_off;
@@ -425,6 +440,8 @@ struct Pieces
 	Image fps, ms, off, frames;
 	//! The runtime's own panel (optional pieces: an older set lacks them): its name, its restart line.
 	Image runtime, restart_runtime;
+	//! The IPD notice's words (optional pieces: an older set lacks them).
+	Image ipd_name, mm;
 	Image card[kCardCount];
 	//! Each row's name (none for notes) and its explanation (none for status lines).
 	Image label[kRowCount], help[kRowCount];
@@ -442,6 +459,8 @@ struct Pieces
 		bool ok = piece("title", title) && piece("subtitle", subtitle) && piece("needs-direct", needs_direct) &&
 		          piece("btn-mute", mute) && piece("btn-muted", muted) && piece("btn-setfloor", setfloor) &&
 		          piece("btn-reset", reset) && piece("btn-measure", measure) && piece("btn-close", close) &&
+		          piece("btn-switch", switch_app) && piece("btn-auto", auto_ipd) &&
+		          piece("btn-cancel", cancel) &&
 		          piece("cm", cm) &&
 		          piece("digits", digits.img) &&
 		          piece("digits-small", digits_small.img) && piece("bright-note", bright_note) &&
@@ -460,6 +479,8 @@ struct Pieces
 		load_raw(dir + "/tab-word-off.rgba", off);
 		load_raw(dir + "/tab-word-frames.rgba", frames);
 		load_raw(dir + "/tab-restart-runtime.rgba", restart_runtime);
+		load_raw(dir + "/tab-word-ipd.rgba", ipd_name);
+		load_raw(dir + "/tab-word-mm.rgba", mm);
 		for (int r = 0; ok && r < kRowCount; r++) {
 			ok = (kRows[r].kind == Kind::Note || piece(std::string(kRows[r].id) + "-label", label[r])) &&
 			     (kRows[r].kind == Kind::Info || piece(std::string(kRows[r].id) + "-help", help[r]));
@@ -524,7 +545,7 @@ tab_layout(const Pieces &p, bool native = false)
 		// the application is the runtime's: SteamVR's dashboard has its own Quit.
 		L.hidden[r] = native ? (kRows[r].ctl == Ctl::DirectMode || kRows[r].ctl == Ctl::PfGpu ||
 		                        kRows[r].ctl == Ctl::PfDropped)
-		                     : kRows[r].ctl == Ctl::CloseApp;
+		                     : (kRows[r].ctl == Ctl::CloseApp || kRows[r].ctl == Ctl::SwitchApp);
 	}
 	for (int c = 0; c < kCardCount; c++) {
 		bool any = false;
@@ -816,6 +837,22 @@ draw_card(Image &img, const Pieces &p, const Layout &L, const TabState &s, int c
 			            R.value_right - p.cm.w - 8, R.value_y - oy);
 			break;
 		}
+		case Ctl::Ipd: {
+			// "Auto" lit while the headset's slider is followed.
+			const bool known = s.ipd_tenths > 0;
+			draw_button(img, R.small, oy, p.auto_ipd, s.ipd_manual ? Rgba{38, 42, 52, 255} : kAccent, known ? 1.0f : 0.3f);
+			draw_slider(img, R, oy,
+			            (float)(std::clamp(s.ipd_tenths, kIpdMinTenths, kIpdMaxTenths) - kIpdMinTenths) /
+			                (kIpdMaxTenths - kIpdMinTenths),
+			            0.0f, known ? kAccent : kInactive, known);
+			if (known) {
+				char text[16];
+				snprintf(text, sizeof(text), "%d.%d", s.ipd_tenths / 10, s.ipd_tenths % 10);
+				draw(img, p.mm, R.value_right - p.mm.w, R.value_y - oy - p.mm.h / 2 + 3);
+				draw_number(img, p.digits, text, R.value_right - p.mm.w - 8, R.value_y - oy);
+			}
+			break;
+		}
 		case Ctl::Recentre: break;
 		case Ctl::AutoHdr: draw_switch(img, R.control, oy, pic.on, enabled); break;
 		case Ctl::Strength:
@@ -875,6 +912,12 @@ draw_card(Image &img, const Pieces &p, const Layout &L, const TabState &s, int c
 		}
 		case Ctl::FastPath: draw_switch(img, R.control, oy, s.info.fast_path && pic.direct, row_enabled); break;
 		case Ctl::PerfOn: draw_switch(img, R.control, oy, s.info.perf_on, true); break;
+		case Ctl::SwitchApp: {
+			// Greyed without another application to show.
+			draw_button(img, R.control, oy, p.switch_app, s.info.other_app ? Rgba{38, 42, 52, 255} : Rgba{28, 30, 37, 255},
+			            s.info.other_app ? 1.0f : 0.3f);
+			break;
+		}
 		case Ctl::CloseApp: {
 			// Greyed with no application running, or while one is being closed.
 			const bool can = s.info.app_running && !s.info.app_closing;
@@ -944,6 +987,32 @@ render_volume_panel(const Pieces &p, const Layout &L, const TabState &s)
 	return out;
 }
 
+//! The IPD notice ("IPD 63.5 mm", u_notice "ipd" in tenths of a millimetre), shown at the view's lower right while the
+//! distance between the eyes changes.
+inline Image
+render_ipd_panel(const Pieces &p, int tenths)
+{
+	char text[16];
+	snprintf(text, sizeof(text), "%d.%d", tenths / 10, tenths % 10);
+	std::vector<Image> parts;
+	if (p.ipd_name.w > 0) {
+		parts.push_back(p.ipd_name);
+	}
+	parts.push_back(p.digits.render(text));
+	if (p.mm.w > 0) {
+		parts.push_back(p.mm);
+	}
+	const Image line = side_by_side(parts, 16);
+	constexpr int kPadX = 36, kPadY = 22;
+	Image img;
+	img.w = line.w + 2 * kPadX;
+	img.h = line.h + 2 * kPadY;
+	img.px.assign(static_cast<size_t>(img.w) * img.h * 4, 0);
+	fill_round_rect(img, 0, 0, static_cast<float>(img.w), static_cast<float>(img.h), 26.0f, Rgba{18, 20, 26, 230});
+	draw(img, line, kPadX, kPadY);
+	return img;
+}
+
 //! What the laser's point is on: a row's control, its small button ("Reset", "Mute"), or its slider's track.
 struct Hit
 {
@@ -967,12 +1036,23 @@ slider_frac(const TabState &s, Ctl ctl)
 	case Ctl::Volume: return std::clamp(s.volume, 0, 100) / 100.0f;
 	case Ctl::Mic: return std::clamp(s.mic, 0, 100) / 100.0f;
 	case Ctl::Height: return (float)(s.height_cm - kHeightMinCm) / (kHeightMaxCm - kHeightMinCm);
+	case Ctl::Ipd:
+		return (float)(std::clamp(s.ipd_tenths, kIpdMinTenths, kIpdMaxTenths) - kIpdMinTenths) /
+		       (kIpdMaxTenths - kIpdMinTenths);
 	case Ctl::Strength: return std::clamp(s.picture.strength, 0, 100) / 100.0f;
 	case Ctl::Colour: return std::clamp(s.picture.colour, 0, 100) / 100.0f;
 	case Ctl::RenderScale:
 		return (float)(std::clamp(s.info.scale_saved, kScaleMin, kScaleMax) - kScaleMin) / (kScaleMax - kScaleMin);
 	default: return -1.0f;
 	}
+}
+
+//! The IPD set by hand at @p frac of its slider, tenths of a millimetre, in steps of 0.5 mm.
+inline int
+ipd_tenths_at(float frac)
+{
+	const float tenths = kIpdMinTenths + std::clamp(frac, 0.0f, 1.0f) * (kIpdMaxTenths - kIpdMinTenths);
+	return (int)std::lround(tenths / 5.0f) * 5;
 }
 
 //! Where a slider's knob is drawn at @p frac.

@@ -48,6 +48,8 @@ layout(set = 0, binding = 3, std140) uniform restrict Config
 	// The fast path's layer when it is HDR: as layer.comp's hdr_source and hdr_range; x 0 is SDR.
 	vec4 hdr_source;
 	vec4 hdr_range;
+	// The lens test's pattern (RiftLinux): per view xy the lens centre's pixel, z 1 drawn.
+	ivec4 pattern[2];
 }ubo;
 
 
@@ -208,6 +210,21 @@ void main()
 		taps[k] = auto_hdr_layer(c, ubo.post2, ubo.hdr_source, ubo.hdr_range);
 	}
 	vec4 colour = vec4(taps[0].r, taps[1].g, taps[2].b, 1);
+
+	/*
+	 * The lens test's pattern (RiftLinux): a cross around the lens centre's pixel, drawn here, in panel pixels after the
+	 * lens correction, so its one-pixel lines land on panel pixels. Each bar 9 pixels across: green lines at the odd
+	 * offsets 1 and 3, black between and around them, a black pixel past each line's end; the horizontal bars stop at
+	 * the vertical one. Green and black, then processed as everything is.
+	 */
+	if (ubo.pattern[iz].z != 0) {
+		ivec2 a = abs(ivec2(ix, iy) - ubo.pattern[iz].xy);
+		if (a.x <= 4 && a.y <= 40) {
+			colour.rgb = (a.x % 2 == 1 && a.y <= 39) ? vec3(0.0, 1.0, 0.0) : vec3(0.0);
+		} else if (a.y <= 4 && a.x >= 5 && a.x <= 40) {
+			colour.rgb = (a.y % 2 == 1 && a.x <= 39) ? vec3(0.0, 1.0, 0.0) : vec3(0.0);
+		}
+	}
 
 	// Then, as after the squasher: highlights past white eased in (float content only) and the panel's black level.
 	colour.rgb = auto_hdr(tone_map(colour.rgb, ubo.post0.z), vec4(0.0), ubo.post0.y);

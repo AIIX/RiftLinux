@@ -32,12 +32,14 @@
 #include "math/m_gyro_rest_bias.h"
 #include "math/m_api.h"
 #include "math/m_vec3.h"
+#include "math/m_predict.h"
 
 #include "tracking/t_camera_models.h"
 
 #include "constellation/t_constellation_tracker_internal.hpp"
 #include "constellation/t_constellation_tracker_dataset.hpp"
 #include "constellation/t_rift_blobwatch.h"
+#include "constellation/t_touch_app_pose.h"
 
 #include "util/u_frame.h"
 #include "util/u_notice.h"
@@ -107,6 +109,11 @@ struct ReplayDevice
 	//! The fusion is the prior only within this long of a solve, 0 for always: the Touch driver's rule.
 	timepoint_ns fusion_fresh_ns{0};
 	timepoint_ns last_solve_ns{0};
+	//! What a Touch's app is shown, as the Rift driver decides it.
+	t_touch_app_pose app{};
+	t_touch_app_pose_params app_params{};
+	bool app_why{false};
+	const char *app_why_last{nullptr};
 	//! Within that time too, the held pose when the fusion has none (it started over), as the Touch driver does.
 	bool held_when_no_fusion{false};
 
@@ -203,6 +210,73 @@ replay_get_tracked_pose(t_constellation_tracker_tracking_source *source,
 	}
 }
 
+//! What an app asking at @p when_ns gets, recorded; for a Touch as the Rift driver decides it (touch_get_app_relation).
+static void
+replay_app_query(ReplayDevice *rd, timepoint_ns when_ns)
+{
+	xrt_space_relation relation = XRT_SPACE_RELATION_ZERO;
+	if (rd->fusion_fresh_ns <= 0) {
+		rd->tracker->getTrackedPose(rd->id, when_ns, relation);
+		return;
+	}
+	timepoint_ns state_ns = 0;
+	xrt_space_relation fused = XRT_SPACE_RELATION_ZERO;
+	for (auto &device : rd->tracker->devices) {
+		if (device->id == rd->id) {
+			device->sensor_fusion->getTrackedPose(when_ns, state_ns, fused, true);
+			if (fused.relation_flags != 0) {
+				xrt_space_relation predicted;
+				m_predict_relation(&fused, time_ns_to_s(when_ns - state_ns), &predicted);
+				fused = predicted;
+			}
+		}
+	}
+	const xrt_space_relation_flags needed =
+	    (xrt_space_relation_flags)(XRT_SPACE_RELATION_POSITION_VALID_BIT | XRT_SPACE_RELATION_ORIENTATION_VALID_BIT);
+	const xrt_vec3 solved = rd->hold_pose.position;
+	const bool shown = (fused.relation_flags & needed) == needed &&
+	                   t_touch_app_pose_carried(&rd->app, &rd->app_params, rd->last_solve_ns, when_ns, &fused,
+	                                            rd->have_hold, &solved) &&
+	                   t_touch_app_pose_show(&rd->app, &rd->app_params, when_ns, rd->have_hold, &solved, &fused);
+	// Why an app is not shown the fusion's pose, as it changes (--touch-app-why).
+	if (rd->app_why && !shown) {
+		const bool have_fused = (fused.relation_flags & needed) == needed;
+		const int64_t age_ns = when_ns - rd->last_solve_ns;
+		const float off_m = have_fused ? m_vec3_len(m_vec3_sub(fused.pose.position, solved)) : -1.0f;
+		const char *why = !have_fused                                  ? "no fusion pose"
+		                  : age_ns > rd->app_params.carry_ns           ? "too long"
+		                  : rd->app.carry_over_solve_ns == rd->last_solve_ns ? "carrying stopped"
+		                                                                 : "fusion far from the solve";
+		if (why != rd->app_why_last) {
+			fprintf(stderr, "APPWHY %d %.3f %s age %.0f ms, fusion %.2f m from the solve\n", rd->id,
+			        static_cast<double>(when_ns) / U_TIME_1S_IN_NS, why, static_cast<double>(age_ns) / U_TIME_1MS_IN_NS,
+			        off_m);
+			rd->app_why_last = why;
+		}
+	} else if (rd->app_why) {
+		rd->app_why_last = nullptr;
+	}
+	if (shown) {
+		relation = fused;
+	} else if (rd->have_hold) {
+		relation.pose.position = t_touch_app_pose_hold_position(&rd->app, &rd->app_params, &solved);
+		relation.pose.orientation = rd->hold_pose.orientation;
+		relation.relation_flags = (xrt_space_relation_flags)(XRT_SPACE_RELATION_ORIENTATION_VALID_BIT |
+		                                                     XRT_SPACE_RELATION_ORIENTATION_TRACKED_BIT |
+		                                                     XRT_SPACE_RELATION_POSITION_VALID_BIT);
+		t_touch_app_pose_held(&rd->app, &relation.pose);
+	}
+	if (rd->tracker->data_recorder) {
+		rd->tracker->data_recorder->recordOutputPose(ct::DatasetOutputPose{
+		    .device_id = rd->id,
+		    .query_ns = os_monotonic_get_ns(),
+		    .when_ns = when_ns,
+		    .state_ns = state_ns,
+		    .relation = relation,
+		});
+	}
+}
+
 struct Options
 {
 	std::string mode;
@@ -254,6 +328,27 @@ struct Options
 	 * tracking space, as a measurement whose solve picked another origin left it. Implies live camera poses.
 	 */
 	double rig_offset[6]{0.0, 0.0, 0.0, 0.0, 0.0, 0.0};
+	//! `track` mode: one device's IMU turned by a fixed rotation in its own frame (device id, degrees, axis), as an IMU
+	//! seated off its LED ring would read; device -1: none.
+	int tilt_device = -1;
+	double tilt_deg = 0.0;
+	double tilt_axis[3]{1.0, 0.0, 0.0};
+	//! `track` mode: an IMU seat calibration of this device started this many seconds in, its corrections applied to
+	//! the device's IMU samples as the driver would (device -1: none).
+	int calibrate_device = -1;
+	double calibrate_at_s = -1.0;
+	//! `track` mode: a saved calibration: this device's IMU samples turned by this quaternion from the start.
+	int seat_device = -1;
+	xrt_quat seat_quat = XRT_QUAT_IDENTITY;
+	xrt_vec3 seat_bias = XRT_VEC3_ZERO;
+	//! `track` mode: an IMU alignment kept from an earlier session given to the tracker at the start (RiftLinux,
+	//! t_constellation_tracker_set_imu_align, as the driver does): device, turn, bias.
+	int align_device = -1;
+	xrt_quat align_quat = XRT_QUAT_IDENTITY;
+	xrt_vec3 align_bias = XRT_VEC3_ZERO;
+	//! `track` mode: this device's accelerometer reading this much off (m/s², its own frame), as a biased one would.
+	int bias_device = -1;
+	xrt_vec3 bias_add = XRT_VEC3_ZERO;
 
 	//! `frames` mode: a directory of recorded camera frames and IMU samples (frames.zst, frames.csv, imu.csv).
 	std::string frames_dir;
@@ -263,7 +358,12 @@ struct Options
 	//! `track` mode: how long after its last solve a Touch's fusion pose is used (RIFT_TOUCH_POSITION_HOLD_NS).
 	double touch_fresh_ms{150.0};
 	//! `track` mode: a Touch whose fusion has no pose within that time gets the held pose, as in the Rift driver.
-	bool touch_held_when_no_fusion{false};
+	bool touch_held_when_no_fusion{true};
+	bool touch_app_why{false};
+	double touch_carry_ms{-1.0};
+	float touch_carry_speed{-1.0f};
+	float touch_carry_distance{-1.0f};
+	float touch_carry_near{-1.0f};
 	//! `frames` mode: take the Touch gyros' bias out whenever they lie still, as the Rift driver does.
 	bool rest_bias{true};
 	//! `frames` mode: blobs added to every frame of their camera (camera,dx,dy,ux,uy,bbx,bby,bbw,bbh,sx,sy), e.g.
@@ -277,6 +377,9 @@ struct Options
 	int max_blob_width{RIFT_BLOBWATCH_DEFAULT_MAX_BLOB_WIDTH};
 	//! `frames` mode: hand frames over at the pace they were captured, as live, not as fast as they go.
 	bool realtime{false};
+	//! `track` mode: the fusion's thread caught up before each camera sample too, not only after it (the IMU
+	//! samples handed over in between all in, as live where it keeps up): the run no longer depends on timing.
+	bool fusion_sync{false};
 	//! track: stretches of the run, in seconds from its first sample, in which no sensor sees anything.
 	std::vector<std::pair<double, double>> blind;
 	//! `frames` mode: run the tracker's camera threads as live does, fast and slow searches racing the frames.
@@ -329,12 +432,23 @@ usage()
 	    "  --led-visibility-deg A Treat LEDs as visible up to A degrees off their normal (default: as "
 	    "recorded).\n"
 	    "  --prior raw|fusion     track: the prior is the last solves (default) or the sensor fusion.\n"
-	    "  --imu-lead-ms T        track: IMU samples up to T ms after a camera sample are in when it is\n"
+	    "  --imu-seat D,X,Y,Z,W[,BX,BY,BZ] track: device D's IMU corrected by this rotation and accelerometer bias from the\n"
+    "            start, as a saved calibration\n"
+    "  --bias-imu D,X,Y,Z     track: device D's accelerometer reads this much off (m/s2), as a biased one would\n"
+    "  --imu-align-preset D,X,Y,Z,W,BX,BY,BZ track: device D's IMU alignment kept from an earlier session, given to the\n"
+    "            tracker at the start (with CONSTELLATION_TRACKER_IMU_ALIGN)\n"
+    "  --calibrate-imu D,T    track: start device D's IMU seat calibration T seconds in, and turn its IMU samples\n"
+    "            by what it finds, as the driver does\n"
+    "  --tilt-imu D,DEG[,X,Y,Z] track: device D's IMU turned DEG degrees about axis X,Y,Z (its own frame; default\n"
+    "            1,0,0), as an IMU seated off its LED ring reads\n"
+    "  --imu-lead-ms T        track: IMU samples up to T ms after a camera sample are in when it is\n"
 	    "                         processed (default 10).\n"
 	    "  --touch-fresh-ms T     track: a Touch's fusion pose is used up to T ms after its last solve\n"
 	    "                         (default 150, the Rift driver's).\n"
+	    "  --touch-carry-ms T, --touch-carry-speed V, --touch-carry-distance D\n"
+	    "                         what a Touch's app is shown past its last solve (default: the Rift driver's).\n"
 	    "  --touch-held 0|1       track: within that time, a Touch whose fusion has no pose (it started over) gets\n"
-	    "                         its held pose as the prior, as the Rift driver does (default 0).\n"
+	    "                         its held pose as the prior, as the Rift driver does (default 1).\n"
 	    "  --frames-dir D         frames: run the Rift blobwatch and the tracker on raw sensor frames and IMU\n"
 	    "                         samples from D (frames.zst, frames.csv, imu.csv), <in.ctdata> giving the cameras,\n"
 	    "                         their placement and the devices. Implies --prior fusion.\n"
@@ -351,7 +465,8 @@ usage()
 	    "  --max-blob-width N    frames: the blobwatch's largest blob (50).\n"
 	    "  --blind S,E[,S,E...]  track: no sensor sees anything from S to E seconds after the first sample (the IMU\n"
 	    "                        and the app's queries go on), to compare what is held with what was tracked.\n"
-	    "  --realtime 0|1        frames, track: hand frames (track: samples and the app's queries) over at the pace\n"
+	    "  --fusion-sync 0|1     track: the fusion catches up before each camera sample too (no timing in the run)\n"
+    "  --realtime 0|1        frames, track: hand frames (track: samples and the app's queries) over at the pace\n"
 	    "                        they were captured (0); what the fusion times on the clock then runs as live.\n"
 	    "  --threaded 0|1        frames: run the tracker's camera threads as live (0, one thread).\n"
 	    "  --forget-every S      frames: forget the controllers every S seconds, to measure finding them again.\n"
@@ -417,6 +532,8 @@ parse_options(int argc, char **argv, Options &o)
 			for (size_t k = 0; k + 1 < v.size(); k += 2) {
 				o.blind.emplace_back(v[k], v[k + 1]);
 			}
+		} else if (arg == "--fusion-sync") {
+			o.fusion_sync = atoi(value) != 0;
 		} else if (arg == "--realtime") {
 			o.realtime = atoi(value) != 0;
 		} else if (arg == "--threaded") {
@@ -445,6 +562,16 @@ parse_options(int argc, char **argv, Options &o)
 			o.app_after_each_ms = atof(value);
 		} else if (arg == "--touch-fresh-ms") {
 			o.touch_fresh_ms = atof(value);
+		} else if (arg == "--touch-app-why") {
+			o.touch_app_why = atoi(value) != 0;
+		} else if (arg == "--touch-carry-ms") {
+			o.touch_carry_ms = atof(value);
+		} else if (arg == "--touch-carry-speed") {
+			o.touch_carry_speed = static_cast<float>(atof(value));
+		} else if (arg == "--touch-carry-near") {
+			o.touch_carry_near = static_cast<float>(atof(value));
+		} else if (arg == "--touch-carry-distance") {
+			o.touch_carry_distance = static_cast<float>(atof(value));
 		} else if (arg == "--touch-held") {
 			o.touch_held_when_no_fusion = atoi(value) != 0;
 		} else if (arg == "--calibration-from") {
@@ -465,6 +592,31 @@ parse_options(int argc, char **argv, Options &o)
 		} else if (arg == "--recalibrate-at") {
 			o.recalibrate_at_s = atof(value);
 			o.live_camera_poses = true;
+		} else if (arg == "--imu-seat") {
+			const int n = sscanf(value, "%d,%f,%f,%f,%f,%f,%f,%f", &o.seat_device, &o.seat_quat.x, &o.seat_quat.y,
+			                     &o.seat_quat.z, &o.seat_quat.w, &o.seat_bias.x, &o.seat_bias.y, &o.seat_bias.z);
+			if (n != 5 && n != 8) {
+				return false;
+			}
+		} else if (arg == "--imu-align-preset") {
+			if (sscanf(value, "%d,%f,%f,%f,%f,%f,%f,%f", &o.align_device, &o.align_quat.x, &o.align_quat.y,
+			           &o.align_quat.z, &o.align_quat.w, &o.align_bias.x, &o.align_bias.y, &o.align_bias.z) != 8) {
+				return false;
+			}
+		} else if (arg == "--bias-imu") {
+			if (sscanf(value, "%d,%f,%f,%f", &o.bias_device, &o.bias_add.x, &o.bias_add.y, &o.bias_add.z) != 4) {
+				return false;
+			}
+		} else if (arg == "--calibrate-imu") {
+			if (sscanf(value, "%d,%lf", &o.calibrate_device, &o.calibrate_at_s) != 2) {
+				return false;
+			}
+		} else if (arg == "--tilt-imu") {
+			const int n = sscanf(value, "%d,%lf,%lf,%lf,%lf", &o.tilt_device, &o.tilt_deg, &o.tilt_axis[0],
+			                     &o.tilt_axis[1], &o.tilt_axis[2]);
+			if (n != 2 && n != 5) {
+				return false;
+			}
 		} else if (arg == "--rig-offset") {
 			const int n = sscanf(value, "%lf,%lf,%lf,%lf,%lf,%lf", &o.rig_offset[0], &o.rig_offset[1],
 			                     &o.rig_offset[2], &o.rig_offset[3], &o.rig_offset[4], &o.rig_offset[5]);
@@ -547,6 +699,45 @@ give_loose_part(t_constellation_tracker_device_params &params, LoosePart &part, 
 	params.loose_part.leds = part.leds.data();
 	params.loose_part.led_count = part.leds.size();
 	snprintf(params.serial, sizeof(params.serial), "%s", part.serial.c_str());
+}
+
+//! @p s corrected as a driver does: accelerometer @p q * (a - @p bias), gyro @p q * g.
+static xrt_imu_sample
+turned(const xrt_imu_sample &s, const xrt_quat &q, const xrt_vec3 &bias)
+{
+	xrt_imu_sample out = s;
+	const xrt_vec3 a = {static_cast<float>(s.accel_m_s2.x) - bias.x, static_cast<float>(s.accel_m_s2.y) - bias.y,
+	                    static_cast<float>(s.accel_m_s2.z) - bias.z};
+	const xrt_vec3 g = {static_cast<float>(s.gyro_rad_secs.x), static_cast<float>(s.gyro_rad_secs.y),
+	                    static_cast<float>(s.gyro_rad_secs.z)};
+	xrt_vec3 ta, tg;
+	math_quat_rotate_vec3(&q, &a, &ta);
+	math_quat_rotate_vec3(&q, &g, &tg);
+	out.accel_m_s2 = {ta.x, ta.y, ta.z};
+	out.gyro_rad_secs = {tg.x, tg.y, tg.z};
+	return out;
+}
+
+//! @p s with its accelerometer and gyro turned by --tilt-imu's rotation (Rodrigues).
+static xrt_imu_sample
+tilted(const Options &o, const xrt_imu_sample &s)
+{
+	double ax = o.tilt_axis[0], ay = o.tilt_axis[1], az = o.tilt_axis[2];
+	const double len = std::sqrt(ax * ax + ay * ay + az * az);
+	ax /= len;
+	ay /= len;
+	az /= len;
+	const double a = o.tilt_deg * M_PI / 180.0, c = std::cos(a), sn = std::sin(a);
+	auto turn = [&](const xrt_vec3_f64 &v) {
+		const double dot = ax * v.x + ay * v.y + az * v.z;
+		const double cx = ay * v.z - az * v.y, cy = az * v.x - ax * v.z, cz = ax * v.y - ay * v.x;
+		return xrt_vec3_f64{v.x * c + cx * sn + ax * dot * (1 - c), v.y * c + cy * sn + ay * dot * (1 - c),
+		                    v.z * c + cz * sn + az * dot * (1 - c)};
+	};
+	xrt_imu_sample out = s;
+	out.accel_m_s2 = turn(s.accel_m_s2);
+	out.gyro_rad_secs = turn(s.gyro_rad_secs);
+	return out;
 }
 
 int
@@ -673,6 +864,20 @@ do_replay(const Options &o)
 		if (touch) {
 			// RIFT_TOUCH_POSITION_HOLD_NS
 			rd->fusion_fresh_ns = static_cast<timepoint_ns>(o.touch_fresh_ms * U_TIME_1MS_IN_NS);
+			rd->app_why = o.touch_app_why;
+			t_touch_app_pose_params_default(&rd->app_params);
+			if (o.touch_carry_ms >= 0.0) {
+				rd->app_params.carry_ns = static_cast<int64_t>(o.touch_carry_ms * U_TIME_1MS_IN_NS);
+			}
+			if (o.touch_carry_speed >= 0.0f) {
+				rd->app_params.max_speed_m_s = o.touch_carry_speed;
+			}
+			if (o.touch_carry_distance >= 0.0f) {
+				rd->app_params.max_distance_m = o.touch_carry_distance;
+			}
+			if (o.touch_carry_near >= 0.0f) {
+				rd->app_params.near_distance_m = o.touch_carry_near;
+			}
 			rd->held_when_no_fusion = o.touch_held_when_no_fusion;
 		}
 		device_params.led_model.match_parameters = {
@@ -774,6 +979,15 @@ do_replay(const Options &o)
 	timepoint_ns app_next_ns = 0;
 
 	const timepoint_ns t0 = dataset.samples.front().timestamp_ns;
+	// --calibrate-imu: the tracker as drivers see it, and the correction as a driver applies it.
+	t_constellation_tracker *raw_tracker = reinterpret_cast<t_constellation_tracker *>(tracker.get());
+	xrt_quat seat = o.seat_quat;
+	xrt_vec3 seat_bias = o.seat_bias;
+	uint32_t seat_generation = 0;
+	bool calibration_started = false;
+	bool align_preset_given = false;
+	timepoint_ns imu_advice_asked_ns = 0;
+	bool imu_advised[3] = {};
 	const timepoint_ns from_ns = t0 + static_cast<timepoint_ns>(o.from_s * U_TIME_1S_IN_NS);
 	const timepoint_ns to_ns = o.to_s < 0.0 ? INT64_MAX : t0 + static_cast<timepoint_ns>(o.to_s * U_TIME_1S_IN_NS);
 
@@ -816,10 +1030,40 @@ do_replay(const Options &o)
 		while (imu_next < imu_in_order.size() &&
 		       imu_in_order[imu_next]->sample.timestamp_ns <= recorded.timestamp_ns + imu_lead_ns) {
 			const ct::DatasetImuSample *imu = imu_in_order[imu_next++];
-			devices_by_id[device_ids[imu->device_id]]->pushImuSample(imu->sample);
+			xrt_imu_sample sample =
+			    device_ids[imu->device_id] == o.tilt_device ? tilted(o, imu->sample) : imu->sample;
+			// As the driver: the calibration's correction, once it has one.
+			if (device_ids[imu->device_id] == o.bias_device) {
+				sample.accel_m_s2.x += o.bias_add.x;
+				sample.accel_m_s2.y += o.bias_add.y;
+				sample.accel_m_s2.z += o.bias_add.z;
+			}
+			if (device_ids[imu->device_id] == o.seat_device && o.seat_device != o.calibrate_device) {
+				sample = turned(sample, seat, seat_bias);
+			} else if (device_ids[imu->device_id] == o.calibrate_device) {
+				t_constellation_imu_calibration_status status = {};
+				if (t_constellation_tracker_imu_calibration(raw_tracker, o.calibrate_device, &status) == 0 &&
+				    status.generation != seat_generation) {
+					seat_generation = status.generation;
+					// As the driver: on top of what was in use as it started.
+					math_quat_rotate(&status.correction, &o.seat_quat, &seat);
+					xrt_quat start_inverse = o.seat_quat;
+					math_quat_invert(&start_inverse, &start_inverse);
+					xrt_vec3 back;
+					math_quat_rotate_vec3(&start_inverse, &status.accel_bias, &back);
+					seat_bias = {o.seat_bias.x + back.x, o.seat_bias.y + back.y, o.seat_bias.z + back.z};
+				}
+				if (status.state == T_CONSTELLATION_IMU_CALIBRATION_FAILED && seat_generation != UINT32_MAX) {
+					seat = o.seat_quat;
+					seat_bias = o.seat_bias;
+					seat_generation = UINT32_MAX;
+				}
+				sample = turned(sample, seat, seat_bias);
+			}
+			devices_by_id[device_ids[imu->device_id]]->pushImuSample(sample);
 			for (auto &rd : replay_devices) {
 				if (rd->id == device_ids[imu->device_id]) {
-					rd->pushImu(imu->sample);
+					rd->pushImu(sample);
 				}
 			}
 		}
@@ -831,19 +1075,15 @@ do_replay(const Options &o)
 			}
 			for (; app_next_ns <= recorded.timestamp_ns; app_next_ns += app_period_ns) {
 				pace(app_next_ns);
+				ct::optimizer::sensor_fusion::sensorFusionSetReplayClock(app_next_ns);
 				for (auto &rd : replay_devices) {
-					xrt_space_relation relation;
-					if (rd->fusion_fresh_ns > 0 &&
-					    (rd->last_solve_ns == 0 ||
-					     app_next_ns - rd->last_solve_ns > rd->fusion_fresh_ns)) {
-						continue;
-					}
-					tracker->getTrackedPose(rd->id, app_next_ns, relation);
+					replay_app_query(rd.get(), app_next_ns);
 				}
 			}
 		}
 
 		pace(recorded.timestamp_ns);
+		ct::optimizer::sensor_fusion::sensorFusionSetReplayClock(recorded.timestamp_ns);
 		bool blinded = false;
 		for (const auto &b : o.blind) {
 			const double at_s = static_cast<double>(recorded.timestamp_ns - t0) / U_TIME_1S_IN_NS;
@@ -856,6 +1096,35 @@ do_replay(const Options &o)
 		sample.source = &stub_blobwatch;
 		if (!track) {
 			sample.Txr_world_cam = std::nullopt;
+		}
+		// As the driver asks, about once a second: the headset is the first device.
+		if (track && sample.timestamp_ns - imu_advice_asked_ns >= U_TIME_1S_IN_NS) {
+			imu_advice_asked_ns = sample.timestamp_ns;
+			for (int d = 1; d < 3; d++) {
+				t_constellation_imu_advice advice = {};
+				if (!imu_advised[d] && t_constellation_tracker_imu_advice(raw_tracker, d, 0, &advice) == 0 &&
+				    advice.advised) {
+					imu_advised[d] = true;
+					fprintf(stderr,
+					        "Device %d: IMU calibration advised at %.1f s: %u orientations, %u sensors, %u of "
+					        "%u off\n",
+					        d, (sample.timestamp_ns - t0) / static_cast<double>(U_TIME_1S_IN_NS),
+					        advice.steady_orientations, advice.sensors, advice.off, advice.samples);
+				}
+			}
+		}
+		if (track && !align_preset_given && o.align_device >= 0) {
+			align_preset_given = true;
+			const int r = t_constellation_tracker_set_imu_align(raw_tracker, o.align_device, &o.align_quat, &o.align_bias);
+			fprintf(stderr, "Device %d: IMU alignment from an earlier session given: %s\n", o.align_device,
+			        r == 0 ? "yes" : "no such device");
+		}
+		if (track && !calibration_started && o.calibrate_device >= 0 &&
+		    sample.timestamp_ns >= t0 + static_cast<timepoint_ns>(o.calibrate_at_s * U_TIME_1S_IN_NS)) {
+			calibration_started = true;
+			t_constellation_tracker_calibrate_imu(raw_tracker, o.calibrate_device, true);
+			fprintf(stderr, "Device %d: IMU calibration started at %.1f s\n", o.calibrate_device,
+			        (sample.timestamp_ns - t0) / 1e9);
 		}
 		ct::Camera *camera = tracker->mosaics[sample.mosaic_index]->cameras[sample.camera_index].get();
 		if (track && o.live_camera_poses) {
@@ -929,6 +1198,11 @@ do_replay(const Options &o)
 		if (!track) {
 			camera->processSampleSlow(sample);
 		} else {
+			if (o.fusion_sync) {
+				for (auto &device : tracker->devices) {
+					device->sensor_fusion->waitIdle();
+				}
+			}
 			const auto fast_start = std::chrono::steady_clock::now();
 			const bool need_slow = camera->processSampleFast(sample);
 			const auto slow_start = std::chrono::steady_clock::now();
@@ -982,6 +1256,28 @@ do_replay(const Options &o)
 		        static_cast<size_t>(std::count_if(v->begin(), v->end(), [](double x) { return x > 19.2; })));
 	}
 
+	if (track) {
+		for (int d = 1; d < 3; d++) {
+			t_constellation_imu_advice advice = {};
+			if (t_constellation_tracker_imu_advice(raw_tracker, d, 0, &advice) == 0) {
+				fprintf(stderr, "Device %d: IMU advice at the end %d: %u orientations, %u sensors, %u of %u off%s\n", d,
+				        advice.advised, advice.steady_orientations, advice.sensors, advice.off, advice.samples,
+				        imu_advised[d] ? ", advised on the way" : "");
+				t_constellation_tracker_imu_advice_log(raw_tracker, d);
+			}
+		}
+		t_constellation_tracker_imu_advice_log(raw_tracker, 0);
+	}
+	if (o.calibrate_device >= 0) {
+		t_constellation_imu_calibration_status status = {};
+		t_constellation_tracker_imu_calibration(raw_tracker, o.calibrate_device, &status);
+		fprintf(stderr,
+		        "Device %d: IMU calibration state %d, round %d, progress %d %%, correction %.2f degrees (%.4f,%.4f,"
+		        "%.4f,%.4f,%.4f,%.4f,%.4f), residual p90 %.1f degrees\n",
+		        o.calibrate_device, static_cast<int>(status.state), status.round, status.progress,
+		        status.correction_deg, seat.x, seat.y, seat.z, seat.w, seat_bias.x, seat_bias.y, seat_bias.z,
+		        status.residual_p90_deg);
+	}
 	for (auto &device : tracker->devices) {
 		fprintf(stderr,
 		        "Device %d: %" PRIu64 " pose(s) rejected for disagreeing with the IMU on down, %" PRIu64
@@ -1138,6 +1434,20 @@ do_frames(const Options &o)
 		const bool touch = device.led_model.led_count <= 24;
 		if (touch) {
 			rd->fusion_fresh_ns = static_cast<timepoint_ns>(o.touch_fresh_ms * U_TIME_1MS_IN_NS);
+			rd->app_why = o.touch_app_why;
+			t_touch_app_pose_params_default(&rd->app_params);
+			if (o.touch_carry_ms >= 0.0) {
+				rd->app_params.carry_ns = static_cast<int64_t>(o.touch_carry_ms * U_TIME_1MS_IN_NS);
+			}
+			if (o.touch_carry_speed >= 0.0f) {
+				rd->app_params.max_speed_m_s = o.touch_carry_speed;
+			}
+			if (o.touch_carry_distance >= 0.0f) {
+				rd->app_params.max_distance_m = o.touch_carry_distance;
+			}
+			if (o.touch_carry_near >= 0.0f) {
+				rd->app_params.near_distance_m = o.touch_carry_near;
+			}
 			rd->held_when_no_fusion = o.touch_held_when_no_fusion;
 		}
 		t_constellation_tracker_device_params device_params = {
@@ -1242,6 +1552,10 @@ do_frames(const Options &o)
 	std::vector<std::pair<int, timepoint_ns>> index;
 	{
 		FILE *f = fopen((o.frames_dir + "/frames.csv").c_str(), "r");
+		if (f == nullptr) {
+			fprintf(stderr, "Can't open %s/frames.csv\n", o.frames_dir.c_str());
+			return 1;
+		}
 		char line[256];
 		if (fgets(line, sizeof(line), f) == nullptr) {
 			line[0] = '\0'; // Empty file, the loop below reads nothing.
@@ -1256,6 +1570,10 @@ do_frames(const Options &o)
 	std::vector<std::pair<int, xrt_imu_sample>> imu;
 	{
 		FILE *f = fopen((o.frames_dir + "/imu.csv").c_str(), "r");
+		if (f == nullptr) {
+			fprintf(stderr, "Can't open %s/imu.csv\n", o.frames_dir.c_str());
+			return 1;
+		}
 		char line[256];
 		if (fgets(line, sizeof(line), f) == nullptr) {
 			line[0] = '\0'; // Empty file, the loop below reads nothing.
@@ -1359,6 +1677,9 @@ do_frames(const Options &o)
 				m_gyro_rest_bias_apply(&rb->second, &gyro, &out);
 				corrected.gyro_rad_secs = {out.x, out.y, out.z};
 			}
+			if (static_cast<int>(it->second) == o.seat_device) {
+				corrected = turned(corrected, o.seat_quat, o.seat_bias);
+			}
 			devices_by_id[it->second]->pushImuSample(corrected);
 			for (auto &rd : replay_devices) {
 				if (rd->id == it->second) {
@@ -1404,18 +1725,14 @@ do_frames(const Options &o)
 				app_next_ns = ts;
 			}
 			for (; app_next_ns <= ts; app_next_ns += app_period_ns) {
+				ct::optimizer::sensor_fusion::sensorFusionSetReplayClock(app_next_ns);
 				for (auto &rd : replay_devices) {
-					if (rd->fusion_fresh_ns > 0 &&
-					    (rd->last_solve_ns == 0 ||
-					     app_next_ns - rd->last_solve_ns > rd->fusion_fresh_ns)) {
-						continue;
-					}
-					xrt_space_relation relation;
-					tracker->getTrackedPose(rd->id, app_next_ns, relation);
+					replay_app_query(rd.get(), app_next_ns);
 				}
 			}
 		}
 
+		ct::optimizer::sensor_fusion::sensorFusionSetReplayClock(ts);
 		struct xrt_frame *frame = nullptr;
 		u_frame_create_one_off(XRT_FORMAT_L8, w, h, &frame);
 		for (uint32_t y = 0; y < h; y++) {
@@ -1435,7 +1752,13 @@ do_frames(const Options &o)
 			        std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count());
 		}
 	}
-	pclose(zf);
+	const int zstd_status = pclose(zf);
+	// zstd missing or the file unreadable reads as no frames at all: an empty output must not pass for a run.
+	const bool no_frames = done == 0 && !index.empty();
+	if (no_frames) {
+		fprintf(stderr, "No frames read from %s/frames.zst (zstd status %d): is zstd installed?\n", o.frames_dir.c_str(),
+		        zstd_status);
+	}
 
 	fprintf(stderr, "Replayed %zu frames in %.1f s, output %s\n", done,
 	        std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count(), o.out_file.c_str());
@@ -1448,10 +1771,15 @@ do_frames(const Options &o)
 		        device->rms_rejections_total.load(), device->fusion_resets_total.load());
 	}
 
-	// The blobwatches first, then the tracker and its threads, before the dataset its LED models point into goes.
+	/*
+	 * The tracker's camera threads first: one still on its last frame marked blobs in a blobwatch already destroyed
+	 * (every threaded run crashed at its end). Then the blobwatches, then the tracker, before the dataset its LED models
+	 * point into goes. Live, the tracker is a frame node and its break apart stops them first.
+	 */
+	tracker->stopCameraThreads();
 	xrt_frame_context_destroy_nodes(&xfctx);
 	tracker.reset();
-	return 0;
+	return no_frames ? 1 : 0;
 }
 
 int

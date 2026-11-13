@@ -141,6 +141,7 @@ TAB_CARDS = [
     ("view", "View", [
         ("floor", "button", "Floor", "Lay a controller on the floor, then press Set floor."),
         ("height", "slider", "Height", "Raise or lower your view."),
+        ("ipd", "slider", "IPD", "The distance between your eyes. Auto follows the headset's slider; drag to set it by hand."),
     ]),
     ("picture", "Picture", [
         ("autohdr", "switch", "Auto-HDR", "Deeper darks, brighter highlights and richer colour."),
@@ -184,6 +185,8 @@ TAB_CARDS = [
     ]),
     # Only in RiftLinux's own runtime's panel: SteamVR's dashboard has its own Quit.
     ("app", "Application", [
+        ("switchapp", "button", "Switch application", "Shows the application you used before this one, such as "
+                                                      "a VR desktop."),
         ("closeapp", "button", "Close the application", "Asks the running application to quit, and ends it if it "
                                                         "does not."),
     ]),
@@ -313,9 +316,13 @@ def render_tab(out):
     piece(text_block("Now: HDR content on screen", regular(25), (150, 210, 160)), "tab-bright-status-on")
     piece(text_block("Now: no HDR content on screen", regular(25), TAB_GREY), "tab-bright-status-off")
     for name, text in (("mute", "Mute"), ("muted", "Muted"), ("setfloor", "Set floor"), ("reset", "Reset"),
-                       ("measure", "Measure"), ("close", "Close")):
+                       ("measure", "Measure"), ("close", "Close"), ("switch", "Switch"), ("auto", "Auto"),
+                       ("cancel", "Cancel")):
         piece(text_block(text, bold(30), TAB_WHITE), f"tab-btn-{name}")
     piece(text_block("cm", bold(30), TAB_WHITE), "tab-cm")
+    # The IPD notice ("IPD 63.5 mm", put together in the helper with the digits).
+    piece(text_block("IPD", bold(30), TAB_GREY), "tab-word-ipd")
+    piece(text_block("mm", bold(30), TAB_WHITE), "tab-word-mm")
     # Digits, "%", "+", "-" and "." in cells of one width, side by side; the helper finds each one's ink.
     f = bold(40)
     chars = "0123456789%+-."

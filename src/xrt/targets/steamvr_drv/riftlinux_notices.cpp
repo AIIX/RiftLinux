@@ -14,7 +14,8 @@
  * driver: "cmd-open-quick" (the right Touch's Oculus button: the dashboard on the Rift tab), "cmd-recentre" (the
  * button held: SteamVR's own seated recentre), "cmd-height <mm>" (the height above the floor now), "cmd-picture
  * <direct 0|1> <Auto-HDR 0|1> <strength %> <colour %> <smoothing 0|1> <HDR Bright 0|1>" (the picture's settings),
- * "cmd-hdr-content 0|1" (HDR content on screen now, shown at HDR Bright).
+ * "cmd-hdr-content 0|1" (HDR content on screen now, shown at HDR Bright), "cmd-ipd <tenths of a mm>" (the distance
+ * between the eyes changed: shown at the view's lower right for a few seconds).
  * Answers on the same
  * socket "dashboard 1" / "dashboard 0" as SteamVR's dashboard opens and closes (the Oculus button then closes it),
  * "game 1 <application key>" / "game 0" as a game becomes SteamVR's scene application or stops being it,
@@ -91,6 +92,11 @@ constexpr float kAheadM = 1.0f;
 constexpr float kAheadDashboardM = 0.6f;
 constexpr float kBelowM = 0.18f;
 constexpr float kWidthM = 0.6f;
+//! The IPD notice: its width and place at 1 m (the view's lower right), and how long it stays after the last change.
+constexpr float kIpdWidthM = 0.2f;
+constexpr float kIpdRightM = 0.24f;
+constexpr float kIpdBelowM = 0.22f;
+constexpr double kIpdShowS = 3.0;
 //! Test patterns ("test-..." panels): straight ahead, filling most of the view, for longer.
 constexpr double kTestShowS = 30.0;
 constexpr float kTestWidthM = 1.6f;
@@ -1682,6 +1688,19 @@ main(int argc, char **argv)
 		core->Cleanup();
 		return 1;
 	}
+	// The IPD notice ("cmd-ipd"), an overlay of its own: it changes live while the slider moves, beside any notice.
+	vr::VROverlayHandle_t ipd_handle = vr::k_ulOverlayHandleInvalid;
+	if (overlay->CreateOverlay("riftlinux.ipd", "Rift CV1 IPD", &ipd_handle) == vr::VROverlayError_None) {
+		overlay->SetOverlayWidthInMeters(ipd_handle, kIpdWidthM);
+		vr::HmdMatrix34_t lower_right = {
+		    {{1.0f, 0.0f, 0.0f, kIpdRightM}, {0.0f, 1.0f, 0.0f, -kIpdBelowM}, {0.0f, 0.0f, 1.0f, -kAheadM}}};
+		overlay->SetOverlayTransformTrackedDeviceRelative(ipd_handle, vr::k_unTrackedDeviceIndex_Hmd, &lower_right);
+	} else {
+		fprintf(stderr, "riftlinux-notices: no IPD overlay\n");
+	}
+	int ipd_tenths = 0;
+	bool ipd_changed = false;
+	double ipd_drawn_at = -10.0, ipd_last_at = -10.0, ipd_shown_at = -1.0;
 	// The last panel's size and drop at 1 m, kept to place it again nearer or back as the dashboard opens and closes.
 	float placed_width = kWidthM, placed_below = kBelowM;
 	bool near_dashboard = false;
@@ -1757,6 +1776,12 @@ main(int argc, char **argv)
 	double floor_lit_until = 0.0;
 	bool dragging_height = false;
 	int drag_height_cm = 0;
+	// The IPD row: the distance in use (tenths of a mm, 0: not known) and whether set by hand, as the driver says.
+	int ipd_state_tenths = 0;
+	bool ipd_manual = false;
+	bool dragging_ipd = false;
+	int drag_ipd_tenths = 0;
+	double ipd_sent_at = -1.0;
 	double height_sent_at = 0.0;
 	bool dragging = false;
 	//! The trigger's press on the tab: what it is on, and a grabbed knob (rl::tab::Press).
@@ -1794,6 +1819,12 @@ main(int argc, char **argv)
 				while ((eol = partial.find('\n')) != std::string::npos) {
 					std::string name = partial.substr(0, eol);
 					partial.erase(0, eol + 1);
+					// The distance between the eyes, in tenths of a millimetre, as it changes.
+					if (name.rfind("cmd-ipd ", 0) == 0) {
+						ipd_tenths = atoi(name.c_str() + 8);
+						ipd_changed = true;
+						continue;
+					}
 #ifdef RLN_HAVE_PULSE
 					// The Rift tab's state (the tab needs PulseAudio for its volume; built without it, no tab).
 					if (name.rfind("cmd-height ", 0) == 0) {
@@ -1802,6 +1833,14 @@ main(int argc, char **argv)
 					}
 					if (name.rfind("cmd-hdr-content ", 0) == 0) {
 						picture.hdr_content = atoi(name.c_str() + 16) != 0;
+						continue;
+					}
+					if (name.rfind("cmd-ipd-state ", 0) == 0) {
+						int tenths = 0, manual = 0;
+						if (sscanf(name.c_str() + 14, "%d %d", &tenths, &manual) == 2 && !dragging_ipd) {
+							ipd_state_tenths = tenths;
+							ipd_manual = manual != 0;
+						}
 						continue;
 					}
 					// "cmd-status key=value ..." and "cmd-display key=value ...": the second page's cards.
@@ -1901,6 +1940,30 @@ main(int argc, char **argv)
 		}
 
 		const double t = now_s();
+		// The IPD notice: drawn as the distance changes (at most 20 times a second), faded out after the last change.
+		if (ipd_changed && have_pieces && ipd_handle != vr::k_ulOverlayHandleInvalid && t - ipd_drawn_at >= 0.05) {
+			ipd_changed = false;
+			ipd_drawn_at = t;
+			Image img = render_ipd_panel(pieces, ipd_tenths);
+			if (set_overlay_image(overlay, ipd_handle, img, raw_ok)) {
+				if (ipd_shown_at < 0.0) {
+					overlay->SetOverlayAlpha(ipd_handle, 0.0f);
+					overlay->ShowOverlay(ipd_handle);
+					ipd_shown_at = t;
+					fprintf(stderr, "riftlinux-notices: showing the IPD (%d.%d mm)\n", ipd_tenths / 10, ipd_tenths % 10);
+				}
+				ipd_last_at = t;
+			}
+		}
+		if (ipd_shown_at >= 0.0) {
+			const double left = kIpdShowS - (t - ipd_last_at);
+			if (left <= 0.0) {
+				overlay->HideOverlay(ipd_handle);
+				ipd_shown_at = -1.0;
+			} else {
+				overlay->SetOverlayAlpha(ipd_handle, static_cast<float>(std::min(1.0, std::min(t - ipd_shown_at, left) / kFadeS)));
+			}
+		}
 		shortcut_entries.check(t, false);
 		shortcut_launch.leave(shortcut_entries.taken());
 		shortcut_launch.tick(t);
@@ -2004,6 +2067,13 @@ main(int argc, char **argv)
 							fprintf(stderr, "riftlinux-notices: height reset\n");
 						}
 						break;
+					case Ctl::Ipd:
+						if (small) {
+							ipd_manual = false;
+							tell_driver("ipd auto");
+							fprintf(stderr, "riftlinux-notices: IPD follows the headset's slider\n");
+						}
+						break;
 					case Ctl::AutoHdr:
 						picture.on = !picture.on;
 						tell_driver(picture.on ? "autohdr 1" : "autohdr 0");
@@ -2069,6 +2139,8 @@ main(int argc, char **argv)
 					case Ctl::PfSmooth:
 					case Ctl::PfGpu:
 					case Ctl::PfDropped:
+					// The runtime's own panel's only (hidden here).
+					case Ctl::SwitchApp:
 					case Ctl::CloseApp: break;
 					}
 				};
@@ -2096,6 +2168,7 @@ main(int argc, char **argv)
 					}
 					dragging = false;
 					dragging_height = false;
+					dragging_ipd = false;
 					if (dragging_strength) {
 						dragging_strength = false;
 						strength_sent_at = -1.0;
@@ -2145,6 +2218,10 @@ main(int argc, char **argv)
 						dragging_height = true;
 						drag_height_cm = height_cm;
 						break;
+					case Ctl::Ipd:
+						dragging_ipd = ipd_state_tenths > 0;
+						drag_ipd_tenths = ipd_state_tenths;
+						break;
 					case Ctl::Strength: dragging_strength = true; break;
 					case Ctl::Colour: dragging_colour = true; break;
 					case Ctl::RenderScale: dragging_scale = true; break;
@@ -2167,6 +2244,9 @@ main(int argc, char **argv)
 					}
 					if (dragging_colour) {
 						picture.colour = percent;
+					}
+					if (dragging_ipd) {
+						drag_ipd_tenths = ipd_tenths_at(*f);
 					}
 					if (dragging_height) {
 						drag_height_cm = std::clamp(
@@ -2195,6 +2275,16 @@ main(int argc, char **argv)
 					if (dragging_colour) {
 						dragging_colour = false;
 						colour_sent_at = -1.0;
+					}
+					if (dragging_ipd) {
+						dragging_ipd = false;
+						if (drag_ipd_tenths != ipd_state_tenths || !ipd_manual) {
+							ipd_state_tenths = drag_ipd_tenths;
+							ipd_manual = true;
+							tell_driver(("ipd " + std::to_string(ipd_state_tenths)).c_str());
+						}
+						fprintf(stderr, "riftlinux-notices: IPD set by hand to %d.%d mm\n", ipd_state_tenths / 10,
+						        ipd_state_tenths % 10);
 					}
 					if (dragging_height) {
 						height_sent_at = -1.0; // Sent below, now.
@@ -2242,6 +2332,13 @@ main(int argc, char **argv)
 				colour_sent = picture.colour;
 				colour_sent_at = t;
 			}
+			// While the IPD slider is held, at most 10 changes a second to the driver.
+			if (dragging_ipd && (drag_ipd_tenths != ipd_state_tenths || !ipd_manual) && t - ipd_sent_at >= 0.1) {
+				ipd_state_tenths = drag_ipd_tenths;
+				ipd_manual = true;
+				tell_driver(("ipd " + std::to_string(ipd_state_tenths)).c_str());
+				ipd_sent_at = t;
+			}
 			// While the height slider is held, at most 10 changes a second to the driver.
 			if (dragging_height && drag_height_cm != height_cm && t - height_sent_at >= 0.1) {
 				height_cm = drag_height_cm;
@@ -2268,6 +2365,8 @@ main(int argc, char **argv)
 			now.mic = pulse.mic_known ? pulse.mic_percent : -1;
 			now.mic_muted = pulse.mic_muted;
 			now.height_cm = height_cm;
+			now.ipd_tenths = dragging_ipd ? drag_ipd_tenths : ipd_state_tenths;
+			now.ipd_manual = ipd_manual;
 			now.floor_lit = t < floor_lit_until;
 			now.picture = picture;
 			now.info = info;

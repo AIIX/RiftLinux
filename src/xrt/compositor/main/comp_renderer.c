@@ -13,12 +13,14 @@
  */
 
 #include "render/render_interface.h"
+#include "render/render_output_settings.h"
 #include "xrt/xrt_defines.h"
 #include "xrt/xrt_frame.h"
 #include "xrt/xrt_compositor.h"
 #include "xrt/xrt_results.h"
 
 #include "os/os_time.h"
+#include "os/os_threading.h"
 
 #include "math/m_api.h"
 #include "math/m_matrix_2x2.h"
@@ -26,6 +28,7 @@
 
 #include "util/u_misc.h"
 #include "util/u_notice.h"
+#include "util/u_screenshot.h"
 #include "util/u_trace_marker.h"
 #include "util/u_distortion_mesh.h"
 #include "util/u_sink.h"
@@ -144,6 +147,16 @@ struct comp_renderer
 	bool black;
 	bool black_shown;
 
+	/*!
+	 * RiftLinux: the memory screenshots read the views back into (u_screenshot.h), made on the asking thread by
+	 * @ref renderer_screenshot_prepare and kept; the lock covers it against the compositor's copy.
+	 */
+	struct
+	{
+		struct os_mutex lock;
+		struct render_buffer buffers[2];
+	} shot;
+
 	//! @}
 
 	//! @name Image-dependent members
@@ -204,6 +217,155 @@ renderer_wait_queue_idle(struct comp_renderer *r)
 	vk_queue_lock(vk->main_queue);
 	vk->vkQueueWaitIdle(vk->main_queue->queue);
 	vk_queue_unlock(vk->main_queue);
+}
+
+//! The size of view @p i's read-back for a screenshot, 0 until the compositor has drawn into its views.
+static VkDeviceSize
+screenshot_view_bytes(const struct comp_renderer *r, uint32_t i, bool *out_half)
+{
+	const struct comp_scratch_single_images *cssi = &r->c->scratch.views[i].cssi;
+	*out_half = cssi->info.format == VK_FORMAT_R16G16B16A16_SFLOAT;
+	return (VkDeviceSize)cssi->info.width * cssi->info.height * (*out_half ? 8 : 4);
+}
+
+/*!
+ * On the screenshot's asking thread (u_screenshot_provider): the read-back memory for both views, made once and
+ * mapped, CPU-cached where the GPU offers it (reading back from uncached memory is slow). Making it here kept the
+ * compositor's frame from waiting for it: a frame was shown up to 0.3 s late when the copy made and read its own.
+ */
+static bool
+renderer_screenshot_prepare(void *ctx)
+{
+	struct comp_renderer *r = ctx;
+	struct vk_bundle *vk = &r->c->base.vk;
+	bool ok = true;
+	bool made = false;
+	const int64_t start_ns = os_monotonic_get_ns();
+	os_mutex_lock(&r->shot.lock);
+	for (uint32_t i = 0; i < 2 && ok; i++) {
+		bool half;
+		const VkDeviceSize size = screenshot_view_bytes(r, i, &half);
+		struct render_buffer *b = &r->shot.buffers[i];
+		if (size == 0) {
+			ok = false;
+			break;
+		}
+		if (b->buffer != VK_NULL_HANDLE && b->size == size) {
+			continue;
+		}
+		if (b->buffer != VK_NULL_HANDLE) {
+			render_buffer_unmap(vk, b);
+			render_buffer_fini(vk, b);
+		}
+		VkResult ret = render_buffer_init(vk, b, VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+		                                  VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
+		                                      VK_MEMORY_PROPERTY_HOST_COHERENT_BIT |
+		                                      VK_MEMORY_PROPERTY_HOST_CACHED_BIT,
+		                                  size);
+		if (ret != VK_SUCCESS) {
+			ret = render_buffer_init(vk, b, VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+			                         VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+			                         size);
+		}
+		if (ret == VK_SUCCESS) {
+			ret = render_buffer_map(vk, b);
+		}
+		made = true;
+		if (ret != VK_SUCCESS) {
+			render_buffer_fini(vk, b);
+			memset(b, 0, sizeof(*b));
+			ok = false;
+		}
+	}
+	os_mutex_unlock(&r->shot.lock);
+	if (made && ok) {
+		COMP_INFO(r->c, "Screenshot: read-back memory made in %.1f ms", (double)(os_monotonic_get_ns() - start_ns) / 1e6);
+	}
+	return ok;
+}
+
+/*!
+ * A screenshot waits for this frame (u_screenshot.h): the views the layers were drawn into, before the lens pass, as
+ * the frame left them (the queue is idle), copied into the read-back memory made for it; black while the headset shows
+ * black. The compositor only records and waits for the GPU's copy; reading and writing happen on the asking thread.
+ */
+static void
+renderer_screenshot(struct comp_renderer *r, const struct chl_frame_state *frame_state, uint32_t view_count)
+{
+	struct comp_compositor *c = r->c;
+	struct vk_bundle *vk = &c->base.vk;
+	struct u_screenshot_view views[2] = {0};
+	const uint32_t count = view_count < 2 ? view_count : 2;
+	struct render_output_settings settings;
+	render_output_settings_get(&settings);
+	const int64_t start_ns = os_monotonic_get_ns();
+
+	os_mutex_lock(&r->shot.lock);
+	VkResult ret = VK_SUCCESS;
+	for (uint32_t i = 0; i < count; i++) {
+		const struct comp_scratch_single_images *cssi = &c->scratch.views[i].cssi;
+		bool half;
+		const VkDeviceSize size = screenshot_view_bytes(r, i, &half);
+		views[i].width = cssi->info.width;
+		views[i].height = cssi->info.height;
+		views[i].format = half ? U_SCREENSHOT_RGBA16F : U_SCREENSHOT_RGBA8_SRGB;
+		views[i].fov = c->xdev->hmd->distortion.fov[i];
+		views[i].pixels = r->black ? NULL : r->shot.buffers[i].mapped;
+		if (r->shot.buffers[i].buffer == VK_NULL_HANDLE || r->shot.buffers[i].size != size) {
+			ret = VK_ERROR_OUT_OF_HOST_MEMORY; // Not made for these views (they changed since).
+		}
+	}
+
+	if (ret == VK_SUCCESS && !r->black) {
+		const VkImageSubresourceRange range = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+		struct vk_cmd_pool *pool = &c->nr.distortion_pool;
+		VkCommandBuffer cmd = VK_NULL_HANDLE;
+		vk_cmd_pool_lock(pool);
+		ret = vk_cmd_pool_create_and_begin_cmd_buffer_locked(vk, pool, 0, &cmd);
+		for (uint32_t i = 0; i < count && ret == VK_SUCCESS; i++) {
+			const struct comp_scratch_single_images *cssi = &c->scratch.views[i].cssi;
+			const VkImage image = cssi->images[frame_state->scratch_state.views[i].index].image;
+			vk_cmd_image_barrier_gpu_locked(vk, cmd, image, VK_ACCESS_SHADER_READ_BIT,
+			                                VK_ACCESS_TRANSFER_READ_BIT, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+			                                VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, range);
+			const VkBufferImageCopy region = {
+			    .imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1},
+			    .imageExtent = {views[i].width, views[i].height, 1},
+			};
+			vk->vkCmdCopyImageToBuffer(cmd, image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+			                           r->shot.buffers[i].buffer, 1, &region);
+			vk_cmd_image_barrier_gpu_locked(vk, cmd, image, VK_ACCESS_TRANSFER_READ_BIT,
+			                                VK_ACCESS_SHADER_READ_BIT, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+			                                VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, range);
+		}
+		if (cmd != VK_NULL_HANDLE) {
+			const VkResult end = vk->vkEndCommandBuffer(cmd);
+			if (ret == VK_SUCCESS) {
+				ret = end;
+			}
+			if (ret == VK_SUCCESS) {
+				ret = vk_cmd_pool_submit_cmd_buffer_locked(vk, pool, cmd);
+			}
+		}
+		vk_cmd_pool_unlock(pool);
+		if (cmd != VK_NULL_HANDLE) {
+			// The copy done before the command buffer goes and the memory is read.
+			renderer_wait_queue_idle(r);
+			vk_cmd_pool_lock(pool);
+			vk->vkFreeCommandBuffers(vk->device, pool->pool, 1, &cmd);
+			vk_cmd_pool_unlock(pool);
+		}
+	}
+	os_mutex_unlock(&r->shot.lock);
+	COMP_INFO(c, "Screenshot: views copied in %.1f ms%s", (double)(os_monotonic_get_ns() - start_ns) / 1e6,
+	          r->black ? " (black)" : "");
+
+	if (ret != VK_SUCCESS) {
+		COMP_ERROR(c, "Screenshot: copying the views failed (%s)", vk_result_string(ret));
+		u_screenshot_deliver(views, 0, 0.0f);
+		return;
+	}
+	u_screenshot_deliver(views, count, settings.tonemap_shoulder);
 }
 
 static void
@@ -655,6 +817,11 @@ renderer_init(struct comp_renderer *r, struct comp_compositor *c, VkExtent2D scr
 	r->c = c;
 	r->settings = &c->settings;
 
+	// RiftLinux: screenshots (u_screenshot.h).
+	os_mutex_init(&r->shot.lock);
+	const struct u_screenshot_provider provider = {.prepare = renderer_screenshot_prepare, .ctx = r};
+	u_screenshot_set_provider(&provider);
+
 	r->acquired_buffer = -1;
 	r->fenced_buffer = -1;
 	r->rtr_array = NULL;
@@ -1007,6 +1174,16 @@ renderer_fini(struct comp_renderer *r)
 {
 	struct vk_bundle *vk = &r->c->base.vk;
 
+	// RiftLinux: no more screenshots (waits for one being taken), then their memory.
+	u_screenshot_set_provider(NULL);
+	for (uint32_t i = 0; i < 2; i++) {
+		if (r->shot.buffers[i].buffer != VK_NULL_HANDLE) {
+			render_buffer_unmap(vk, &r->shot.buffers[i]);
+			render_buffer_fini(vk, &r->shot.buffers[i]);
+		}
+	}
+	os_mutex_destroy(&r->shot.lock);
+
 	// Command buffers
 	renderer_close_renderings_and_fences(r);
 
@@ -1218,7 +1395,9 @@ comp_renderer_draw(struct comp_renderer *r)
 
 	// Pure black while the headset's driver asks for it: no layers, so no lens or panel processing either.
 	r->black = u_notice_display_black_requested();
-	bool fast_path = !r->black && c->base.frame_params.one_projection_layer_fast_path;
+	// A screenshot takes the views the layers are drawn into, which the fast path leaves out.
+	const bool screenshot = u_screenshot_wanted();
+	bool fast_path = !r->black && !screenshot && c->base.frame_params.one_projection_layer_fast_path;
 	bool do_timewarp = !c->debug.atw_off;
 
 	// Consistency check.
@@ -1334,6 +1513,10 @@ comp_renderer_draw(struct comp_renderer *r)
 	 * This is done after a swap so isn't time critical.
 	 */
 	renderer_wait_queue_idle(r);
+
+	if (screenshot) {
+		renderer_screenshot(r, &frame_state, view_count);
+	}
 
 	/*
 	 * Free any resources and finalize the scratch images,

@@ -16,6 +16,9 @@
 #include "util/u_pretty_print.h"
 #include "util/u_visibility_mask.h"
 #include "util/u_trace_marker.h"
+#include "util/u_screenshot.h"
+#include "util/u_notice.h"
+#include "util/u_time.h"
 
 #include "server/ipc_server.h"
 #include "server/ipc_server_objects.h"
@@ -27,6 +30,7 @@
 
 #ifdef XRT_GRAPHICS_SYNC_HANDLE_IS_FD
 #include <unistd.h>
+#include <string.h>
 #endif
 
 
@@ -1570,6 +1574,75 @@ ipc_handle_system_set_primary_client(volatile struct ipc_client_state *_ics, uin
 	IPC_INFO(s, "System setting active client to %d.", client_id);
 
 	return ipc_server_set_active_client(s, client_id);
+}
+
+xrt_result_t
+ipc_handle_system_take_screenshot(volatile struct ipc_client_state *ics, const struct ipc_screenshot_request *request)
+{
+	char path[sizeof(request->path)];
+	memcpy(path, request->path, sizeof(path));
+	path[sizeof(path) - 1] = '\0';
+	if (request->flags != 0 || path[0] != '/') {
+		return XRT_ERROR_INVALID_ARGUMENT;
+	}
+	IPC_INFO(ics->server, "Screenshot to %s", path);
+
+	// The compositor's next frame, copied and written; blocks only this client's thread.
+	return u_screenshot_take(path, (uint64_t)3 * U_TIME_1S_IN_NS);
+}
+
+/*
+ * RiftLinux: a controller's manual calibration is gone (a turned or biased motion sensor is learned while the
+ * controller is used, see the constellation tracker's IMU alignment). The calls stay for libmonado's callers and
+ * answer that there is none.
+ */
+xrt_result_t
+ipc_handle_system_calibrate_controller(volatile struct ipc_client_state *ics, uint32_t hand, bool start)
+{
+	(void)ics;
+	(void)start;
+	return hand > 2 ? XRT_ERROR_INVALID_ARGUMENT : XRT_ERROR_NOT_IMPLEMENTED;
+}
+
+xrt_result_t
+ipc_handle_system_forget_controller_calibration(volatile struct ipc_client_state *ics, uint32_t hand)
+{
+	(void)ics;
+	return hand > 1 ? XRT_ERROR_INVALID_ARGUMENT : XRT_ERROR_NOT_IMPLEMENTED;
+}
+
+xrt_result_t
+ipc_handle_system_set_controller_calibration_quiet(volatile struct ipc_client_state *ics, bool quiet)
+{
+	(void)ics;
+	(void)quiet;
+	return XRT_SUCCESS;
+}
+
+xrt_result_t
+ipc_handle_system_get_controller_calibration(volatile struct ipc_client_state *ics,
+                                             uint32_t hand,
+                                             struct ipc_controller_calibration *out_status)
+{
+	(void)ics;
+	if (hand > 1) {
+		return XRT_ERROR_INVALID_ARGUMENT;
+	}
+	*out_status = (struct ipc_controller_calibration){.orientation_now = -1, .next_orientation = -1};
+	return XRT_ERROR_NOT_IMPLEMENTED;
+}
+
+xrt_result_t
+ipc_handle_system_set_lens_pattern(volatile struct ipc_client_state *ics, bool on)
+{
+	int32_t centres[2][2];
+	if (on && !u_notice_get_lens_centres(centres)) {
+		return XRT_ERROR_NOT_IMPLEMENTED;
+	}
+	// Goes off when this client goes (ipc_server_per_client_thread.c).
+	u_notice_set_lens_pattern(on, (int64_t)ics->client_state.id);
+	IPC_INFO(ics->server, "Lens pattern %s (client %u)", on ? "on" : "off", ics->client_state.id);
+	return XRT_SUCCESS;
 }
 
 xrt_result_t

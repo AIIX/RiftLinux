@@ -46,9 +46,12 @@ static void
 rift_sensor_destroy(struct rift_sensor *sensor)
 {
 	if (sensor->hid_dev) {
+		// The device's own reference (taken when the sensor was made) is released after the handle: its pointer read
+		// first, as closing frees the handle.
+		libusb_device *device = libusb_get_device(sensor->hid_dev);
 		libusb_close(sensor->hid_dev);
-
-		libusb_unref_device(libusb_get_device(sensor->hid_dev));
+		libusb_unref_device(device);
+		sensor->hid_dev = NULL;
 	}
 
 	// @note uvc_fs_destroy is called by the xrt_frame_node destroy callback, so we don't need to call it here
@@ -62,6 +65,17 @@ rift_sensor_context_destroy(struct rift_sensor_context *context)
 	}
 
 	u_var_remove_root(context);
+
+	/*
+	 * This node is destroyed before the sensors' video streams (added after them, the frame context destroys the newest
+	 * first), and all of them were stopped before (break apart): the streams' USB transfers are freed here, while the
+	 * handles and the USB context they belong to are still open, not after libusb_exit.
+	 */
+	for (uint32_t i = 0; i < context->sensor_count; i++) {
+		if (context->sensors[i].frame_server != NULL) {
+			uvc_fs_release_usb(context->sensors[i].frame_server);
+		}
+	}
 
 	for (uint32_t i = 0; i < context->sensor_count; i++) {
 		rift_sensor_destroy(&context->sensors[i]);

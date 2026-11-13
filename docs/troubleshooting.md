@@ -35,6 +35,27 @@ After a crash SteamVR blocks the driver that was loaded (its safe mode). Close S
 `riftlinux-setup repair`, or in SteamVR: *Settings*, *Startup / Shutdown*, *Manage Add-ons*, switch **monado** on.
 (The driver's name in SteamVR is *monado*.) Logging in again or plugging the headset in also lifts the block.
 
+**SteamVR Home never appears and games don't start, after a Steam client update.**
+The headset works, but SteamVR keeps starting Home again, several times a second. Steam's newer layout
+(`~/.steam/bin` leading to `steamrt32`) leaves out the runtime SteamVR Home's launcher needs,
+`~/.steam/bin/steam-runtime`. RiftLinux links it back by itself when SteamVR starts, at each login and when the headset
+is plugged in;
+`riftlinux-setup check` shows it on its "Steam's runtime for SteamVR Home" line, and `riftlinux-setup repair` fixes it
+at once. If check says no real runtime is installed, install "Steam Linux Runtime 1.0 (scout)" from Steam's Library
+(Tools), then run `riftlinux-setup repair`.
+
+**SteamVR blocks the driver after every start, and lsfg-vk is installed.**
+lsfg-vk (Lossless Scaling's frame generation for Linux) loads itself into every Vulkan program, and it crashed
+SteamVR's server as RiftLinux's display started. SteamVR then blocks the driver. RiftLinux keeps it out of SteamVR's
+server and its own runtime (your games still get it), and `riftlinux-setup check` shows that on its lsfg-vk line. Run
+`riftlinux-setup repair` once to lift the block. If you turned it back on with `riftlinux-setup lsfg-vk on`, turn it
+off again.
+
+**The headset is not found after using another Rift driver (OpenHMD and the like).**
+RiftLinux talks to the headset through its HID interfaces. A program that takes them from the kernel and doesn't give
+them back leaves them without a driver. `riftlinux-setup check` names them on its "Headset's HID interfaces" line, and
+`riftlinux-setup repair` gives them back. Unplugging the headset's USB cable and plugging it back in does the same.
+
 **A notice says "Real-time priority refused".**
 Steam was started from a remote (SSH) login, where Linux does not give real-time priority. Start Steam from your
 desktop. **"RealtimeKit is not installed"**: install your distribution's `rtkit` package.
@@ -126,6 +147,12 @@ picture comes back after that; `riftlinux-setup wear-sensor motion high` makes i
 sensor reads with `riftlinux-setup wear-sensor test`, then set its levels to fit, or turn it off:
 [Settings](settings.md#the-wear-sensor-face-shields-pads-and-glasses).
 
+**The IPD always shows 57.5 mm, wherever the IPD slider is.**
+The headset's slider sensor doesn't report: the lenses move, but the number doesn't (the Oculus software on Windows
+shows the same). `riftlinux-setup ipd test` shows what it reads while you move it. Measure your IPD and set it by hand
+in the Rift tab's IPD row or with `riftlinux-setup ipd <mm>`, see
+[Settings](settings.md#ipd-the-distance-between-your-eyes).
+
 **On Wayland with NVIDIA, the lower part of the picture tears and lags when you turn your head.**
 NVIDIA's driver can show the headset without vsync when a monitor offers adaptive sync (VRR, FreeSync, G-Sync
 Compatible): NVIDIA's bug, [open-gpu-kernel-modules #992](https://github.com/NVIDIA/open-gpu-kernel-modules/issues/992). Hide VRR from it: `riftlinux-setup nvidia-vrr conceal` and
@@ -158,6 +185,16 @@ Press a button on it to wake it, and check its battery (the Rift tab's *Display 
 the sensors are being measured, controllers are hidden until it is done. A new controller has to be paired once:
 [Touch controllers and pairing](controllers.md).
 
+**One controller freezes or jumps in full view of the sensors, every session.**
+Its motion sensor probably disagrees with its LEDs on which way is down. RiftLinux learns and corrects that while you
+play (`riftlinux-setup controller-alignment status` shows it once it's in use). See
+[A controller that freezes or jumps](settings.md#a-controller-that-freezes-or-jumps-in-view).
+
+**A controller moves back and forth a little when you're far from the sensors.**
+At 3 m and more, the sensors often see only three or four of a controller's LEDs, and a position from so few LEDs moves
+a little from one frame to the next. Make sure nothing stands between the sensors and where you play: in testing, a
+laptop screen in front of one sensor made it clearly worse. If you can, play a little closer to the sensors.
+
 **Sensors behind me do not track the headset.** The headband's rear LEDs are measured on your headset the first time
 the front of it is tracked while you turn; turn slowly a full circle once, facing the front sensors part of the time.
 If you changed the strap a lot, the measurement is checked again by itself.
@@ -181,6 +218,13 @@ holds the headset*: close SteamVR first.
 
 **The runtime keeps running after the application.** `riftlinux-runtime --stop`, or right-click **RiftLinux
 Runtime** in the app menu, **Stop RiftLinux Runtime**.
+
+**Memory use keeps growing with NVIDIA's 615 driver.**
+NVIDIA's 615 driver keeps a little memory each time a program sends work to the graphics card, and never gives it
+back ([NVIDIA's forum](https://forums.developer.nvidia.com/t/615-78-08-glfencesync-leaks-host-memory-never-freed/385726)).
+Every OpenGL and Vulkan program is affected, and you notice it in programs that run for hours, like a VR desktop or
+your desktop's own compositor. Until NVIDIA fixes it, the workaround from that thread is to set `__GL_4718a5=0` in the
+environment of those programs. It's an undocumented driver setting that NVIDIA hasn't confirmed.
 
 ## Logs and reporting a problem
 

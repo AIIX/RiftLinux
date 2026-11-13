@@ -27,6 +27,8 @@
 #include "rift_usb.h"
 
 #include <errno.h>
+#include <sys/stat.h>
+#include <time.h>
 
 
 static void
@@ -50,36 +52,16 @@ rift_update_input(struct xrt_device *device, size_t index, union xrt_input_value
 #define RIFT_TOUCH_POSITION_HOLD_NS (150 * U_TIME_1MS_IN_NS)
 
 /*!
- * What the app gets carried on by the sensor fusion for this long, the prior only for RIFT_TOUCH_POSITION_HOLD_NS: past
- * 150 ms, while the fusion's speed and distance from the last solve stay plausible (RIFT_TOUCH_DEAD_RECKON_MAX_*).
- * Against what Oculus tracked, 150-250 ms after the last solve the fusion was half as far off as the held position
- * (left Touch 15 / 25 mm against 31 / 59 mm, day / night), and the switch to holding jumped the controller back to
- * where it was solved: the maintainer saw it stop in space and catch up.
+ * The orientation from the controller's own IMU is carried on from its newest sample for no longer than this, then held.
+ * With no limit, a controller whose reports stopped (its battery empty, out of the radio's reach) kept turning at its
+ * last speed for as long as it was gone, in SteamVR and in the own runtime alike: seen spinning. Reports come every couple
+ * of milliseconds, so what a frame predicts ahead while they come stays as it was.
  */
-#define RIFT_TOUCH_APP_DEAD_RECKON_NS (300 * U_TIME_1MS_IN_NS)
-#define RIFT_TOUCH_DEAD_RECKON_MAX_SPEED_M_S 3.0f
-#define RIFT_TOUCH_DEAD_RECKON_MAX_DISTANCE_M 0.3f
+#define RIFT_TOUCH_IMU_PREDICT_MAX_NS (100 * U_TIME_1MS_IN_NS)
 
-/*!
- * Found again after a hold, the app gets the sensor fusion's pose once it is this close to the solve that found it.
- */
-#define RIFT_TOUCH_APP_HOLD_MAX_OFFSET_M 0.15f
-
-/*!
- * How far from its last solve the app may see a controller: as far as a hand gets, this plus this speed times the
- * time since the solve. Right after a solve the fusion carried controllers 0.3-1.5 m off within 150 ms (velocities of
- * up to 10 m/s from poor solves), unchecked until then, and the app showed them there until the hold put them back:
- * the controllers jumped. Replayed on two sessions, the jumps over 150 mm went from 30 to 2.
- */
-#define RIFT_TOUCH_APP_REACH_M 0.10f
-#define RIFT_TOUCH_APP_REACH_SPEED_M_S 3.0f
-
-/*!
- * A hold starts where the app last saw the controller rather than at its last solve, so it stops without jumping back,
- * unless the two are further apart than a hand gets by the end of RIFT_TOUCH_POSITION_HOLD_NS.
- */
-#define RIFT_TOUCH_APP_HOLD_FROM_SHOWN_M 0.55f
-
+//! How long past its last solve the app sees a controller carried on, ms (settings: controllers.coast_ms); default as
+//! t_touch_app_pose_params_default says, 300 was RiftLinux's before.
+DEBUG_GET_ONCE_NUM_OPTION(rift_touch_coast_ms, "RIFT_TOUCH_COAST_MS", 1000)
 /*!
  * For this long after its last solve, a lost controller's held pose is the constellation tracker's prior: where it was
  * last seen, turned as its IMU has turned it since, see
@@ -87,9 +69,6 @@ rift_update_input(struct xrt_device *device, size_t index, union xrt_input_value
  * (CONSTELLATION_TRACKER_HELD_PRIOR_MS).
  */
 #define RIFT_TOUCH_HELD_PRIOR_NS (5LL * U_TIME_1S_IN_NS)
-
-//! A controller found again slides from where it was held to where it is over this long, rather than jumping.
-#define RIFT_TOUCH_REACQUIRE_BLEND_NS (100 * U_TIME_1MS_IN_NS)
 
 //! How far from a requested time an IMU orientation from the history may be and still stand for it.
 #define RIFT_TOUCH_IMU_HISTORY_MAX_GAP_NS (50 * U_TIME_1MS_IN_NS)
@@ -114,7 +93,7 @@ touch_get_fused_relation(struct rift_touch_controller *controller,
 
 	const int64_t last_solve_ns = xrt_atomic_s64_load(&controller->last_solve_ns);
 	const int64_t age_ns = at_ns - last_solve_ns;
-	if (last_solve_ns == 0 || age_ns > (for_prior ? RIFT_TOUCH_POSITION_HOLD_NS : RIFT_TOUCH_APP_DEAD_RECKON_NS)) {
+	if (last_solve_ns == 0 || (for_prior && age_ns > RIFT_TOUCH_POSITION_HOLD_NS)) {
 		return false;
 	}
 
@@ -135,31 +114,14 @@ touch_get_fused_relation(struct rift_touch_controller *controller,
 		return false;
 	}
 
-	// Never further from the last solve than a hand gets (the app's pose only; the prior is the tracker's own).
+	// How long and how far the app sees it carried on (the prior is the tracker's own).
 	if (!for_prior) {
 		os_mutex_lock(&controller->pose_hold.mutex);
-		const bool have_solved = controller->pose_hold.have;
-		const struct xrt_vec3 last_solved = controller->pose_hold.position;
+		const bool carried = t_touch_app_pose_carried(&controller->pose_hold.app, &controller->pose_hold.app_params,
+		                                              last_solve_ns, at_ns, &relation, controller->pose_hold.have,
+		                                              &controller->pose_hold.position);
 		os_mutex_unlock(&controller->pose_hold.mutex);
-		const float reach_m =
-		    RIFT_TOUCH_APP_REACH_M + RIFT_TOUCH_APP_REACH_SPEED_M_S * (float)age_ns / (float)U_TIME_1S_IN_NS;
-		if (have_solved && m_vec3_len(m_vec3_sub(relation.pose.position, last_solved)) > reach_m) {
-			return false;
-		}
-	}
-
-	// Carried on past RIFT_TOUCH_POSITION_HOLD_NS only while it looks like a hand moving, not a fusion running off.
-	if (age_ns > RIFT_TOUCH_POSITION_HOLD_NS) {
-		if ((relation.relation_flags & XRT_SPACE_RELATION_LINEAR_VELOCITY_VALID_BIT) != 0 &&
-		    m_vec3_len(relation.linear_velocity) > RIFT_TOUCH_DEAD_RECKON_MAX_SPEED_M_S) {
-			return false;
-		}
-		os_mutex_lock(&controller->pose_hold.mutex);
-		const bool have_hold = controller->pose_hold.have;
-		const struct xrt_vec3 solved = controller->pose_hold.position;
-		os_mutex_unlock(&controller->pose_hold.mutex);
-		if (have_hold &&
-		    m_vec3_len(m_vec3_sub(relation.pose.position, solved)) > RIFT_TOUCH_DEAD_RECKON_MAX_DISTANCE_M) {
+		if (!carried) {
 			return false;
 		}
 	}
@@ -205,7 +167,7 @@ touch_update_hold_locked(struct rift_touch_controller *controller,
  * The pose for apps. Tracked by the cameras, it is the sensor fusion's. Then lost, the position is held where it was
  * last tracked and the orientation follows the controller's own IMU fusion, turned into the tracker's world as the
  * sensor fusion last had it, so the controller keeps turning in place rather than drifting or freezing. Found again,
- * it slides back from where it was held over RIFT_TOUCH_REACQUIRE_BLEND_NS: snapped back at once, it jerked.
+ * it slides back from where it was held (t_touch_app_pose): snapped back at once, it jerked.
  * Never tracked by the cameras, it is a 3dof controller.
  */
 //! Once a second per controller, which pose the app got and from where: in recordings the Touch was off to one side.
@@ -248,46 +210,25 @@ touch_get_app_relation(struct rift_touch_controller *controller, int64_t at_ns, 
 	struct xrt_quat imu_orientation = XRT_QUAT_IDENTITY;
 	struct xrt_vec3 imu_angular_velocity = XRT_VEC3_ZERO;
 	os_mutex_lock(&controller->input.mutex);
-	const bool have_imu = imu_fusion_get_prediction(controller->input.imu_fusion, (uint64_t)at_ns, &imu_orientation,
+	const int64_t newest_imu_ns = controller->input.last_imu_sample.timestamp_ns;
+	const bool imu_held = newest_imu_ns != 0 && at_ns - newest_imu_ns > RIFT_TOUCH_IMU_PREDICT_MAX_NS;
+	const int64_t predict_ns = imu_held ? newest_imu_ns + RIFT_TOUCH_IMU_PREDICT_MAX_NS : at_ns;
+	const bool have_imu = imu_fusion_get_prediction(controller->input.imu_fusion, (uint64_t)predict_ns, &imu_orientation,
 	                                                &imu_angular_velocity) == 0;
 	os_mutex_unlock(&controller->input.mutex);
+	if (imu_held) {
+		imu_angular_velocity = (struct xrt_vec3)XRT_VEC3_ZERO;
+	}
 
 	struct xrt_space_relation fused;
 	bool use_fused = touch_get_fused_relation(controller, at_ns, false, &fused);
 	if (use_fused) {
-		/*
-		 * Seen again after a hold, the sensor fusion had not taken in the new solve yet: still carried on from the
-		 * last one by the IMU, it stood 1.2 and 1.8 m from where the sensors saw the controller, and the app jumped
-		 * there for a moment and back. Held until the fusion agrees with the solve, then it slides in.
-		 */
 		os_mutex_lock(&controller->pose_hold.mutex);
-		if (controller->pose_hold.app_was_held && controller->pose_hold.have &&
-		    m_vec3_len(m_vec3_sub(fused.pose.position, controller->pose_hold.position)) >
-		        RIFT_TOUCH_APP_HOLD_MAX_OFFSET_M) {
-			use_fused = false;
-		}
+		use_fused = t_touch_app_pose_show(&controller->pose_hold.app, &controller->pose_hold.app_params, at_ns,
+		                                  controller->pose_hold.have, &controller->pose_hold.position, &fused);
 		os_mutex_unlock(&controller->pose_hold.mutex);
 	}
 	if (use_fused) {
-		os_mutex_lock(&controller->pose_hold.mutex);
-		if (controller->pose_hold.app_was_held) {
-			controller->pose_hold.app_was_held = false;
-			controller->pose_hold.blend_start_ns = at_ns;
-			controller->pose_hold.blend_from = controller->pose_hold.app_held_pose;
-		}
-
-		const int64_t blend_ns = at_ns - controller->pose_hold.blend_start_ns;
-		if (controller->pose_hold.blend_start_ns != 0 && blend_ns >= 0 &&
-		    blend_ns < RIFT_TOUCH_REACQUIRE_BLEND_NS) {
-			const float t = (float)blend_ns / (float)RIFT_TOUCH_REACQUIRE_BLEND_NS;
-			const struct xrt_pose from = controller->pose_hold.blend_from;
-			fused.pose.position = m_vec3_lerp(from.position, fused.pose.position, t);
-			math_quat_slerp(&from.orientation, &fused.pose.orientation, t, &fused.pose.orientation);
-		}
-		controller->pose_hold.have_app_tracked = true;
-		controller->pose_hold.app_tracked_position = fused.pose.position;
-		os_mutex_unlock(&controller->pose_hold.mutex);
-
 		*out_relation = fused;
 		touch_log_app_relation(controller, at_ns, "tracked", out_relation);
 		return;
@@ -300,22 +241,20 @@ touch_get_app_relation(struct rift_touch_controller *controller, int64_t at_ns, 
 	os_mutex_lock(&controller->pose_hold.mutex);
 	const bool have_hold = controller->pose_hold.have;
 	const struct xrt_quat imu_to_world = controller->pose_hold.imu_to_world;
-	if (have_hold && !controller->pose_hold.app_was_held) {
-		// The hold starts: where the app last saw it, unless that is too far from the last solve.
-		const struct xrt_vec3 solved = controller->pose_hold.position;
-		const struct xrt_vec3 shown = controller->pose_hold.app_tracked_position;
-		controller->pose_hold.app_hold_position =
-		    controller->pose_hold.have_app_tracked &&
-		            m_vec3_len(m_vec3_sub(shown, solved)) <= RIFT_TOUCH_APP_HOLD_FROM_SHOWN_M
-		        ? shown
-		        : solved;
+	struct xrt_vec3 hold_position = XRT_VEC3_ZERO;
+	if (have_hold) {
+		hold_position = t_touch_app_pose_hold_position(&controller->pose_hold.app, &controller->pose_hold.app_params,
+		                                               &controller->pose_hold.position);
 	}
-	const struct xrt_vec3 hold_position = controller->pose_hold.app_hold_position;
 	os_mutex_unlock(&controller->pose_hold.mutex);
 
 	out_relation->relation_flags = XRT_SPACE_RELATION_ORIENTATION_VALID_BIT |
 	                               XRT_SPACE_RELATION_ORIENTATION_TRACKED_BIT |
 	                               XRT_SPACE_RELATION_ANGULAR_VELOCITY_VALID_BIT;
+	// Gone from the radio (rift_radio_update_touch_haptics): held, and no longer tracked. Resting, it still reports.
+	if (controller->radio_data.silent) {
+		out_relation->relation_flags &= ~XRT_SPACE_RELATION_ORIENTATION_TRACKED_BIT;
+	}
 
 	if (have_hold) {
 		math_quat_rotate(&imu_to_world, &imu_orientation, &out_relation->pose.orientation);
@@ -323,8 +262,7 @@ touch_get_app_relation(struct rift_touch_controller *controller, int64_t at_ns, 
 		out_relation->relation_flags |= XRT_SPACE_RELATION_POSITION_VALID_BIT;
 
 		os_mutex_lock(&controller->pose_hold.mutex);
-		controller->pose_hold.app_was_held = true;
-		controller->pose_hold.app_held_pose = out_relation->pose;
+		t_touch_app_pose_held(&controller->pose_hold.app, &out_relation->pose);
 		os_mutex_unlock(&controller->pose_hold.mutex);
 	} else {
 		out_relation->pose.orientation = imu_orientation;
@@ -679,6 +617,113 @@ rift_touch_gyro_bias_changed(const struct rift_touch_controller *controller)
 {
 	const struct xrt_vec3 d = m_vec3_sub(controller->input.gyro_rest_bias.bias, controller->input.gyro_bias_saved);
 	return controller->input.gyro_rest_bias.have_bias && m_vec3_len(d) > RIFT_TOUCH_GYRO_BIAS_SAVE_CHANGE;
+}
+
+/*
+ * A controller's IMU alignment, learned by the tracker in the background (a turned IMU, a biased accelerometer: GitHub
+ * issue #5) and used for its gravity check once clearly a fault. Kept per serial as the Oculus runtime keeps its
+ * Ekf_<serial>, given back at the next start, where the tracker checks it against the solves again and drops it when
+ * it no longer fits. A controller that never needed one has no file; one whose kept alignment was dropped has it saved
+ * as unused (last field 0), and nothing is used at its next start. Same switch as the tracker's.
+ */
+DEBUG_GET_ONCE_BOOL_OPTION(rift_imu_align, "CONSTELLATION_TRACKER_IMU_ALIGN", true)
+#define RIFT_TOUCH_IMU_ALIGN_SAVE_RAD (0.5f * (float)M_PI / 180.0f)
+#define RIFT_TOUCH_IMU_ALIGN_SAVE_BIAS 0.05f
+#define RIFT_TOUCH_IMU_ALIGN_MAX_RAD (25.0f * (float)M_PI / 180.0f)
+#define RIFT_TOUCH_IMU_ALIGN_MAX_BIAS 2.5f
+
+static float
+rift_quat_angle_between(const struct xrt_quat *a, const struct xrt_quat *b)
+{
+	const float dot = fabsf(a->x * b->x + a->y * b->y + a->z * b->z + a->w * b->w);
+	return 2.0f * acosf(fminf(dot, 1.0f));
+}
+
+static void
+rift_touch_imu_align_poll(struct rift_hmd *hmd, struct rift_touch_controller *controller)
+{
+	if (!debug_get_bool_option_rift_imu_align() || !controller->radio_data.serial_valid) {
+		return;
+	}
+	const timepoint_ns now_ns = (timepoint_ns)os_monotonic_get_ns();
+	if (now_ns - controller->input.imu_align.polled_ns < U_TIME_1S_IN_NS) {
+		return;
+	}
+	controller->input.imu_align.polled_ns = now_ns;
+	os_mutex_lock(&controller->constellation_mutex);
+	const bool in_tracker = controller->use_constellation;
+	os_mutex_unlock(&controller->constellation_mutex);
+	if (!in_tracker) {
+		return;
+	}
+	char filename[XRT_DEVICE_NAME_LEN + 32];
+	snprintf(filename, sizeof(filename), "touch_%s_imu_align.txt", controller->base.serial);
+
+	if (!controller->input.imu_align.loaded) {
+		controller->input.imu_align.loaded = true;
+		FILE *f = u_file_open_file_in_config_dir_subpath(RIFT_TOUCH_GYRO_BIAS_DIR, filename, "r");
+		if (f != NULL) {
+			struct xrt_quat rot = XRT_QUAT_IDENTITY;
+			struct xrt_vec3 bias = XRT_VEC3_ZERO;
+			int used = 0;
+			const int n = fscanf(f, "%f %f %f %f %f %f %f %d", &rot.x, &rot.y, &rot.z, &rot.w, &bias.x, &bias.y,
+			                     &bias.z, &used);
+			fclose(f);
+			const float len = sqrtf(rot.x * rot.x + rot.y * rot.y + rot.z * rot.z + rot.w * rot.w);
+			const struct xrt_quat identity = XRT_QUAT_IDENTITY;
+			const bool sane = n == 8 && len > 0.99f && len < 1.01f &&
+			                  rift_quat_angle_between(&rot, &identity) <= RIFT_TOUCH_IMU_ALIGN_MAX_RAD &&
+			                  m_vec3_len(bias) <= RIFT_TOUCH_IMU_ALIGN_MAX_BIAS;
+			if (n == 8 && used == 0) {
+				// Kept as needing none.
+			} else if (!sane || used != 1) {
+				// As the Oculus runtime does with a stored state that does not read right: left out, learned again.
+				HMD_WARN(hmd, "Ignoring the IMU alignment saved for Touch controller %s, it does not read right.",
+				         controller->base.serial);
+			} else if (t_constellation_tracker_set_imu_align(controller->constellation_tracker,
+			                                                 controller->constellation_device_id, &rot, &bias) == 0) {
+				controller->input.imu_align.saved_used = true;
+				controller->input.imu_align.saved_rot = rot;
+				controller->input.imu_align.saved_bias = bias;
+				HMD_INFO(hmd, "Touch controller %s: IMU alignment from last session in use (turned %.1f degrees, "
+				         "bias %.3f m/s2), checked again against what the sensors see.",
+				         controller->base.serial, rift_quat_angle_between(&rot, &identity) * 180.0f / (float)M_PI,
+				         m_vec3_len(bias));
+			}
+		}
+	}
+
+	struct xrt_quat rot = XRT_QUAT_IDENTITY;
+	struct xrt_vec3 bias = XRT_VEC3_ZERO;
+	bool applied = false;
+	if (t_constellation_tracker_get_imu_align(controller->constellation_tracker, controller->constellation_device_id,
+	                                          &rot, &bias, &applied) != 0) {
+		return;
+	}
+	controller->input.imu_align.in_use = applied;
+	bool changed = applied != controller->input.imu_align.saved_used;
+	if (applied && !changed) {
+		changed = rift_quat_angle_between(&rot, &controller->input.imu_align.saved_rot) > RIFT_TOUCH_IMU_ALIGN_SAVE_RAD ||
+		          m_vec3_len(m_vec3_sub(bias, controller->input.imu_align.saved_bias)) > RIFT_TOUCH_IMU_ALIGN_SAVE_BIAS;
+	}
+	if (!changed) {
+		return;
+	}
+	FILE *f = u_file_open_file_in_config_dir_subpath(RIFT_TOUCH_GYRO_BIAS_DIR, filename, "w");
+	if (f == NULL) {
+		HMD_WARN(hmd, "Could not save the IMU alignment of Touch controller %s.", controller->base.serial);
+		return;
+	}
+	fprintf(f, "%.6f %.6f %.6f %.6f %.6f %.6f %.6f %d\n", rot.x, rot.y, rot.z, rot.w, bias.x, bias.y, bias.z,
+	        applied ? 1 : 0);
+	fclose(f);
+	controller->input.imu_align.saved_used = applied;
+	controller->input.imu_align.saved_rot = rot;
+	controller->input.imu_align.saved_bias = bias;
+	const struct xrt_quat identity = XRT_QUAT_IDENTITY;
+	HMD_WARN(hmd, "Touch controller %s: IMU alignment %s (turned %.1f degrees, accelerometer bias %.3f m/s2), kept.",
+	         controller->base.serial, applied ? "learned" : "no longer needed",
+	         rift_quat_angle_between(&rot, &identity) * 180.0f / (float)M_PI, m_vec3_len(bias));
 }
 
 void
@@ -1075,6 +1120,11 @@ rift_touch_controller_create(struct rift_hmd *hmd,
 		return NULL;
 	}
 	controller->pose_hold.mutex_created = true;
+	t_touch_app_pose_params_default(&controller->pose_hold.app_params);
+	const int64_t coast_ms = debug_get_num_option_rift_touch_coast_ms();
+	if (coast_ms >= 150 && coast_ms <= 2000) {
+		controller->pose_hold.app_params.carry_ns = coast_ms * U_TIME_1MS_IN_NS;
+	}
 
 	controller->input.clock_tracker = m_clock_windowed_skew_tracker_alloc(64);
 	if (controller->input.clock_tracker == NULL) {
@@ -1530,6 +1580,8 @@ rift_touch_controller_handle_radio_input_report(struct rift_hmd *hmd,
 		HMD_INFO(hmd, "Touch controller %d %s.", controller->device_type,
 		         imu_idle ? "is at rest, its IMU went idle" : "moved, its IMU is back");
 	}
+
+	rift_touch_imu_align_poll(hmd, controller);
 
 	os_mutex_lock(&controller->input.mutex);
 

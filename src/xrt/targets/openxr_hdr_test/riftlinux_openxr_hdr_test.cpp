@@ -21,6 +21,27 @@
  *   glass:N    the pattern (as none) with a translucent panel in front of it, rounded corners, whose backdrop is
  *              blurred by N milliradians (XR_MNDX_composition_layer_backdrop_blur); glass:0 the same two layers
  *              without the blur, for comparing
+ *   mask       a session only (XR_KHR_visibility_mask): prints the runtime's hidden, visible and line-loop masks of
+ *              both views, then quits without drawing
+ *   swapchains:N  a session that makes N swapchains as a desktop shell does for its windows (12 alive, random window
+ *              sizes, one replaced at random each step, each used once), printing its memory (VmRSS) every 50, then
+ *              quits without drawing: for the client library's memory per swapchain made
+ *   churn:N    the pattern shown while N swapchains come and go as a desktop shell's windows do (a new one every 4
+ *              frames between xrBeginFrame and xrEndFrame, RGBA8 sRGB and RGBA16F alternately, window sizes, 12 alive,
+ *              one destroyed at random after xrBeginFrame, every live image acquired, waited and released each frame),
+ *              printing VmRSS and the heap in use (mallinfo2) every 50, then quits
+ *   shell:N    as a VR desktop shell uses swapchains, until N are made: windows of 10 swapchains (quads,
+ *              some cylinders, every layer with XR_MNDX_composition_layer_hdr, glass ones with a backdrop blur, a fading
+ *              one with a colour scale), opened and closed inside frames, a closed window's swapchains destroyed in a
+ *              burst while they were in the previous xrEndFrame's layers, a size change replacing one in the same
+ *              frame, most images used once, video layers every frame, a room layer, and a layer per eye drawn every
+ *              frame with a second fenced submit; the application's own clears go through one fenced submit and a wait
+ *              a frame on the one queue, as a shell's copies do. VmRSS and the heap in use every 50 made.
+ *              shell:N:nolayers keeps the windows out of the layers, shell:N:nocopy leaves the clears out,
+ *              shell:N:hold makes N and then goes on without making more until the seconds given (heap every 10 s)
+ *   rlof:X:Y:F a 1024x768 crop at X, Y of an output-capture style image F ("RLOF", width, height, RGBA half floats),
+ *              shown as PQ BT.2020 video with MaxCLL 1000, MaxFALL 400, mastering 0.005-1000 nits (as a VR desktop
+ *              describes Firefox's HDR video): the same frame through the runtime, for comparing builds
  * Logs to stdout once a second.
  */
 
@@ -124,6 +145,22 @@ struct Mode
 	float glass_mrad = -1.0f;
 	//! probe: an instance only.
 	bool probe = false;
+	//! mask: the visibility masks printed.
+	bool mask = false;
+	//! swapchains:N: swapchains made and destroyed, memory printed.
+	int swapchains = 0;
+	//! churn:N: swapchains coming and going while frames run.
+	int churn = 0;
+	//! shell:N: swapchains used as a VR desktop shell uses them; its windows in the layers, its own clears.
+	int shell = 0;
+	bool shell_layers = true;
+	bool shell_copy = true;
+	//! shell:N:hold: after N made, frames go on as they are until the seconds given (memory over time).
+	bool shell_hold = false;
+	//! rlof:X:Y:F: the image shown instead of the pattern, its crop, and BT.2020 video's description.
+	std::string image;
+	uint32_t crop_x = 0, crop_y = 0;
+	bool video = false;
 };
 
 bool
@@ -163,6 +200,43 @@ parse_mode(const char *text, Mode &m)
 		m.probe = true;
 		return true;
 	}
+	if (kind == "rlof") {
+		const size_t c2 = t.find(':', colon + 1);
+		const size_t c3 = c2 == std::string::npos ? std::string::npos : t.find(':', c2 + 1);
+		if (c3 == std::string::npos) {
+			return false;
+		}
+		m.crop_x = (uint32_t)atoi(t.c_str() + colon + 1);
+		m.crop_y = (uint32_t)atoi(t.c_str() + c2 + 1);
+		m.image = t.substr(c3 + 1);
+		m.transfer = XR_HDR_TRANSFER_PQ_MNDX;
+		m.cll_nits = 1000.0f;
+		m.video = true;
+		return true;
+	}
+	if (kind == "shell" && value >= 1.0f) {
+		m.describe = false;
+		m.shell = (int)value;
+		m.shell_layers = t.find(":nolayers") == std::string::npos;
+		m.shell_copy = t.find(":nocopy") == std::string::npos;
+		m.shell_hold = t.find(":hold") != std::string::npos;
+		return true;
+	}
+	if (kind == "churn" && value >= 1.0f) {
+		m.describe = false;
+		m.churn = (int)value;
+		return true;
+	}
+	if (kind == "swapchains" && value >= 1.0f) {
+		m.describe = false;
+		m.swapchains = (int)value;
+		return true;
+	}
+	if (kind == "mask") {
+		m.describe = false;
+		m.mask = true;
+		return true;
+	}
 	if (kind == "glass" && value >= 0.0f) {
 		m.describe = false;
 		m.glass_mrad = value;
@@ -200,6 +274,28 @@ std::vector<uint16_t>
 make_pattern(const Mode &mode)
 {
 	std::vector<uint16_t> px((size_t)kWidth * kHeight * 4);
+	if (!mode.image.empty()) {
+		// rlof:X:Y:F: the crop, its half floats as they are (PQ values).
+		FILE *f = fopen(mode.image.c_str(), "rb");
+		char magic[4] = {};
+		uint32_t wh[2] = {};
+		const bool ok = f != nullptr && fread(magic, 1, 4, f) == 4 && memcmp(magic, "RLOF", 4) == 0 &&
+		                fread(wh, 4, 2, f) == 2 && mode.crop_x + kWidth <= wh[0] && mode.crop_y + kHeight <= wh[1];
+		for (uint32_t y = 0; ok && y < kHeight; y++) {
+			fseek(f, 12 + (((long)(mode.crop_y + y) * wh[0] + mode.crop_x) * 8), SEEK_SET);
+			if (fread(&px[(size_t)y * kWidth * 4], 8, kWidth, f) != kWidth) {
+				break;
+			}
+		}
+		if (f != nullptr) {
+			fclose(f);
+		}
+		printf("riftlinux-openxr-hdr-test: image %s (%ux%u), crop at %u %u: %s\n", mode.image.c_str(), wh[0], wh[1],
+		       mode.crop_x, mode.crop_y, ok ? "loaded" : "NOT loaded (pattern shown)");
+		if (ok) {
+			return px;
+		}
+	}
 	uint32_t seed = 12345u;
 	auto rnd = [&]() {
 		seed = seed * 1664525u + 1013904223u;
@@ -274,6 +370,7 @@ make_pattern(const Mode &mode)
 	_(vkResetCommandBuffer)                                                                                        \
 	_(vkCmdPipelineBarrier)                                                                                        \
 	_(vkCmdCopyBufferToImage)                                                                                      \
+	_(vkCmdClearColorImage)                                                                                        \
 	_(vkQueueSubmit)                                                                                               \
 	_(vkWaitForFences)                                                                                             \
 	_(vkResetFences)                                                                                               \
@@ -297,6 +394,8 @@ struct App
 	std::vector<XrSwapchainImageVulkan2KHR> images;
 	bool has_hdr_ext = false;
 	bool has_blur_ext = false;
+	bool has_cyl_ext = false;
+	bool has_csb_ext = false;
 	//! glass:N's panel.
 	XrSwapchain panel_swapchain = XR_NULL_HANDLE;
 	std::vector<XrSwapchainImageVulkan2KHR> panel_images;
@@ -309,6 +408,9 @@ struct App
 	VkQueue queue = VK_NULL_HANDLE;
 	VkCommandBuffer cmd = VK_NULL_HANDLE;
 	VkFence fence = VK_NULL_HANDLE;
+	//! shell:N's second submit (the layers per eye).
+	VkCommandBuffer cmd2 = VK_NULL_HANDLE;
+	VkFence fence2 = VK_NULL_HANDLE;
 	VkBuffer staging = VK_NULL_HANDLE;
 
 	bool
@@ -364,11 +466,16 @@ struct App
 		std::vector<XrExtensionProperties> props(n, xr_struct<XrExtensionProperties>(XR_TYPE_EXTENSION_PROPERTIES));
 		xrEnumerateInstanceExtensionProperties(nullptr, n, &n, props.data());
 		bool has_vk2 = false;
+		bool has_mask_ext = false;
 		for (const auto &p : props) {
+			has_mask_ext = has_mask_ext || strcmp(p.extensionName, XR_KHR_VISIBILITY_MASK_EXTENSION_NAME) == 0;
 			has_vk2 = has_vk2 || strcmp(p.extensionName, XR_KHR_VULKAN_ENABLE2_EXTENSION_NAME) == 0;
 			has_hdr_ext = has_hdr_ext || strcmp(p.extensionName, XR_MNDX_COMPOSITION_LAYER_HDR_EXTENSION_NAME) == 0;
 			has_blur_ext = has_blur_ext ||
 			               strcmp(p.extensionName, XR_MNDX_COMPOSITION_LAYER_BACKDROP_BLUR_EXTENSION_NAME) == 0;
+			has_cyl_ext = has_cyl_ext || strcmp(p.extensionName, XR_KHR_COMPOSITION_LAYER_CYLINDER_EXTENSION_NAME) == 0;
+			has_csb_ext = has_csb_ext ||
+			              strcmp(p.extensionName, XR_KHR_COMPOSITION_LAYER_COLOR_SCALE_BIAS_EXTENSION_NAME) == 0;
 		}
 		if (!has_vk2) {
 			return fail("XR_KHR_vulkan_enable2 (runtime has none)");
@@ -387,6 +494,29 @@ struct App
 		}
 		if (mode.glass_mrad > 0.0f) {
 			exts.push_back(XR_MNDX_COMPOSITION_LAYER_BACKDROP_BLUR_EXTENSION_NAME);
+		}
+		if (mode.shell > 0) {
+			// Whatever of a shell's layer extensions the runtime offers.
+			if (has_hdr_ext) {
+				exts.push_back(XR_MNDX_COMPOSITION_LAYER_HDR_EXTENSION_NAME);
+			}
+			if (has_blur_ext) {
+				exts.push_back(XR_MNDX_COMPOSITION_LAYER_BACKDROP_BLUR_EXTENSION_NAME);
+			}
+			if (has_cyl_ext) {
+				exts.push_back(XR_KHR_COMPOSITION_LAYER_CYLINDER_EXTENSION_NAME);
+			}
+			if (has_csb_ext) {
+				exts.push_back(XR_KHR_COMPOSITION_LAYER_COLOR_SCALE_BIAS_EXTENSION_NAME);
+			}
+			printf("riftlinux-openxr-hdr-test: shell layers: hdr %d, blur %d, cylinder %d, colour scale %d\n",
+			       has_hdr_ext, has_blur_ext, has_cyl_ext, has_csb_ext);
+		}
+		if (mode.mask) {
+			if (!has_mask_ext) {
+				return fail("mode needs XR_KHR_visibility_mask");
+			}
+			exts.push_back(XR_KHR_VISIBILITY_MASK_EXTENSION_NAME);
 		}
 		XrInstanceCreateInfo ici = {};
 		ici.type = XR_TYPE_INSTANCE_CREATE_INFO;
@@ -495,7 +625,9 @@ struct App
 		fci.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO;
 		if (vkCreateCommandPool(device, &pci, nullptr, &pool) != VK_SUCCESS ||
 		    (cai.commandPool = pool, vkAllocateCommandBuffers(device, &cai, &cmd) != VK_SUCCESS) ||
-		    vkCreateFence(device, &fci, nullptr, &fence) != VK_SUCCESS) {
+		    vkAllocateCommandBuffers(device, &cai, &cmd2) != VK_SUCCESS ||
+		    vkCreateFence(device, &fci, nullptr, &fence) != VK_SUCCESS ||
+		    vkCreateFence(device, &fci, nullptr, &fence2) != VK_SUCCESS) {
 			return fail("command buffer");
 		}
 
@@ -584,17 +716,21 @@ struct App
 
 	//! A float swapchain of the pattern's size.
 	bool
-	make_swapchain(XrSwapchain &out, std::vector<XrSwapchainImageVulkan2KHR> &out_images)
+	make_swapchain(XrSwapchain &out,
+	               std::vector<XrSwapchainImageVulkan2KHR> &out_images,
+	               uint32_t width = kWidth,
+	               uint32_t height = kHeight,
+	               int64_t format = VK_FORMAT_R16G16B16A16_SFLOAT)
 	{
 		uint32_t n = 0;
 		XrSwapchainCreateInfo swci = {};
 		swci.type = XR_TYPE_SWAPCHAIN_CREATE_INFO;
 		swci.usageFlags = XR_SWAPCHAIN_USAGE_COLOR_ATTACHMENT_BIT | XR_SWAPCHAIN_USAGE_TRANSFER_DST_BIT |
 		                  XR_SWAPCHAIN_USAGE_SAMPLED_BIT;
-		swci.format = VK_FORMAT_R16G16B16A16_SFLOAT;
+		swci.format = format;
 		swci.sampleCount = 1;
-		swci.width = kWidth;
-		swci.height = kHeight;
+		swci.width = width;
+		swci.height = height;
 		swci.faceCount = 1;
 		swci.arraySize = 1;
 		swci.mipCount = 1;
@@ -648,6 +784,370 @@ struct App
 		vkWaitForFences(device, 1, &fence, VK_TRUE, UINT64_MAX);
 	}
 
+	//! @p imgs cleared to a grey, one fenced submit and a wait, left as colour attachments (shell:N's copies).
+	void
+	clear_images(VkCommandBuffer cb, VkFence f, const std::vector<VkImage> &imgs, float shade)
+	{
+		if (imgs.empty()) {
+			return;
+		}
+		vkResetCommandBuffer(cb, 0);
+		VkCommandBufferBeginInfo bi = {};
+		bi.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+		bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+		vkBeginCommandBuffer(cb, &bi);
+		const VkImageSubresourceRange range = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+		const VkClearColorValue colour = {{shade, shade, shade, 1.0f}};
+		for (VkImage image : imgs) {
+			VkImageMemoryBarrier b = {};
+			b.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+			b.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+			b.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+			b.newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+			b.srcQueueFamilyIndex = b.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+			b.image = image;
+			b.subresourceRange = range;
+			vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0,
+			                     nullptr, 0, nullptr, 1, &b);
+			vkCmdClearColorImage(cb, image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &colour, 1, &range);
+			b.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+			b.dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+			b.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+			b.newLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+			vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, 0,
+			                     0, nullptr, 0, nullptr, 1, &b);
+		}
+		vkEndCommandBuffer(cb);
+		VkSubmitInfo si = {};
+		si.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
+		si.commandBufferCount = 1;
+		si.pCommandBuffers = &cb;
+		vkResetFences(device, 1, &f);
+		vkQueueSubmit(queue, 1, &si, f);
+		vkWaitForFences(device, 1, &f, VK_TRUE, UINT64_MAX);
+	}
+
+	//! shell:N: a window's layer, the room, the layers per eye.
+	struct ShellLayer
+	{
+		XrSwapchain sc = XR_NULL_HANDLE;
+		std::vector<XrSwapchainImageVulkan2KHR> imgs;
+		uint32_t w = 0, h = 0;
+		int64_t format = VK_FORMAT_R16G16B16A16_SFLOAT;
+		bool video = false, cylinder = false, glass = false;
+	};
+	std::vector<std::vector<ShellLayer>> shell_windows;
+	ShellLayer shell_room, shell_eye[2];
+	int shell_made = 0, shell_destroyed = 0, shell_window_count = 0;
+	uint32_t shell_seed = 4242u;
+
+	//! shell:N: a new swapchain for @p l, its size and format as a shell's window layers have them.
+	bool
+	shell_make(ShellLayer &l, bool &exit_requested)
+	{
+		auto rnd = [&](uint32_t n) {
+			shell_seed = shell_seed * 1664525u + 1013904223u;
+			return (shell_seed >> 8) % n;
+		};
+		if (l.video) {
+			l.w = 1920;
+			l.h = 1080;
+			l.format = VK_FORMAT_R16G16B16A16_SFLOAT;
+		} else {
+			// Window sizes rounded up by an eighth, in steps of 16.
+			auto round = [](uint32_t v) { return ((v + v / 8 + 15) / 16) * 16; };
+			l.w = round(64 + rnd(1536));
+			l.h = round(48 + rnd(864));
+			l.format = rnd(3) == 0 ? VK_FORMAT_R8G8B8A8_SRGB : VK_FORMAT_R16G16B16A16_SFLOAT;
+		}
+		if (!make_swapchain(l.sc, l.imgs, l.w, l.h, l.format)) {
+			return false;
+		}
+		shell_made++;
+		if (shell_made % 50 == 0 || shell_made == mode.shell) {
+			long rss, heap;
+			memory_kb(rss, heap);
+			printf("riftlinux-openxr-hdr-test: shell %d swapchains made, %d destroyed, VmRSS %ld kB, heap in use %ld "
+			       "kB\n",
+			       shell_made, shell_destroyed, rss, heap);
+			fflush(stdout);
+		}
+		if (shell_made >= mode.shell && !mode.shell_hold && !exit_requested) {
+			xrRequestExitSession(session);
+			exit_requested = true;
+		}
+		return true;
+	}
+
+	void
+	shell_destroy(ShellLayer &l)
+	{
+		if (l.sc != XR_NULL_HANDLE) {
+			xrDestroySwapchain(l.sc);
+			l.sc = XR_NULL_HANDLE;
+			shell_destroyed++;
+		}
+	}
+
+	//! One frame of shell:N, between xrBeginFrame and xrEndFrame, then xrEndFrame.
+	bool
+	shell_frame(const XrFrameState &fs, uint64_t frames, bool &exit_requested)
+	{
+		auto rnd = [&](uint32_t n) {
+			shell_seed = shell_seed * 1664525u + 1013904223u;
+			return (shell_seed >> 8) % n;
+		};
+		XrSwapchainImageAcquireInfo ai = {};
+		ai.type = XR_TYPE_SWAPCHAIN_IMAGE_ACQUIRE_INFO;
+		XrSwapchainImageWaitInfo wi = {};
+		wi.type = XR_TYPE_SWAPCHAIN_IMAGE_WAIT_INFO;
+		wi.timeout = XR_INFINITE_DURATION;
+		XrSwapchainImageReleaseInfo ri = {};
+		ri.type = XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO;
+		std::vector<XrSwapchain> to_release;
+		std::vector<VkImage> to_clear;
+		auto use = [&](ShellLayer &l, std::vector<XrSwapchain> &rel, std::vector<VkImage> &clr) {
+			uint32_t index = 0;
+			if (xrAcquireSwapchainImage(l.sc, &ai, &index) == XR_SUCCESS &&
+			    xrWaitSwapchainImage(l.sc, &wi) == XR_SUCCESS) {
+				clr.push_back(l.imgs[index].image);
+				rel.push_back(l.sc);
+			}
+		};
+		const bool making = shell_made < mode.shell;
+
+		// The room and the layers per eye, once.
+		if (shell_room.sc == XR_NULL_HANDLE) {
+			shell_room.w = 2048;
+			shell_room.h = 1024;
+			if (!make_swapchain(shell_room.sc, shell_room.imgs, shell_room.w, shell_room.h)) {
+				return false;
+			}
+			use(shell_room, to_release, to_clear);
+			for (ShellLayer &e : shell_eye) {
+				e.w = 1344;
+				e.h = 1600;
+				e.format = VK_FORMAT_R8G8B8A8_SRGB;
+				if (!make_swapchain(e.sc, e.imgs, e.w, e.h, e.format)) {
+					return false;
+				}
+			}
+		}
+		// A window closed: its layers left out from this frame on, its swapchains destroyed now, in a burst, while
+		// they were in the last xrEndFrame's layers.
+		const uint64_t phase = frames % 40;
+		if (phase == 0 && shell_windows.size() >= 4) {
+			for (ShellLayer &l : shell_windows.front()) {
+				shell_destroy(l);
+			}
+			shell_windows.erase(shell_windows.begin());
+		}
+		// A window opened: its 10 swapchains made mid-frame, each image used once now and shown in this frame.
+		if (phase == 20 && making) {
+			std::vector<ShellLayer> win(10);
+			const int n = shell_window_count++;
+			for (size_t i = 0; i < win.size(); i++) {
+				win[i].video = i == 0 && n % 3 == 0;
+				win[i].cylinder = has_cyl_ext && n % 3 == 1;
+				win[i].glass = i >= 8;
+				if (!shell_make(win[i], exit_requested)) {
+					return false;
+				}
+				use(win[i], to_release, to_clear);
+			}
+			shell_windows.push_back(std::move(win));
+		}
+		// A size change: the new swapchain made and used, the old one (in the last xrEndFrame) destroyed, same frame.
+		if (phase == 10 && making && !shell_windows.empty()) {
+			std::vector<ShellLayer> &win = shell_windows[rnd((uint32_t)shell_windows.size())];
+			ShellLayer &old = win[1 + rnd((uint32_t)win.size() - 1)];
+			ShellLayer fresh;
+			fresh.cylinder = old.cylinder;
+			fresh.glass = old.glass;
+			if (!shell_make(fresh, exit_requested)) {
+				return false;
+			}
+			use(fresh, to_release, to_clear);
+			shell_destroy(old);
+			old = std::move(fresh);
+		}
+		// Video layers every frame.
+		for (auto &win : shell_windows) {
+			for (ShellLayer &l : win) {
+				if (l.video) {
+					use(l, to_release, to_clear);
+				}
+			}
+		}
+		// The application's own copies: one fenced submit and a wait, then everything acquired released.
+		if (mode.shell_copy) {
+			clear_images(cmd, fence, to_clear, 0.2f + 0.1f * (float)(frames % 5));
+		}
+		for (XrSwapchain sc : to_release) {
+			xrReleaseSwapchainImage(sc, &ri);
+		}
+		// The layers per eye, drawn every frame with a second fenced submit.
+		std::vector<XrSwapchain> eye_release;
+		std::vector<VkImage> eye_clear;
+		for (ShellLayer &e : shell_eye) {
+			use(e, eye_release, eye_clear);
+		}
+		if (mode.shell_copy) {
+			clear_images(cmd2, fence2, eye_clear, 0.05f);
+		}
+		for (XrSwapchain sc : eye_release) {
+			xrReleaseSwapchainImage(sc, &ri);
+		}
+
+		// The layers: the room, the windows (unless :nolayers), one layer per eye on top.
+		std::vector<XrCompositionLayerQuad> quads;
+		std::vector<XrCompositionLayerCylinderKHR> cyls;
+		std::vector<XrCompositionLayerHdrMNDX> hdrs;
+		std::vector<XrCompositionLayerBackdropBlurMNDX> blurs;
+		std::vector<XrCompositionLayerColorScaleBiasKHR> csbs;
+		quads.reserve(128);
+		cyls.reserve(128);
+		hdrs.reserve(128);
+		blurs.reserve(128);
+		csbs.reserve(128);
+		std::vector<const XrCompositionLayerBaseHeader *> layers;
+		auto describe = [&](const ShellLayer &l) -> void * {
+			if (!has_hdr_ext) {
+				return nullptr;
+			}
+			XrCompositionLayerHdrMNDX h = {};
+			h.type = XR_TYPE_COMPOSITION_LAYER_HDR_MNDX;
+			h.referenceWhiteNits = kWhiteNits;
+			if (l.video) {
+				h.transfer = XR_HDR_TRANSFER_PQ_MNDX;
+				h.primaries = XR_HDR_PRIMARIES_BT2020_MNDX;
+				h.maxContentLightLevelNits = 1000.0f;
+				h.maxFrameAverageLightLevelNits = 400.0f;
+				h.masteringMinNits = 0.005f;
+				h.masteringMaxNits = 1000.0f;
+			} else {
+				h.transfer = l.format == VK_FORMAT_R8G8B8A8_SRGB ? XR_HDR_TRANSFER_SDR_MNDX : XR_HDR_TRANSFER_LINEAR_MNDX;
+				h.primaries = XR_HDR_PRIMARIES_BT709_MNDX;
+			}
+			hdrs.push_back(h);
+			return &hdrs.back();
+		};
+		auto add = [&](const ShellLayer &l, float x, float y, float z, float width, XrEyeVisibility eye, bool fading,
+		               int &glass_count) {
+			void *next = describe(l);
+			if (l.glass && has_blur_ext && glass_count < 4) {
+				XrCompositionLayerBackdropBlurMNDX b = {};
+				b.type = XR_TYPE_COMPOSITION_LAYER_BACKDROP_BLUR_MNDX;
+				b.next = next;
+				b.blurRadians = 0.01f;
+				b.saturation = 1.0f;
+				b.tint = {1.0f, 1.0f, 1.0f, 0.0f};
+				b.maskAlpha = 0.3f;
+				blurs.push_back(b);
+				next = &blurs.back();
+				glass_count++;
+			}
+			if (fading && has_csb_ext) {
+				XrCompositionLayerColorScaleBiasKHR c = {};
+				c.type = XR_TYPE_COMPOSITION_LAYER_COLOR_SCALE_BIAS_KHR;
+				c.next = next;
+				c.colorScale = {1.0f, 1.0f, 1.0f, 0.5f};
+				csbs.push_back(c);
+				next = &csbs.back();
+			}
+			const XrSwapchainSubImage sub = {l.sc, {{0, 0}, {(int32_t)l.w, (int32_t)l.h}}, 0};
+			const XrCompositionLayerFlags flags =
+			    l.video ? 0 : XR_COMPOSITION_LAYER_BLEND_TEXTURE_SOURCE_ALPHA_BIT;
+			XrPosef pose = {};
+			pose.orientation.w = 1.0f;
+			pose.position = {x, y, z};
+			if (l.cylinder) {
+				XrCompositionLayerCylinderKHR c = {};
+				c.type = XR_TYPE_COMPOSITION_LAYER_CYLINDER_KHR;
+				c.next = next;
+				c.layerFlags = flags;
+				c.space = view_space;
+				c.eyeVisibility = eye;
+				c.subImage = sub;
+				c.pose = pose;
+				c.radius = -z;
+				c.centralAngle = width / -z;
+				c.aspectRatio = (float)l.w / (float)l.h;
+				cyls.push_back(c);
+				layers.push_back(reinterpret_cast<const XrCompositionLayerBaseHeader *>(&cyls.back()));
+			} else {
+				XrCompositionLayerQuad q = {};
+				q.type = XR_TYPE_COMPOSITION_LAYER_QUAD;
+				q.next = next;
+				q.layerFlags = flags;
+				q.space = view_space;
+				q.eyeVisibility = eye;
+				q.subImage = sub;
+				q.pose = pose;
+				q.size = {width, width * (float)l.h / (float)l.w};
+				quads.push_back(q);
+				layers.push_back(reinterpret_cast<const XrCompositionLayerBaseHeader *>(&quads.back()));
+			}
+		};
+		if (fs.shouldRender) {
+			int glass_count = 0;
+			ShellLayer room = shell_room;
+			room.cylinder = has_cyl_ext;
+			add(room, 0.0f, 0.0f, -4.0f, 6.0f, XR_EYE_VISIBILITY_BOTH, has_csb_ext, glass_count);
+			if (mode.shell_layers) {
+				for (size_t w = 0; w < shell_windows.size(); w++) {
+					const bool fading = shell_windows.size() >= 4 && w == 0;
+					for (size_t i = 0; i < shell_windows[w].size(); i++) {
+						const ShellLayer &l = shell_windows[w][i];
+						add(l, -0.9f + 0.6f * (float)w + 0.05f * (float)(i % 3), -0.3f + 0.06f * (float)i,
+						    -2.0f + 0.01f * (float)i, 0.5f, XR_EYE_VISIBILITY_BOTH, fading, glass_count);
+					}
+				}
+			}
+			add(shell_eye[0], 0.0f, -0.4f, -1.0f, 0.3f, XR_EYE_VISIBILITY_LEFT, false, glass_count);
+			add(shell_eye[1], 0.0f, -0.4f, -1.0f, 0.3f, XR_EYE_VISIBILITY_RIGHT, false, glass_count);
+		}
+		XrFrameEndInfo fei = {};
+		fei.type = XR_TYPE_FRAME_END_INFO;
+		fei.displayTime = fs.predictedDisplayTime;
+		fei.environmentBlendMode = XR_ENVIRONMENT_BLEND_MODE_OPAQUE;
+		fei.layerCount = (uint32_t)layers.size();
+		fei.layers = layers.data();
+		return xr_ok(xrEndFrame(session, &fei), "xrEndFrame");
+	}
+
+	//! churn:N's swapchains alive, how many made, its random sizes.
+	std::vector<XrSwapchain> churn_alive;
+	int churn_made = 0;
+	uint32_t churn_seed = 4242u;
+
+	//! The process's resident memory and its heap in use (glibc's mallinfo2, looked up as old headers lack it), kB.
+	static void
+	memory_kb(long &rss, long &heap)
+	{
+		rss = -1;
+		heap = -1;
+		FILE *f = fopen("/proc/self/status", "r");
+		char line[256];
+		while (f != nullptr && fgets(line, sizeof(line), f) != nullptr) {
+			if (strncmp(line, "VmRSS:", 6) == 0) {
+				rss = atol(line + 6);
+			}
+		}
+		if (f != nullptr) {
+			fclose(f);
+		}
+		struct mi2
+		{
+			size_t arena, ordblks, smblks, hblks, hblkhd, usmblks, fsmblks, uordblks, fordblks, keepcost;
+		};
+		auto fn = reinterpret_cast<mi2 (*)()>(dlsym(RTLD_DEFAULT, "mallinfo2"));
+		if (fn != nullptr) {
+			const mi2 m = fn();
+			heap = (long)((m.uordblks + m.hblkhd) / 1024);
+		}
+	}
+
 	int
 	run(double seconds)
 	{
@@ -698,6 +1198,69 @@ struct App
 				return 1;
 			}
 			frames++;
+			if (mode.churn > 0) {
+				// As a desktop shell's windows: one closed at frame start, one opened mid-frame, all used each frame.
+				auto rnd = [&](uint32_t n) {
+					churn_seed = churn_seed * 1664525u + 1013904223u;
+					return (churn_seed >> 8) % n;
+				};
+				const bool step = churn_made < mode.churn && frames % 4 == 0;
+				if (step && churn_alive.size() >= 12) {
+					const uint32_t k = rnd((uint32_t)churn_alive.size());
+					xrDestroySwapchain(churn_alive[k]);
+					churn_alive.erase(churn_alive.begin() + k);
+				}
+				if (step) {
+					XrSwapchain sc = XR_NULL_HANDLE;
+					std::vector<XrSwapchainImageVulkan2KHR> imgs;
+					const int64_t format = (churn_made % 2) ? VK_FORMAT_R16G16B16A16_SFLOAT : VK_FORMAT_R8G8B8A8_SRGB;
+					if (make_swapchain(sc, imgs, 128 + rnd(1792), 128 + rnd(952), format)) {
+						churn_alive.push_back(sc);
+						churn_made++;
+						if (churn_made % 50 == 0 || churn_made == mode.churn) {
+							long rss, heap;
+							memory_kb(rss, heap);
+							printf("riftlinux-openxr-hdr-test: churn %d swapchains made, VmRSS %ld kB, heap in use %ld kB\n",
+							       churn_made, rss, heap);
+							fflush(stdout);
+						}
+						if (churn_made == mode.churn && !exit_requested) {
+							xrRequestExitSession(session);
+							exit_requested = true;
+						}
+					}
+				}
+				XrSwapchainImageAcquireInfo cai = {};
+				cai.type = XR_TYPE_SWAPCHAIN_IMAGE_ACQUIRE_INFO;
+				XrSwapchainImageWaitInfo cwi = {};
+				cwi.type = XR_TYPE_SWAPCHAIN_IMAGE_WAIT_INFO;
+				cwi.timeout = XR_INFINITE_DURATION;
+				XrSwapchainImageReleaseInfo cri = {};
+				cri.type = XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO;
+				for (XrSwapchain sc : churn_alive) {
+					uint32_t index = 0;
+					if (xrAcquireSwapchainImage(sc, &cai, &index) == XR_SUCCESS &&
+					    xrWaitSwapchainImage(sc, &cwi) == XR_SUCCESS) {
+						xrReleaseSwapchainImage(sc, &cri);
+					}
+				}
+			}
+			if (mode.shell > 0) {
+				if (!shell_frame(fs, frames, exit_requested)) {
+					return 1;
+				}
+				if (now - last_log >= (mode.shell_hold ? 10.0 : 1.0)) {
+					last_log = now;
+					long rss, heap;
+					memory_kb(rss, heap);
+					printf("riftlinux-openxr-hdr-test: %.0f s, mode %s, %llu frames, %d windows, %d swapchains made, "
+					       "%d destroyed, VmRSS %ld kB, heap in use %ld kB\n",
+					       now - start, mode.name.c_str(), (unsigned long long)frames, (int)shell_windows.size(),
+					       shell_made, shell_destroyed, rss, heap);
+					fflush(stdout);
+				}
+				continue;
+			}
 			XrCompositionLayerQuad quad = {};
 			quad.type = XR_TYPE_COMPOSITION_LAYER_QUAD;
 			XrCompositionLayerHdrMNDX hdr = {};
@@ -732,9 +1295,14 @@ struct App
 					quad.size = {1.2f, 1.2f * kHeight / kWidth};
 					if (mode.describe) {
 						hdr.transfer = mode.transfer;
-						hdr.primaries = XR_HDR_PRIMARIES_BT709_MNDX;
+						hdr.primaries = mode.video ? XR_HDR_PRIMARIES_BT2020_MNDX : XR_HDR_PRIMARIES_BT709_MNDX;
 						hdr.referenceWhiteNits = kWhiteNits;
 						hdr.maxContentLightLevelNits = mode.cll_nits;
+						if (mode.video) {
+							hdr.masteringMinNits = 0.005f;
+							hdr.masteringMaxNits = 1000.0f;
+							hdr.maxFrameAverageLightLevelNits = 400.0f;
+						}
 						hdr.sceneMaxNits = mode.scene_nits;
 						hdr.sceneAverageNits = mode.scene_nits > 0.0f ? kWhiteNits * 0.7f : 0.0f;
 						quad.next = &hdr;
@@ -792,7 +1360,7 @@ int
 main(int argc, char **argv)
 {
 	if (argc < 2) {
-		fprintf(stderr, "usage: %s <libopenxr_monado.so> [seconds, 60] [none|linear|scene:N|cll:N|pq:N|sdr|probe|glass:N]\n",
+		fprintf(stderr, "usage: %s <libopenxr_monado.so> [seconds, 60] [none|linear|scene:N|cll:N|pq:N|sdr|probe|glass:N|mask|swapchains:N|churn:N|shell:N[:nolayers][:nocopy]|rlof:X:Y:F]\n",
 		        argv[0]);
 		return 2;
 	}
@@ -817,6 +1385,117 @@ main(int argc, char **argv)
 	}
 	if (!app.load_runtime(argv[1]) || !app.create_instance() || !app.create_vulkan() || !app.create_session()) {
 		return 1;
+	}
+	if (app.mode.swapchains > 0) {
+		// The client library's memory per swapchain made: made and destroyed again and again, VmRSS every 50.
+		auto rss_kb = []() {
+			long kb = -1;
+			FILE *f = fopen("/proc/self/status", "r");
+			char line[256];
+			while (f != nullptr && fgets(line, sizeof(line), f) != nullptr) {
+				if (strncmp(line, "VmRSS:", 6) == 0) {
+					kb = atol(line + 6);
+				}
+			}
+			if (f != nullptr) {
+				fclose(f);
+			}
+			return kb;
+		};
+		int ret = 0;
+		long first = -1;
+		// As a desktop shell's windows: 12 alive at once, sizes as windows have them, one closed and another opened
+		// at random each step (the pool's freed memory then lies between live command buffers).
+		uint32_t seed = 4242u;
+		auto rnd = [&](uint32_t n) {
+			seed = seed * 1664525u + 1013904223u;
+			return (seed >> 8) % n;
+		};
+		std::vector<XrSwapchain> alive;
+		for (int i = 1; i <= app.mode.swapchains; i++) {
+			if (alive.size() >= 12) {
+				const uint32_t k = rnd((uint32_t)alive.size());
+				app.xrDestroySwapchain(alive[k]);
+				alive.erase(alive.begin() + k);
+			}
+			XrSwapchain sc = XR_NULL_HANDLE;
+			std::vector<XrSwapchainImageVulkan2KHR> imgs;
+			if (!app.make_swapchain(sc, imgs, 200 + rnd(1720), 120 + rnd(960))) {
+				ret = 1;
+				break;
+			}
+			// Used as an application uses one: every image acquired, waited for and released (the client library
+			// runs its command buffers then).
+			for (size_t k = 0; k < imgs.size(); k++) {
+				uint32_t index = 0;
+				XrSwapchainImageAcquireInfo ai = {};
+				ai.type = XR_TYPE_SWAPCHAIN_IMAGE_ACQUIRE_INFO;
+				XrSwapchainImageWaitInfo wi = {};
+				wi.type = XR_TYPE_SWAPCHAIN_IMAGE_WAIT_INFO;
+				wi.timeout = XR_INFINITE_DURATION;
+				XrSwapchainImageReleaseInfo ri = {};
+				ri.type = XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO;
+				if (app.xrAcquireSwapchainImage(sc, &ai, &index) == XR_SUCCESS &&
+				    app.xrWaitSwapchainImage(sc, &wi) == XR_SUCCESS) {
+					app.xrReleaseSwapchainImage(sc, &ri);
+				}
+			}
+			alive.push_back(sc);
+			if (i == 10) {
+				first = rss_kb();
+			}
+			if (i % 50 == 0 || i == app.mode.swapchains) {
+				printf("riftlinux-openxr-hdr-test: %d swapchains made and destroyed, VmRSS %ld kB\n", i, rss_kb());
+			}
+		}
+		for (XrSwapchain sc : alive) {
+			app.xrDestroySwapchain(sc);
+		}
+		if (first >= 0 && app.mode.swapchains > 10) {
+			printf("riftlinux-openxr-hdr-test: growth after the first 10: %.1f kB per swapchain\n",
+			       (double)(rss_kb() - first) / (app.mode.swapchains - 10));
+		}
+		app.xrDestroySwapchain(app.swapchain);
+		app.xrDestroySpace(app.view_space);
+		app.xrDestroySession(app.session);
+		app.xrDestroyInstance(app.instance);
+		return ret;
+	}
+	if (app.mode.mask) {
+		// The runtime's visibility masks of both views, as a game asks for them; nothing drawn.
+		PFN_xrGetVisibilityMaskKHR get_mask = nullptr;
+		app.gipa(app.instance, "xrGetVisibilityMaskKHR", reinterpret_cast<PFN_xrVoidFunction *>(&get_mask));
+		int ret = get_mask != nullptr ? 0 : 1;
+		const char *names[] = {"hidden", "visible", "line loop"};
+		const XrVisibilityMaskTypeKHR types[] = {XR_VISIBILITY_MASK_TYPE_HIDDEN_TRIANGLE_MESH_KHR,
+		                                         XR_VISIBILITY_MASK_TYPE_VISIBLE_TRIANGLE_MESH_KHR,
+		                                         XR_VISIBILITY_MASK_TYPE_LINE_LOOP_KHR};
+		for (uint32_t view = 0; get_mask != nullptr && view < 2; view++) {
+			for (int t = 0; t < 3; t++) {
+				XrVisibilityMaskKHR m = xr_struct<XrVisibilityMaskKHR>(XR_TYPE_VISIBILITY_MASK_KHR);
+				XrResult r = get_mask(app.session, XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO, view, types[t], &m);
+				std::vector<XrVector2f> v(m.vertexCountOutput);
+				std::vector<uint32_t> idx(m.indexCountOutput);
+				if (r == XR_SUCCESS && m.vertexCountOutput > 0 && m.indexCountOutput > 0) {
+					m.vertexCapacityInput = m.vertexCountOutput;
+					m.indexCapacityInput = m.indexCountOutput;
+					m.vertices = v.data();
+					m.indices = idx.data();
+					r = get_mask(app.session, XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO, view, types[t], &m);
+				}
+				printf("riftlinux-openxr-hdr-test: mask view %u %s: XrResult %d, %u vertices, %u indices", view,
+				       names[t], (int)r, m.vertexCountOutput, m.indexCountOutput);
+				for (uint32_t i = 0; i < v.size() && i < 12; i++) {
+					printf(" (%.3f %.3f)", v[i].x, v[i].y);
+				}
+				printf("\n");
+				ret = r == XR_SUCCESS ? ret : 1;
+			}
+		}
+		app.xrDestroySpace(app.view_space);
+		app.xrDestroySession(app.session);
+		app.xrDestroyInstance(app.instance);
+		return ret;
 	}
 	const int ret = app.run(seconds);
 	app.vkDeviceWaitIdle(app.device);

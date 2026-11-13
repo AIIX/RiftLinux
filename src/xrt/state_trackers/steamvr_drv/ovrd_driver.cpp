@@ -82,6 +82,7 @@ extern "C" {
 #include "riftlinux/rl_floor.hpp"
 #include "riftlinux/rl_room.hpp"
 #include "riftlinux/rl_settings.hpp"
+#include "riftlinux/rl_tab.hpp"
 #include "main/comp_main_interface.h"
 #include "render/render_output_settings.h"
 extern char **environ;
@@ -1918,6 +1919,11 @@ public:
 		ovrd_log("Display Frequency: %f\n", m_flDisplayFrequency);
 		ovrd_log("IPD: %f\n", m_flIPD);
 	};
+
+	//! The distance between the eyes changed: SteamVR gets the eyes' new places (see the definition).
+	void
+	UpdateIpd();
+
 	// clang-format off
 	virtual ~CDeviceDriver_Monado() {};
 
@@ -1952,6 +1958,9 @@ private:
 	float m_flSecondsFromVsyncToPhotons = -1;
 	float m_flDisplayFrequency = -1;
 	float m_flIPD = -1;
+	//! Activate gave SteamVR the eyes' places (UpdateIpd may change them from then on), and when UpdateIpd last did.
+	bool m_eyes_set = false;
+	int64_t m_ipd_set_ns = 0;
 
 	struct xrt_fov m_fovs[2];
 	struct xrt_pose m_view_pose[2];
@@ -2019,6 +2028,39 @@ CDeviceDriver_Monado::PoseUpdateThreadFunction()
 		}
 	}
 	ovrd_log("Stopping HMD pose update thread\n");
+}
+
+/*!
+ * The distance between the eyes changed (the slider moved, or set by hand: u_notice_get_ipd): SteamVR gets the eyes'
+ * new places and the IPD, as at Activate. From RunFrame, at most every 100 ms while it changes.
+ */
+void
+CDeviceDriver_Monado::UpdateIpd()
+{
+	struct u_notice_ipd ipd = {};
+	const int64_t now_ns = os_monotonic_get_ns();
+	if (!m_eyes_set || !u_notice_get_ipd(&ipd) || std::fabs(ipd.mm / 1000.0f - m_flIPD) < 0.00005f ||
+	    now_ns - m_ipd_set_ns < 100 * U_TIME_1MS_IN_NS) {
+		return;
+	}
+	m_ipd_set_ns = now_ns;
+	struct xrt_vec3 ipd_vec = {ipd.mm / 1000.0f, 0, 0};
+	struct xrt_space_relation head_relation;
+	struct xrt_fov fovs[2];
+	struct xrt_pose poses[2];
+	if (xrt_device_get_view_poses(m_xdev, &ipd_vec, now_ns, XRT_VIEW_TYPE_STEREO, 2, &head_relation, fovs, poses) !=
+	    XRT_SUCCESS) {
+		return;
+	}
+	m_view_pose[0] = poses[0];
+	m_view_pose[1] = poses[1];
+	m_flIPD = -m_view_pose[0].position.x + m_view_pose[1].position.x;
+	vr::HmdMatrix34_t left;
+	create_translation_rotation_matrix(&m_view_pose[0], &left);
+	vr::HmdMatrix34_t right;
+	create_translation_rotation_matrix(&m_view_pose[1], &right);
+	vr::VRServerDriverHost()->SetDisplayEyeToHead(m_trackedDeviceIndex, left, right);
+	vr::VRProperties()->SetFloatProperty(m_ulPropertyContainer, vr::Prop_UserIpdMeters_Float, m_flIPD);
 }
 
 vr::EVRInitError
@@ -2161,13 +2203,14 @@ CDeviceDriver_Monado::Activate(vr::TrackedDeviceIndex_t unObjectId)
 	// clang-format on
 
 
-	//! @todo update when ipd changes
+	// Changed when the distance between the eyes changes: UpdateIpd.
 	vr::HmdMatrix34_t left;
 	create_translation_rotation_matrix(&m_view_pose[0], &left);
 	vr::HmdMatrix34_t right;
 	create_translation_rotation_matrix(&m_view_pose[1], &right);
 
 	vr::VRServerDriverHost()->SetDisplayEyeToHead(m_trackedDeviceIndex, left, right);
+	m_eyes_set = true;
 
 
 	m_poseUpdateThread = new std::thread(&CDeviceDriver_Monado::PoseUpdateThreadFunction, this);
@@ -2509,7 +2552,7 @@ static struct
 	std::vector<pid_t> live;
 	int64_t last_spawn_ns = 0;
 	bool enabled = true;
-	bool kinds[5] = {true, true, true, true, true};
+	bool kinds[6] = {true, true, true, true, true, true};
 	//! The welcome panel was shown once (notices.welcome_shown; false shows it again at the next put-on).
 	bool welcome_shown = false;
 	//! When the headset was first put on since SteamVR started (0: not yet), and whether the controller hint ran.
@@ -2968,6 +3011,79 @@ proton_probe_scan()
 	closedir(proc);
 }
 
+#ifdef XRT_OS_LINUX
+//! Whether @p dir holds Steam's scout runtime itself: its run.sh exports STEAM_RUNTIME (Steam's legacy-run-stub.sh does
+//! not, and SteamVR Home's launcher then starts itself over and over).
+static bool
+riftlinux_real_steam_runtime(const std::string &dir)
+{
+	FILE *f = fopen((dir + "/run.sh").c_str(), "r");
+	if (f == nullptr) {
+		return false;
+	}
+	std::string text(1 << 16, '\0');
+	text.resize(fread(&text[0], 1, text.size(), f));
+	fclose(f);
+	return text.find("export STEAM_RUNTIME") != std::string::npos &&
+	       text.find("legacy-run-stub") == std::string::npos;
+}
+
+/*!
+ * SteamVR Home's launcher (steamtours.sh) runs ~/.steam/bin/steam-runtime/run.sh. Steam's newer layout (bin ->
+ * steamrt32) has none, and then Home never appears and games do not start while SteamVR keeps starting it (issue #7).
+ * riftlinux-setup links it at login and at plug-in; this does the same at SteamVR's start, for a Steam that changed its
+ * layout since, as Steam does when it updates at its own start. A missing entry or a link is replaced, only with a real
+ * scout runtime (Steam's LegacySteamRuntime, else the Steam Linux Runtime 1.0 (scout) tool's); never a folder of
+ * Steam's own. Steam's older layout, which has the runtime, is left alone. Home is started again and again, so the
+ * next start finds it.
+ */
+static void
+riftlinux_link_steam_runtime()
+{
+	const char *home = getenv("HOME");
+	if (home == nullptr || home[0] == '\0') {
+		return;
+	}
+	char real_bin[PATH_MAX];
+	if (realpath((std::string(home) + "/.steam/bin").c_str(), real_bin) == nullptr) {
+		return;
+	}
+	const std::string bin = real_bin;
+	const std::string link = bin + "/steam-runtime";
+	if (riftlinux_real_steam_runtime(link)) {
+		return;
+	}
+	struct stat st = {};
+	const bool exists = lstat(link.c_str(), &st) == 0;
+	if (exists && !S_ISLNK(st.st_mode)) {
+		ovrd_log("SteamVR Home: %s is a folder of Steam's own without its runtime, left alone (riftlinux-setup check)\n",
+		         link.c_str());
+		return;
+	}
+	const std::string root = bin.substr(0, bin.rfind('/'));
+	for (const char *name : {"LegacySteamRuntime", "SteamLinuxRuntime"}) {
+		if (!riftlinux_real_steam_runtime(root + "/steamapps/common/" + name + "/steam-runtime")) {
+			continue;
+		}
+		const std::string target = std::string("../steamapps/common/") + name + "/steam-runtime";
+		if (exists && unlink(link.c_str()) != 0) {
+			ovrd_log("SteamVR Home: could not replace %s: %s\n", link.c_str(), strerror(errno));
+			return;
+		}
+		if (symlink(target.c_str(), link.c_str()) != 0) {
+			ovrd_log("SteamVR Home: could not link %s: %s\n", link.c_str(), strerror(errno));
+			return;
+		}
+		ovrd_log("SteamVR Home: %s %s (Steam's newer layout), linked to %s\n", link.c_str(),
+		         exists ? "led to a stub" : "was missing", target.c_str());
+		return;
+	}
+	ovrd_log("SteamVR Home: %s is missing and no scout runtime is installed: install \"Steam Linux Runtime 1.0 "
+	         "(scout)\" from Steam's Library (riftlinux-setup check)\n",
+	         link.c_str());
+}
+#endif
+
 /*!
  * settings.json "steamvr": {"standby": "pick-up"}: SteamVR's standby also ends when the headset moves, by SteamVR's own
  * rule (as on Windows with the Oculus runtime: picked up, or moved where it lies); the picture still waits until the
@@ -3070,6 +3186,7 @@ notices_read_settings_locked(std::string *out_test)
 	flag("tracking", g_notices.kinds[U_NOTICE_TRACKING]);
 	flag("display", g_notices.kinds[U_NOTICE_DISPLAY]);
 	flag("system", g_notices.kinds[U_NOTICE_SYSTEM]);
+	flag("ipd", g_notices.kinds[U_NOTICE_IPD]);
 	flag("welcome_shown", g_notices.welcome_shown);
 	const cJSON *test_put_on = cJSON_GetObjectItemCaseSensitive(notices, "test_put_on_s");
 	if (cJSON_IsNumber(test_put_on)) {
@@ -3084,9 +3201,10 @@ notices_read_settings_locked(std::string *out_test)
 		*out_test = test->valuestring;
 	}
 	cJSON_Delete(root);
-	ovrd_log("Notices: %s (sensors %d, calibration %d, tracking %d, display %d, system %d; welcome %s), from %s\n",
+	ovrd_log("Notices: %s (sensors %d, calibration %d, tracking %d, display %d, system %d, ipd %d; welcome %s), from %s\n",
 	         g_notices.enabled ? "on" : "off", g_notices.kinds[0], g_notices.kinds[1], g_notices.kinds[2],
-	         g_notices.kinds[3], g_notices.kinds[4], g_notices.welcome_shown ? "shown" : "to show", path.c_str());
+	         g_notices.kinds[3], g_notices.kinds[4], g_notices.kinds[5], g_notices.welcome_shown ? "shown" : "to show",
+	         path.c_str());
 }
 
 //! Starts riftlinux-notices, at most every 30 s. Lock held.
@@ -3214,6 +3332,14 @@ notices_sink(void *ptr, enum u_notice_kind kind, const char *key, int number)
 {
 	(void)ptr;
 	std::lock_guard<std::mutex> lock(g_notices.lock);
+	// The distance between the eyes, posted while it changes (up to 20 a second): drawn by the helper as it comes, by the
+	// switches as last read.
+	if (kind == U_NOTICE_IPD) {
+		if (g_notices.enabled && g_notices.kinds[U_NOTICE_IPD]) {
+			notices_send_locked("cmd-ipd " + std::to_string(number));
+		}
+		return;
+	}
 	// A measuring result (ours, or a first measure with no sensor placed; whatever the notice switches say): world and
 	// floor follow.
 	if (key != nullptr && strcmp(key, "calibration-done") == 0) {
@@ -3227,7 +3353,7 @@ notices_sink(void *ptr, enum u_notice_kind kind, const char *key, int number)
 		ovrd_log("Sensors: a solve of the measuring failed; the tracker keeps measuring\n");
 	}
 	notices_read_settings_locked(nullptr);
-	if (!g_notices.enabled || static_cast<int>(kind) < 0 || static_cast<int>(kind) > U_NOTICE_SYSTEM || !g_notices.kinds[kind]) {
+	if (!g_notices.enabled || static_cast<int>(kind) < 0 || static_cast<int>(kind) > U_NOTICE_IPD || !g_notices.kinds[kind]) {
 		return;
 	}
 	ovrd_log("Notice: %s %d\n", key, number);
@@ -3454,6 +3580,14 @@ display_read_settings_live()
 }
 
 //! The Rift tab's settings, for a helper just started: the height, and the picture's (direct mode only). Lock held.
+//! The Rift tab's IPD row: "cmd-ipd-state <tenths of a mm> <set by hand 0|1>".
+static std::string
+ipd_state_line(const struct u_notice_ipd &ipd)
+{
+	return "cmd-ipd-state " + std::to_string(std::lround(ipd.mm * 10.0f)) + " " +
+	       (ipd.source == U_NOTICE_IPD_MANUAL ? "1" : "0");
+}
+
 static void
 notices_send_state_locked()
 {
@@ -3461,6 +3595,10 @@ notices_send_state_locked()
 	notices_send_locked("cmd-height " + std::to_string(mm));
 	notices_send_locked(picture_line());
 	notices_send_locked("cmd-hdr-content " + std::to_string(g_hdr_content.load()));
+	struct u_notice_ipd ipd = {};
+	if (u_notice_get_ipd(&ipd)) {
+		notices_send_locked(ipd_state_line(ipd));
+	}
 	if (!g_tab_status_line.empty()) {
 		notices_send_locked(g_tab_status_line);
 	}
@@ -3535,6 +3673,17 @@ riftlinux_helper_poll()
 			g_world_from_driver.height_m.store(cm / 100.0f);
 			riftlinux_settings_set_number("tracking", "height_cm", cm);
 			ovrd_log("Rift panel: height %+.0f cm\n", cm);
+		} else if (line.rfind("ipd ", 0) == 0) {
+			// The Rift tab's IPD: "auto" follows the headset's slider, else tenths of a millimetre set by hand.
+			const bool automatic = line == "ipd auto";
+			const float mm = automatic ? 0.0f : std::clamp((float)atof(line.c_str() + 4) / 10.0f, 50.0f, 80.0f);
+			u_notice_set_manual_ipd(mm);
+			riftlinux_settings_set_number("headset", "ipd_mm", mm);
+			if (automatic) {
+				ovrd_log("Rift panel: IPD follows the headset's slider\n");
+			} else {
+				ovrd_log("Rift panel: IPD set by hand to %.1f mm\n", mm);
+			}
 		} else if (line == "floor") {
 			g_world_from_driver.floor_request.store(true);
 		} else if (line == "recalibrate") {
@@ -3859,11 +4008,22 @@ CServerDriver_Monado::Init(vr::IVRDriverContext *pDriverContext)
 	riftlinux_load_floor();
 	riftlinux_load_menu();
 	riftlinux_load_standby();
+	riftlinux_link_steam_runtime();
 	headset_start_read();
 	g_driver_start_ns = os_monotonic_get_ns();
 #endif
 
 #ifdef XRT_OS_LINUX
+	// Before any Vulkan instance: the helper's (started next, it inherits the environment) and the compositor's.
+	{
+		cJSON *settings = riftlinux_settings_load();
+		const std::string lsfg = rl::settings::lsfg_vk_to_env(settings);
+		if (!lsfg.empty()) {
+			ovrd_log("%s\n", lsfg.c_str());
+		}
+		cJSON_Delete(settings);
+	}
+
 	// Before the devices: the tracker may have something to say right away (placing the sensors).
 	notices_start();
 #endif
@@ -4384,8 +4544,27 @@ CServerDriver_Monado::HandleHapticEvent(vr::VREvent_t *event)
 void
 CServerDriver_Monado::RunFrame()
 {
+	if (m_MonadoDeviceDriver != NULL) {
+		m_MonadoDeviceDriver->UpdateIpd();
+	}
 #ifdef XRT_OS_LINUX
 	riftlinux_helper_poll();
+	// The Rift tab's IPD row, sent as the distance or its source changes (at most 10 times a second).
+	{
+		static std::string ipd_sent;
+		static int64_t ipd_sent_ns = 0;
+		struct u_notice_ipd ipd = {};
+		const int64_t now_ns = os_monotonic_get_ns();
+		if (now_ns - ipd_sent_ns >= 100 * U_TIME_1MS_IN_NS && u_notice_get_ipd(&ipd)) {
+			const std::string line = ipd_state_line(ipd);
+			if (line != ipd_sent) {
+				std::lock_guard<std::mutex> lock(g_notices.lock);
+				notices_send_locked(line);
+				ipd_sent = line;
+				ipd_sent_ns = now_ns;
+			}
+		}
+	}
 	/*
 	 * The Rift tab's second page: the headset's state and the display settings, once a second, sent when
 	 * they change.

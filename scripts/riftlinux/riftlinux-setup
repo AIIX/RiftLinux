@@ -23,6 +23,12 @@
   riftlinux-setup backdrop-blur on|off|status
                                           RiftLinux's own runtime: frosted glass for the layers an application asks it
                                           for (on by default; off: those layers without it); nothing else uses it
+  riftlinux-setup ipd <mm>|auto|status    the distance between your eyes set by hand (50 to 80 mm), for a headset whose
+                                          IPD slider is not read; auto follows the headset's slider again (the default)
+  riftlinux-setup ipd test                what the headset's IPD slider reads while you move it (SteamVR closed)
+  riftlinux-setup lsfg-vk off|on|status    lsfg-vk (Lossless Scaling's frame generation) kept out of SteamVR's server
+                                          and RiftLinux's runtime, where it crashed SteamVR (off, the default); on:
+                                          allowed there as before. Games keep it either way
   riftlinux-setup nvidia-vrr status|conceal|restore
                                           NVIDIA on Wayland: a monitor offering adaptive sync (VRR) makes NVIDIA show
                                           the headset's frames without vsync (the lower part tears and lags); conceal
@@ -48,6 +54,16 @@
   riftlinux-setup autostart quit-unused on|off
                                           a SteamVR started by picking the Rift up quits again when it is not put on
                                           within two minutes (on by default); off lets it run on
+  riftlinux-setup controller-alignment status|on|off|forget
+                                          a controller whose motion sensor disagrees with its LEDs (turned, or its
+                                          accelerometer off) has that learned by itself and corrected; status shows
+                                          what is in use, off tracks it as before, forget drops what was kept
+  riftlinux-setup controller-tracking current|0.1.4|status
+                                          the controllers' tracking as up to RiftLinux 0.1.4, should the current one
+                                          not suit a setup
+  riftlinux-setup controller-coast <ms>|status
+                                          how long a controller out of the sensors' view is carried on by its motion
+                                          sensor before it is held (1000 by default, 300 before)
   riftlinux-setup controller-sleep 3|5|7|off|status
                                           minutes after the headset is taken off before the Touch controllers may
                                           go to sleep (5 by default); off keeps them awake while SteamVR runs; from
@@ -88,6 +104,7 @@ else they are printed for you to run.
 """
 
 import argparse
+import math
 import datetime
 import glob
 import json
@@ -220,6 +237,8 @@ SETTINGS_KEYS = {
     ("steamvr", "close_menu_for_games"): ("bool", None, None, "true"),
     ("steamvr", "standby"): ("choice", None, ("worn", "pick-up"), '"worn"'),
     ("controllers", "sleep_after_min"): ("number", None, 60, "5 (1 to 60; negative: kept awake)"),
+    ("controllers", "coast_ms"): ("number", 150, 2000, "1000 (150 to 2000)"),
+    ("controllers", "tracking"): ("choice", None, ("current", "0.1.4"), '"current"'),
     ("headset", "wear_sensor"): ("bool", None, None, "true"),
     ("headset", "worn_above"): ("number", 0, 65535, "30"),
     ("headset", "unworn_below"): ("number", 0, 65535, "15"),
@@ -228,8 +247,10 @@ SETTINGS_KEYS = {
     ("headset", "display_off_after_s"): ("number", None, 86400, "5 (negative: never; at most a day)"),
     ("headset", "not_worn"): ("choice", None, ("black", "off"), '"black"'),
     ("headset", "black_then_off_min"): ("number", None, 10080, "10 (negative: never; at most a week)"),
+    ("headset", "ipd_mm"): ("number", 0, 80, "0: the headset's IPD slider (by hand: 50 to 80)"),
     ("display", "direct_mode"): ("bool", None, None, "true"),
     ("display", "backdrop_blur"): ("bool", None, None, "true"),
+    ("display", "lsfg_vk"): ("bool", None, None, "false"),
     ("diagnostics", "record"): ("bool", None, None, "false"),
 }
 
@@ -447,6 +468,107 @@ def check_steam(p, opts):
         return result("steam", "Steam and SteamVR", "error",
                       f"SteamVR at {p.steamvr} has never been started: start it once from Steam, then run this again.")
     return result("steam", "Steam and SteamVR", "ok", f"SteamVR (build {ver}) at {p.steamvr}" if ver else f"SteamVR at {p.steamvr}")
+
+
+#: Where each Steam keeps its bin link: native, Flatpak, Snap.
+STEAM_BIN_DIRS = ("~/.steam/bin", "~/.var/app/com.valvesoftware.Steam/.steam/bin", "~/snap/steam/common/.steam/bin")
+
+
+def steam_runtime_real(run_sh):
+    """Whether a steam-runtime/run.sh is Steam's scout runtime itself: it exports STEAM_RUNTIME. The stub Steam's newer
+    layout leaves in ubuntu12_32 (legacy-run-stub.sh) does not, and SteamVR Home's launcher then starts itself over."""
+    try:
+        with open(run_sh, errors="replace") as f:
+            text = f.read(1 << 16)
+    except OSError:
+        return False
+    return "export STEAM_RUNTIME" in text and "legacy-run-stub" not in text
+
+
+def steam_runtime_states():
+    """SteamVR Home's launcher (steamtours.sh) runs ~/.steam/bin/steam-runtime/run.sh. Steam's older layout has it
+    (bin -> ubuntu12_32); the newer one (bin -> steamrt32, from Steam's November 2026 client) does not, and then Home
+    and the games never start while SteamVR keeps trying (issue #7). For each Steam: (bin, link, problem, source), where
+    problem is None when the runtime is there, and source is a real scout runtime to link to, if one is installed:
+    Steam's LegacySteamRuntime, else the Steam Linux Runtime 1.0 (scout) tool's copy (the same run.sh)."""
+    states = []
+    for c in STEAM_BIN_DIRS:
+        b = os.path.expanduser(c)
+        if not os.path.isdir(b):
+            continue
+        link = os.path.join(b, "steam-runtime")
+        if steam_runtime_real(os.path.join(link, "run.sh")):
+            states.append((b, link, None, None))
+            continue
+        root = os.path.dirname(os.path.realpath(b))
+        libs = [root]
+        try:
+            with open(os.path.join(root, "steamapps", "libraryfolders.vdf")) as f:
+                for line in f:
+                    parts = line.strip().split('"')
+                    if len(parts) >= 4 and parts[1] == "path" and parts[3] not in libs:
+                        libs.append(parts[3])
+        except OSError:
+            pass
+        source = None
+        for name in ("LegacySteamRuntime", "SteamLinuxRuntime"):
+            for lib in libs:
+                cand = os.path.join(lib, "steamapps", "common", name, "steam-runtime")
+                if steam_runtime_real(os.path.join(cand, "run.sh")):
+                    source = cand
+                    break
+            if source:
+                break
+        if not os.path.lexists(link):
+            problem = "missing"
+        elif os.path.islink(link):
+            problem = "stub link"
+        else:
+            problem = "stub folder"
+        states.append((b, link, problem, source))
+    return states
+
+
+def steam_runtime_fix(state):
+    """Links a Steam's bin/steam-runtime to a real scout runtime. Only a missing entry or a link is replaced, never a
+    folder of Steam's own. Returns the link's target, or None when nothing was done."""
+    b, link, problem, source = state
+    if problem is None or source is None or problem == "stub folder":
+        return None
+    real_bin = os.path.realpath(b)
+    target = os.path.join(real_bin, "steam-runtime")
+    root = os.path.dirname(real_bin)
+    rel = os.path.relpath(source, real_bin) if os.path.realpath(source).startswith(root + os.sep) else source
+    if os.path.islink(target):
+        os.remove(target)
+    os.symlink(rel, target)
+    return rel
+
+
+def check_steam_runtime(p, opts):
+    title = "Steam's runtime for SteamVR Home"
+    states = steam_runtime_states()
+    if not states:
+        return result("steamruntime", title, "info", "No ~/.steam/bin found (Steam not started yet).")
+    bad = [s for s in states if s[2] is not None]
+    if not bad:
+        return result("steamruntime", title, "ok", "Present (" + ", ".join(s[1] for s in states) + ").")
+    b, link, problem, source = bad[0]
+    why = (f"{link} is missing or not the real runtime ({problem}). SteamVR Home's launcher needs it: without it Home "
+           "never appears and games do not start, while SteamVR keeps trying. Steam's newer layout (bin -> steamrt32) "
+           "leaves it out.")
+    if problem == "stub folder":
+        return result("steamruntime", title, "warn", why + " It is a folder of Steam's own, so it is left alone: "
+                      "restart Steam, and if it stays, report it on issue #7.")
+    if source is None:
+        return result("steamruntime", title, "error", why + " No real one is installed to link to: in Steam's Library, "
+                      "under Tools, install \"Steam Linux Runtime 1.0 (scout)\", then run `riftlinux-setup repair`.")
+
+    def fix():
+        for s in bad:
+            steam_runtime_fix(s)
+
+    return result("steamruntime", title, "fix", why + f" It will be linked to {source}.", fix, "user")
 
 
 def check_package(p, opts):
@@ -1023,6 +1145,335 @@ def check_nvidia_vrr(p, opts):
     return result("nvidia-vrr", title, "warn", detail)
 
 
+def lsfg_vk_manifest():
+    """The manifest an installed lsfg-vk (Lossless Scaling's frame generation for Linux) gives the Vulkan loader: an
+    implicit layer, loaded into every Vulkan program that does not set DISABLE_LSFGVK. None when not installed."""
+    layers = "/vulkan/implicit_layer.d"
+    dirs = []
+    for var in ("VK_IMPLICIT_LAYER_PATH", "VK_ADD_IMPLICIT_LAYER_PATH"):
+        dirs += [d for d in os.environ.get(var, "").split(":") if d]
+    home = os.path.expanduser("~")
+    dirs.append((os.environ.get("XDG_DATA_HOME") or os.path.join(home, ".local/share")) + layers)
+    dirs.append((os.environ.get("XDG_CONFIG_HOME") or os.path.join(home, ".config")) + layers)
+    dirs += [d + layers for d in (os.environ.get("XDG_DATA_DIRS") or "/usr/local/share:/usr/share").split(":") if d]
+    dirs += ["/etc/xdg" + layers, "/etc" + layers]
+    for d in dirs:
+        try:
+            names = sorted(os.listdir(d))
+        except OSError:
+            continue
+        for n in names:
+            if n.lower().endswith(".json") and "lsfg" in n.lower():
+                return os.path.join(d, n)
+    return None
+
+
+def check_lsfg_vk(p, opts):
+    title = "Lossless Scaling frame generation (lsfg-vk)"
+    manifest = lsfg_vk_manifest()
+    if manifest is None:
+        return result("lsfg-vk", title, "ok", "Not installed.")
+    s = load_settings(p)
+    display = s.get("display") if isinstance(s.get("display"), dict) else {}
+    where = manifest.replace(os.path.expanduser("~"), "~", 1)
+    if display.get("lsfg_vk") is True:
+        return result("lsfg-vk", title, "warn",
+                      f"Installed ({where}) and allowed in SteamVR's server and RiftLinux's runtime: it has crashed "
+                      "SteamVR's server as RiftLinux's display started, and SteamVR then blocks the driver. "
+                      "`riftlinux-setup lsfg-vk off` keeps it out of them (games keep it).")
+    return result("lsfg-vk", title, "ok",
+                  f"Installed ({where}): kept out of SteamVR's server and RiftLinux's runtime, where it crashed "
+                  "SteamVR; games keep it.")
+
+
+def check_ipd(p, opts):
+    title = "IPD (distance between the eyes)"
+    s = load_settings(p)
+    headset = s.get("headset") if isinstance(s.get("headset"), dict) else {}
+    mm = headset.get("ipd_mm")
+    if isinstance(mm, (int, float)) and not isinstance(mm, bool) and mm > 0:
+        return result("ipd", title, "info",
+                      f"Set by hand to {min(max(mm, 50), 80):.1f} mm (headset.ipd_mm); the headset's IPD slider is not "
+                      "followed. `riftlinux-setup ipd auto` follows it again.")
+    return result("ipd", title, "ok",
+                  "Follows the headset's IPD slider. If the headset always shows 57.5 mm wherever the slider is, its "
+                  "slider's sensor does not report: set your IPD with `riftlinux-setup ipd <mm>` or in the Rift tab.")
+
+
+def controller_alignment_files():
+    """The controllers' alignments learned in the background, in the own runtime's config and every Steam's."""
+    found = []
+    for _, config_dir, _, _ in steam_installs():
+        d = os.path.join(config_dir, "monado", "rift")
+        try:
+            names = sorted(os.listdir(d))
+        except OSError:
+            continue
+        found += [os.path.join(d, n) for n in names if n.startswith("touch_") and n.endswith("_imu_align.txt")]
+    return found
+
+
+def read_controller_alignment(path):
+    """(serial, used, turn degrees, bias m/s2) of a saved alignment, or None when it does not read right."""
+    try:
+        v = open(path).read().split()
+        q = [float(x) for x in v[0:4]]
+        b = [float(x) for x in v[4:7]]
+        used = int(v[7]) == 1
+    except (OSError, ValueError, IndexError):
+        return None
+    serial = os.path.basename(path)[len("touch_"):-len("_imu_align.txt")]
+    turn = math.degrees(2 * math.acos(min(1.0, abs(q[3]))))
+    return serial, used, turn, math.sqrt(sum(x * x for x in b))
+
+
+def check_controller_alignment(p, opts):
+    title = "Controller alignment (learned)"
+    s = load_settings(p)
+    controllers = s.get("controllers") if isinstance(s.get("controllers"), dict) else {}
+    if controllers.get("imu_align") is False:
+        return result("controller_alignment", title, "info",
+                      "Off (controllers.imu_align): a controller whose motion sensor disagrees with its LEDs is "
+                      "tracked as before. `riftlinux-setup controller-alignment on` learns it again.")
+    used = [a for a in (read_controller_alignment(f) for f in controller_alignment_files()) if a and a[1]]
+    if used:
+        text = "; ".join(f"{a[0]}: turned {a[2]:.1f} degrees, accelerometer {a[3]:.2f} m/s2 off" for a in used)
+        return result("controller_alignment", title, "info",
+                      f"In use, learned from how the sensors see it: {text}. Checked again at every start.")
+    return result("controller_alignment", title, "ok",
+                  "Nothing learned: the controllers' motion sensors agree with their LEDs (it is learned by itself "
+                  "if one does not).")
+
+
+def cmd_controller_alignment(p, opts):
+    """A controller's alignment learned in the background (how its motion sensor sits against its LEDs, its
+    accelerometer's bias): from 3 degrees off the gravity check allows for it, from 6 everything is corrected and it is
+    kept. settings.json controllers.imu_align false: off."""
+    if opts.mode in ("on", "off"):
+        s = load_settings(p)
+        c = s.get("controllers") if isinstance(s.get("controllers"), dict) else {}
+        if opts.mode == "on":
+            c.pop("imu_align", None)
+        else:
+            c["imu_align"] = False
+        if c:
+            s["controllers"] = c
+        else:
+            s.pop("controllers", None)
+        write_json(p.settings, s)
+        print("On: learned by itself when a controller needs it (from the next start)." if opts.mode == "on" else
+              "Off: every controller tracked as before, nothing learned or used (from the next start).")
+        return 0
+    if opts.mode == "forget":
+        if busy_runtime():
+            print("Close SteamVR and riftlinux-runtime first: what they have learned is saved as they run.")
+            return 1
+        files = controller_alignment_files()
+        for f in files:
+            os.remove(f)
+            print("Removed " + f.replace(HOME, "~", 1))
+        print("Nothing kept: learned again if a controller needs it." if files else "Nothing was kept.")
+        return 0
+    report([check_controller_alignment(p, opts)], opts.json)
+    return 0
+
+
+def check_controller_coast(p, opts):
+    title = "Controller out of view"
+    s = load_settings(p)
+    controllers = s.get("controllers") if isinstance(s.get("controllers"), dict) else {}
+    ms = controllers.get("coast_ms")
+    if isinstance(ms, (int, float)) and not isinstance(ms, bool):
+        return result("controller_coast", title, "info",
+                      f"Carried on by its motion sensor for {int(min(max(ms, 150), 2000))} ms (controllers.coast_ms), "
+                      "then held. `riftlinux-setup controller-coast 1000` is the default.")
+    return result("controller_coast", title, "ok", "Carried on by its motion sensor for a second, then held.")
+
+
+def cmd_controller_tracking(p, opts):
+    """settings.json controllers.tracking: "0.1.4" brings back the controllers' tracking as it was up to RiftLinux 0.1.4,
+    should the newer one not suit a setup. Read when SteamVR or the runtime starts."""
+    s = load_settings(p)
+    c = s.get("controllers") if isinstance(s.get("controllers"), dict) else {}
+    if opts.mode == "status":
+        print("As up to RiftLinux 0.1.4" if c.get("tracking") == "0.1.4" else "The current controller tracking")
+        return 0
+    if opts.mode == "current":
+        c.pop("tracking", None)
+    else:
+        c["tracking"] = "0.1.4"
+    if c:
+        s["controllers"] = c
+    else:
+        s.pop("controllers", None)
+    write_json(p.settings, s)
+    print("The current controller tracking (from the next start)." if opts.mode == "current" else
+          "The controllers' tracking as up to RiftLinux 0.1.4 (from the next start). If you need this, please report it, "
+          "with your recording: `riftlinux-setup record on`.")
+    return 0
+
+
+def cmd_controller_coast(p, opts):
+    """settings.json controllers.coast_ms: how long a Touch controller the sensors no longer see is carried on by its
+    motion sensor before it is held where it is. 1000, as the Oculus runtime, is the default; 300 was RiftLinux's before.
+    Read when SteamVR or the runtime starts."""
+    if opts.value == "status":
+        report([check_controller_coast(p, opts)], opts.json)
+        return 0
+    try:
+        ms = int(opts.value)
+    except ValueError:
+        print(f"Not a time: {opts.value} (give milliseconds, 150 to 2000, or status).")
+        return 2
+    if not 150 <= ms <= 2000:
+        print(f"{ms} ms is outside 150 to 2000.")
+        return 2
+    s = load_settings(p)
+    c = s.get("controllers") if isinstance(s.get("controllers"), dict) else {}
+    if ms == 1000:
+        c.pop("coast_ms", None)
+    else:
+        c["coast_ms"] = ms
+    if c:
+        s["controllers"] = c
+    else:
+        s.pop("controllers", None)
+    write_json(p.settings, s)
+    print(f"A controller out of view is carried on for {ms} ms, then held (from the next start).")
+    return 0
+
+
+def ipd_slider_mm(raw):
+    """The IPD slider's reading as millimetres, as the driver has it (rift_ipd_slider_mm)."""
+    return min(max(57.534 + 0.00365 * raw, 57.5), 72.5)
+
+
+def ipd_test(p, seconds=30):
+    """The headset's IPD slider read for a while (SteamVR and the own runtime closed), one line a second."""
+    import select
+    import time
+    busy = busy_runtime()
+    if busy:
+        print(f"{busy} is running and has the headset: close SteamVR (or the runtime) first.")
+        return 1
+    path = cv1_hidraw(0)
+    if not path:
+        print("No Rift CV1 headset found (plug it in, or no access yet: riftlinux-setup check).")
+        return 1
+    try:
+        fd = os.open(path, os.O_RDWR | os.O_NONBLOCK)
+    except OSError as e:
+        print(f"Cannot open {path}: {e.strerror} (riftlinux-setup check shows the device rules).")
+        return 1
+    print(f"Reading the IPD slider for {seconds} s: move it slowly from one end to the other, and back.")
+    keep_alive = bytes([0x11, 0x00, 0x00, 0x0B, 0x10, 0x27])  # the driver's: sensor reports for 10 s
+    lo_all, hi_all = None, None
+    try:
+        hid_set_feature(fd, keep_alive)
+        start = last_keep_alive = second_start = time.monotonic()
+        lo = hi = None
+        while time.monotonic() - start < seconds:
+            now = time.monotonic()
+            if now - last_keep_alive > 9.5:
+                hid_set_feature(fd, keep_alive)
+                last_keep_alive = now
+            if now - second_start >= 1.0:
+                if lo is not None:
+                    print(f"  {now - start:4.0f} s  reading {lo}-{hi}  ({ipd_slider_mm(lo):.1f}-{ipd_slider_mm(hi):.1f} mm)")
+                lo = hi = None
+                second_start = now
+            ready, _, _ = select.select([fd], [], [], 0.2)
+            if not ready:
+                continue
+            try:
+                buf = os.read(fd, 64)
+            except BlockingIOError:
+                continue
+            if len(buf) < 64 or buf[0] != 0x0B:
+                continue
+            raw = buf[46] | (buf[47] << 8)
+            lo = raw if lo is None else min(lo, raw)
+            hi = raw if hi is None else max(hi, raw)
+            lo_all = raw if lo_all is None else min(lo_all, raw)
+            hi_all = raw if hi_all is None else max(hi_all, raw)
+    finally:
+        os.close(fd)
+    if lo_all is None:
+        print("No reports from the headset.")
+        return 1
+    print(f"From {ipd_slider_mm(lo_all):.1f} to {ipd_slider_mm(hi_all):.1f} mm (readings {lo_all}-{hi_all}).")
+    # The reading jitters by a few steps at rest; 0.5 mm is about 140 steps.
+    if hi_all - lo_all < 140:
+        print("The reading hardly changed. If you moved the slider (the lenses move), its sensor does not report: "
+              "set your IPD by hand with riftlinux-setup ipd <mm> or in the Rift tab.")
+    return 0
+
+
+def cmd_ipd(p, opts):
+    """settings.json headset.ipd_mm: the distance between the eyes set by hand, for a headset whose IPD slider's sensor
+    does not report (the lenses move, the reading does not); absent or 0 follows the slider. Read when SteamVR or the
+    runtime starts; the Rift tab's IPD row changes it while they run."""
+    if opts.value == "status":
+        report([check_ipd(p, opts)], opts.json)
+        return 0
+    if opts.value == "test":
+        return ipd_test(p)
+    s = load_settings(p)
+    headset = s.get("headset") if isinstance(s.get("headset"), dict) else {}
+    if opts.value == "auto":
+        headset.pop("ipd_mm", None)
+    else:
+        try:
+            mm = float(opts.value.replace(",", "."))
+        except ValueError:
+            print(f"Not a distance: {opts.value} (give millimetres, for example 63.5, or auto).")
+            return 2
+        if not 50.0 <= mm <= 80.0:
+            print(f"{mm:g} mm is outside 50 to 80 mm.")
+            return 2
+        headset["ipd_mm"] = round(mm, 1)
+    if headset:
+        s["headset"] = headset
+    else:
+        s.pop("headset", None)
+    write_json(p.settings, s)
+    if opts.value == "auto":
+        print("Auto: the headset's IPD slider is followed (from SteamVR's or the runtime's next start; the Rift tab's "
+              "Auto button does it at once).")
+    else:
+        print(f"Set by hand: {round(float(opts.value.replace(',', '.')), 1):.1f} mm (from SteamVR's or the runtime's next "
+              "start; the Rift tab's IPD slider changes it at once). Set the headset's lenses to match.")
+    return 0
+
+
+def cmd_lsfg_vk(p, opts):
+    """settings.json display.lsfg_vk: false (the default) keeps lsfg-vk out of SteamVR's server, its helper and
+    RiftLinux's runtime (DISABLE_LSFGVK=1 set before they make a Vulkan instance); true lets it load there as before.
+    Read when SteamVR or the runtime starts."""
+    if opts.mode == "status":
+        report([check_lsfg_vk(p, opts)], opts.json)
+        return 0
+    s = load_settings(p)
+    display = s.get("display") if isinstance(s.get("display"), dict) else {}
+    if opts.mode == "off":
+        display.pop("lsfg_vk", None)
+    else:
+        display["lsfg_vk"] = True
+    if display:
+        s["display"] = display
+    else:
+        s.pop("display", None)
+    write_json(p.settings, s)
+    if opts.mode == "off":
+        print("Off: lsfg-vk is kept out of SteamVR's server and RiftLinux's runtime (from their next start); games "
+              "keep it.")
+    else:
+        print("On: lsfg-vk may load into SteamVR's server and RiftLinux's runtime again (from their next start). It "
+              "has crashed SteamVR's server there: if SteamVR then blocks the driver, `riftlinux-setup lsfg-vk off` "
+              "and `riftlinux-setup repair`.")
+    return 0
+
+
 def cmd_nvidia_vrr(p, opts):
     if opts.action == "status":
         report([check_nvidia_vrr(p, opts)], opts.json)
@@ -1084,9 +1535,12 @@ def check_enabled(p, opts):
     return result("enabled", "Driver enabled in SteamVR", "ok", "Enabled, not blocked.")
 
 
+USB_SYSFS = "/sys/bus/usb/devices"
+
+
 def usb_devices():
     devs = []
-    base = "/sys/bus/usb/devices"
+    base = USB_SYSFS
     try:
         names = os.listdir(base)
     except OSError:
@@ -1189,6 +1643,45 @@ def check_access(p, opts):
         return result("access", "Device access", "ok", f"{len(devs)} USB devices and {len(hid)} HID interfaces usable.")
     return result("access", "Device access", "fix", "No access to " + ", ".join(missing) + ": udev rules needed.",
                   None, "root", udev_root_cmds(p))
+
+
+def unbound_hid_interfaces(devs):
+    """The Rift's HID interfaces (headset, its radio, its audio) that no kernel driver has, so they have no hidraw
+    node. Another program can leave them so: one that took them from the kernel with libusb and never gave them back
+    (an earlier OpenHMD-based setup did, a user found). Returns (interfaces, how many HID interfaces in all)."""
+    out, total = [], 0
+    for d in devs:
+        name = os.path.basename(d["sysfs"])
+        try:
+            entries = sorted(os.listdir(d["sysfs"]))
+        except OSError:
+            continue
+        for e in entries:
+            intf = os.path.join(d["sysfs"], e)
+            if not e.startswith(name + ":") or sysfs(intf, "bInterfaceClass") != "03":
+                continue
+            total += 1
+            if not os.path.exists(os.path.join(intf, "driver")):
+                out.append({"interface": e, "name": d["name"]})
+    return out, total
+
+
+def check_hid_bound(p, opts):
+    title = "Headset's HID interfaces"
+    devs = usb_devices()
+    if not devs:
+        return result("hidbind", title, "info", "Plug in the Rift to check.")
+    unbound, total = unbound_hid_interfaces(devs)
+    if not unbound:
+        return result("hidbind", title, "ok", f"All {total} with the kernel's HID driver.")
+    names = ", ".join(f"{u['name']} ({u['interface']})" for u in unbound)
+    it = "it" if len(unbound) == 1 else "them"
+    cmds = ["modprobe usbhid"] + [f"sh -c 'echo {u['interface']} > /sys/bus/usb/drivers/usbhid/bind'" for u in unbound]
+    return result("hidbind", title, "fix",
+                  f"{names}: no kernel driver, so the driver cannot reach the headset through {it} (another program "
+                  f"took {it} from the kernel and did not give {it} back). Given back to the kernel's HID driver here; "
+                  "unplugging the headset's USB cable and plugging it in again does the same.",
+                  None, "root", cmds)
 
 
 def check_usb_power(p, opts):
@@ -1846,13 +2339,14 @@ def check_headset_mode(p, opts):
                   "will be restarted into normal mode.", fix, "user")
 
 
-CHECKS = [check_arch, check_steam, check_package, check_registered, check_other_drivers, check_sandboxed, check_nvidia_vrr, check_enabled, check_devices,
-          check_lsusb, check_access, check_usb_power, check_holders, check_headset_mode, check_display, check_priority,
+CHECKS = [check_arch, check_steam, check_steam_runtime, check_package, check_registered, check_other_drivers, check_sandboxed, check_nvidia_vrr, check_lsfg_vk, check_ipd, check_controller_alignment, check_controller_coast, check_enabled, check_devices,
+          check_lsusb, check_access, check_hid_bound, check_usb_power, check_holders, check_headset_mode, check_display, check_priority,
           check_openvr_runtime, check_steamvr_launch, check_steamvr_tool, check_env_overrides, check_launch_options,
           check_leaked_handles, check_steamvr_home_leftover, check_test_leftovers, check_proton_probe,
           check_watchdog_loaded, check_openxr, check_chaperone,
           check_settings, check_realtime, check_calibration, check_native]
-REPAIR = {"enabled", "priority", "room", "settings", "registered", "others", "sandboxed", "usbpower", "lsusb", "launch"}
+REPAIR = {"enabled", "priority", "room", "settings", "registered", "others", "sandboxed", "usbpower", "lsusb", "launch",
+          "hidbind", "steamruntime"}
 
 
 # --------------------------------------------------------------------------------------------------------------------
@@ -2687,6 +3181,17 @@ def cmd_register(p, opts):
         # The driver is built for x86-64: registered here, SteamVR could only fail to load it.
         log("not an x86-64 computer: the driver is not registered")
         return 0
+    # Steam's newer layout leaves out the runtime SteamVR Home's launcher needs (issue #7): linked again at each login
+    # and headset plug-in, as Steam may update in between. The older layout has it and is left as it is.
+    for state in steam_runtime_states():
+        try:
+            target = steam_runtime_fix(state)
+        except OSError as e:
+            log(f"could not link {state[1]} for SteamVR Home: {e}")
+            continue
+        if target:
+            what = "was missing" if state[2] == "missing" else "led to a stub"
+            log(f"{state[1]} {what} (Steam's newer layout): linked to {target} for SteamVR Home")
     sysdir = system_package_dir()
     src = sysdir or (p.package if os.path.exists(p.manifest) else None)
     if src is None:
@@ -3119,6 +3624,12 @@ def main():
     au = sub.add_parser("autostart")
     au.add_argument("mode", choices=["on", "off", "status", "trigger", "quit-unused"])
     au.add_argument("value", nargs="?")
+    ca = sub.add_parser("controller-alignment")
+    ca.add_argument("mode", choices=["status", "on", "off", "forget"])
+    ct = sub.add_parser("controller-tracking")
+    ct.add_argument("mode", choices=["current", "0.1.4", "status"])
+    cc2 = sub.add_parser("controller-coast")
+    cc2.add_argument("value", help="milliseconds (150 to 2000) or status")
     cs = sub.add_parser("controller-sleep")
     cs.add_argument("mode", choices=["3", "5", "7", "off", "status"])
     sb = sub.add_parser("standby")
@@ -3127,6 +3638,10 @@ def main():
     gm.add_argument("mode", choices=["close", "keep", "status"])
     bb = sub.add_parser("backdrop-blur")
     bb.add_argument("mode", choices=["on", "off", "status"])
+    lv = sub.add_parser("lsfg-vk")
+    lv.add_argument("mode", choices=["off", "on", "status"])
+    ip = sub.add_parser("ipd")
+    ip.add_argument("value", help="millimetres (50 to 80), auto, status or test")
     ws = sub.add_parser("wear-sensor")
     ws.add_argument("mode", choices=["on", "off", "status", "test", "levels", "motion"])
     ws.add_argument("values", nargs="*")
@@ -3161,6 +3676,12 @@ def main():
         return cmd_record(p, opts)
     if opts.cmd == "autostart":
         return cmd_autostart(p, opts)
+    if opts.cmd == "controller-alignment":
+        return cmd_controller_alignment(p, opts)
+    if opts.cmd == "controller-tracking":
+        return cmd_controller_tracking(p, opts)
+    if opts.cmd == "controller-coast":
+        return cmd_controller_coast(p, opts)
     if opts.cmd == "controller-sleep":
         return cmd_controller_sleep(p, opts)
     if opts.cmd == "standby":
@@ -3169,6 +3690,10 @@ def main():
         return cmd_game_menu(p, opts)
     if opts.cmd == "backdrop-blur":
         return cmd_backdrop_blur(p, opts)
+    if opts.cmd == "lsfg-vk":
+        return cmd_lsfg_vk(p, opts)
+    if opts.cmd == "ipd":
+        return cmd_ipd(p, opts)
     if opts.cmd == "wear-sensor":
         return cmd_wear_sensor(p, opts)
     if opts.cmd == "display-off":

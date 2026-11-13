@@ -284,6 +284,11 @@ client_vk_swapchain_destroy(struct xrt_swapchain *xsc)
 			sc->release[i] = VK_NULL_HANDLE;
 		}
 	}
+	// Freed command buffers' memory stays with the pool, and drivers need not reuse it for the next swapchain's:
+	// given back here, or an application that makes swapchains over and over grows (NVIDIA: by every swapchain made).
+	if (c->trim_pool != NULL) {
+		c->trim_pool(vk->device, c->pool.pool, 0);
+	}
 	vk_cmd_pool_unlock(&c->pool);
 
 	for (uint32_t i = 0; i < sc->base.base.image_count; i++) {
@@ -894,6 +899,11 @@ client_vk_compositor_create(struct xrt_compositor_native *xcn,
 	}
 
 	VK_NAME_COMMAND_POOL(&c->vk, c->pool.pool, "client_vk_compositor command pool");
+
+	c->trim_pool = (PFN_vkTrimCommandPool)c->vk.vkGetDeviceProcAddr(c->vk.device, "vkTrimCommandPool");
+	if (c->trim_pool == NULL) {
+		c->trim_pool = (PFN_vkTrimCommandPool)c->vk.vkGetDeviceProcAddr(c->vk.device, "vkTrimCommandPoolKHR");
+	}
 
 #ifdef VK_KHR_timeline_semaphore
 	if (vk_can_import_and_export_timeline_semaphore(&c->vk)) {

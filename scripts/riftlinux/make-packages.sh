@@ -10,7 +10,10 @@
 # Layout installed (same for both):
 #   /usr/lib/riftlinux/steamvr/rift-cv1/        the SteamVR driver (each user gets a copy SteamVR's container can see)
 #   /usr/lib/riftlinux/native/                  RiftLinux's own OpenXR runtime (monado-service, libopenxr_monado.so,
-#                                               openxr_riftlinux.json), for OpenXR applications without SteamVR
+#                                               libmonado.so with monado.h for applications that switch between apps,
+#                                               openxr_riftlinux.json; openxr_riftlinux_fullpath.json and
+#                                               openxr_riftlinux_flatpak.json name the library by its full path),
+#                                               for OpenXR applications without SteamVR
 #   /usr/bin/riftlinux-setup                    check / repair / pair; `register` runs by itself
 #   /usr/bin/riftlinux-runtime                  starts (and --stop stops) the own runtime
 #   /usr/bin/riftlinux-run                      runs an OpenXR application on it, starting and stopping it
@@ -47,7 +50,11 @@ echo "$VER" > "$R/usr/lib/riftlinux/steamvr/rift-cv1/VERSION"
 rm -rf "$R/usr/lib/riftlinux/steamvr/rift-cv1/riftlinux-setup" "$R/usr/lib/riftlinux/steamvr/rift-cv1/udev"
 install -m 0755 "$SRC/scripts/riftlinux/riftlinux-setup" "$R/usr/bin/riftlinux-setup"
 install -m 0755 "$NAT/monado-service" "$NAT/libopenxr_monado.so" "$R/usr/lib/riftlinux/native/"
-install -m 0644 "$NAT/openxr_riftlinux.json" "$R/usr/lib/riftlinux/native/"
+install -m 0755 "$NAT/libmonado.so.25" "$R/usr/lib/riftlinux/native/"
+ln -s libmonado.so.25 "$R/usr/lib/riftlinux/native/libmonado.so"
+install -m 0644 "$NAT/monado.h" "$R/usr/lib/riftlinux/native/"
+install -m 0644 "$NAT/openxr_riftlinux.json" "$NAT/openxr_riftlinux_fullpath.json" "$NAT/openxr_riftlinux_flatpak.json" \
+	"$R/usr/lib/riftlinux/native/"
 install -m 0755 "$SRC/scripts/riftlinux/packaging/riftlinux-runtime" "$R/usr/bin/riftlinux-runtime"
 install -m 0755 "$SRC/scripts/riftlinux/packaging/riftlinux-run" "$R/usr/bin/riftlinux-run"
 install -m 0644 "$SRC/scripts/riftlinux/packaging/riftlinux-runtime.desktop" "$R/usr/share/applications/"

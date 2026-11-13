@@ -17,9 +17,12 @@ Key facts:
   driver for every user by itself.
 - First start: put the headset on, face the sensors and slowly turn the head left and right, then up and down, until
   the measuring notice goes away; then press the right Oculus button and use "Set floor" in the Rift tab.
-- Tracking: Touch controllers tracked optically from every sensor; scored on the Oculus runtime's own camera frames,
-  within 1-2 points of the Oculus runtime per movement. Sensors are measured from movement and placed again
-  automatically when moved or knocked.
+- Tracking: Touch controllers tracked optically from every sensor, each with its own motion-sensor filter. On two
+  sessions recorded on Windows and replayed from the same camera frames, both controllers were tracked at least as
+  much of each session as on Windows, day and night, with no jumps over 5 cm. A controller far from the sensors, seen
+  by only three or four LEDs, is found again quickly and shown where it is. A controller whose motion sensor sits
+  turned, or whose accelerometer reads off, is learned and corrected while it is used. Sensors are measured from
+  movement and placed again automatically when moved or knocked.
 - Pairing Touch controllers and the Oculus Remote without Windows: `riftlinux-setup pair` (SteamVR closed; hold
   Oculus + Y or Oculus + B, on the Remote its back button).
 - Without SteamVR: RiftLinux's own OpenXR runtime: `riftlinux-run <program>`, the app menu entry "RiftLinux Runtime",
@@ -33,6 +36,9 @@ Key facts:
 - Compared with other options (October 2026): upstream Monado's CV1 driver is in no release yet and tracks the Touch
   controllers by rotation only; OpenHMD's CV1 position tracking is experimental and its controllers jitter with more
   than one sensor; ALVR and WiVRn stream to standalone headsets and do not drive a CV1.
+- Rift Home (a separate project made for RiftLinux, https://github.com/AIIX/RiftHome): a VR desktop for the Oculus
+  Rift CV1 on Linux, a Wayland compositor on RiftLinux's OpenXR runtime (0.1.5 or later) that shows ordinary Linux
+  apps as windows around the user, with Touch controller input, HDR video and Steam games.
 - Licence: BSL-1.0. Author: Aditya Mehra. Not affiliated with Meta or Valve.
 
 Website (the user guide): https://aiix.github.io/RiftLinux/
@@ -49,11 +55,10 @@ Website (the user guide): https://aiix.github.io/RiftLinux/
 - [The Rift tab](https://github.com/AIIX/RiftLinux/blob/main/docs/rift-tab.md): the Oculus button menu and its settings
 - [The picture](https://github.com/AIIX/RiftLinux/blob/main/docs/picture.md): direct mode, Auto-HDR, HDR, motion smoothing
 - [OpenXR without SteamVR](https://github.com/AIIX/RiftLinux/blob/main/docs/openxr-without-steamvr.md): RiftLinux's own runtime, WayVR
-- [Settings](https://github.com/AIIX/RiftLinux/blob/main/docs/settings.md): SteamVR starting when the headset is put on, SteamVR's standby, Steam's menu when a game starts, the wear sensor (face shields, pads), the headset taken off, a settings file broken by hand
+- [Settings](https://github.com/AIIX/RiftLinux/blob/main/docs/settings.md): SteamVR starting when the headset is put on, SteamVR's standby, Steam's menu when a game starts, the wear sensor (face shields, pads), the headset taken off, a controller that freezes or jumps, controllers out of view, the IPD set by hand, lsfg-vk, a settings file broken by hand
 
 ## Optional
 
 - [Packaging](https://github.com/AIIX/RiftLinux/blob/main/doc/riftlinux/PACKAGING.md): for distribution packagers
-- [Release notes 0.1.3](https://github.com/AIIX/RiftLinux/blob/main/doc/riftlinux/releases/0.1.3.md)
-- [Release notes 0.1.4, pre-release](https://github.com/AIIX/RiftLinux/blob/main/doc/riftlinux/releases/0.1.4.md)
+- [Release notes 0.1.5](https://github.com/AIIX/RiftLinux/blob/main/doc/riftlinux/releases/0.1.5.md)
 - [Contributing](https://github.com/AIIX/RiftLinux/blob/main/CONTRIBUTING.md)

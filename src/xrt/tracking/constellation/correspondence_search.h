@@ -97,6 +97,9 @@ struct cs_model_info
 	float gravity_tolerance_rad;
 };
 
+//! Devices a search keeps its place for.
+#define CS_RESUME_SLOTS 8
+
 struct correspondence_search
 {
 	const enum u_logging_level *ct_log_level;
@@ -109,6 +112,8 @@ struct correspondence_search
 	unsigned int num_pose_checks;
 	//! Searches that ran out of time, see CONSTELLATION_TRACKER_SEARCH_BUDGET_MS; the caller may reset it.
 	unsigned int num_timeouts;
+	//! Where a search out of time goes on from, by device.
+	int resume_led[CS_RESUME_SLOTS];
 
 	struct camera_model *calib;
 

@@ -35,6 +35,8 @@
  * not even shut down. What it found by then is still used.
  */
 DEBUG_GET_ONCE_NUM_OPTION(constellation_tracker_search_budget_ms, "CONSTELLATION_TRACKER_SEARCH_BUDGET_MS", 50)
+//! Whether a search out of time goes on next time from the LED it stopped at, see search_pose_for_model.
+DEBUG_GET_ONCE_BOOL_OPTION(constellation_tracker_search_resume, "CONSTELLATION_TRACKER_SEARCH_RESUME", true)
 #include <math.h>
 
 
@@ -485,7 +487,7 @@ check_led_against_model_subset(struct correspondence_search *cs,
 				              "LED %d @ %f %f %f projected to %f %f %f (err %f)",
 				              pose.orientation.x, pose.orientation.y, pose.orientation.z,
 				              pose.orientation.w, pose.position.x, pose.position.y, pose.position.z, p,
-				              tmpblob.x, tmpblob.y, tmpblob.z, checkpos.x, checkpos.y, checkpos.z, l);
+				              tmpblob.x, tmpblob.y, tmpblob.z, checkpos.x, checkpos.y, checkpos.z, sqrtf(l_sq));
 				checks_failed = true;
 				break; // @todo: Figure out why this happened
 			}
@@ -855,9 +857,20 @@ search_pose_for_model(struct correspondence_search *cs, struct cs_model_info *mi
 	}
 
 
-	// Start correspondence search for this model.
-	// At this stage, each image point has a list of the nearest neighbours filtered for this model
-	for (l = 0; l < model->num_points; l++) {
+	/*
+	 * Start correspondence search for this model.
+	 * At this stage, each image point has a list of the nearest neighbours filtered for this model
+	 *
+	 * RiftLinux: a search out of time goes on next time from the LED it stopped at. From the first LED each time, a
+	 * controller lying still among static spots, its blobs the same frame after frame, had the search run out of time at
+	 * the same place every time and was never found (two minutes, in a user's report).
+	 */
+	const size_t resume_slot = (size_t)mi->id % CS_RESUME_SLOTS;
+	const int first = debug_get_bool_option_constellation_tracker_search_resume() && model->num_points > 0
+	                      ? cs->resume_led[resume_slot] % model->num_points
+	                      : 0;
+	for (int i = 0; i < model->num_points; i++) {
+		l = (first + i) % model->num_points;
 		struct t_constellation_search_led_candidate *c = model->points[l];
 		mi->led_index = l;
 
@@ -868,6 +881,7 @@ search_pose_for_model(struct correspondence_search *cs, struct cs_model_info *mi
 			break;
 		}
 	}
+	cs->resume_led[resume_slot] = mi->timed_out ? mi->led_index : 0;
 
 	return (mi->match_flags & POSE_MATCH_GOOD);
 }

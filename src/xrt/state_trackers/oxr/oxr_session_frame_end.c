@@ -1586,6 +1586,20 @@ submit_projection_layer(struct oxr_session *sess,
 	fill_in_color_scale_bias(sess, (XrCompositionLayerBaseHeader *)proj, &data);
 	fill_in_hdr(sess, (XrCompositionLayerBaseHeader *)proj, &data);
 	fill_in_y_flip(sess, (XrCompositionLayerBaseHeader *)proj, &data);
+	// See quirks.negated_fov_means_flip: every view upside down (up below the centre, down above it).
+	if (sess->sys->inst->quirks.negated_fov_means_flip && proj->viewCount > 0) {
+		bool negated = true;
+		for (uint32_t i = 0; i < proj->viewCount; i++) {
+			negated = negated && data.proj.v[i].fov.angle_up < 0.0f && data.proj.v[i].fov.angle_down > 0.0f;
+		}
+		if (negated) {
+			for (uint32_t i = 0; i < proj->viewCount; i++) {
+				data.proj.v[i].fov.angle_up = -data.proj.v[i].fov.angle_up;
+				data.proj.v[i].fov.angle_down = -data.proj.v[i].fov.angle_down;
+			}
+			data.flip_y = !data.flip_y;
+		}
+	}
 	fill_in_blend_factors(sess, (XrCompositionLayerBaseHeader *)proj, &data);
 	fill_in_layer_settings(sess, (XrCompositionLayerBaseHeader *)proj, &data);
 

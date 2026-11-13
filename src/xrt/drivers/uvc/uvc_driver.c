@@ -795,6 +795,25 @@ error:
 	return ret;
 }
 
+void
+uvc_fs_release_usb(struct xrt_fs *xfs)
+{
+	struct uvc_fs *stream = uvc_fs(xfs);
+
+	assert(!stream->is_running);
+
+	if (stream->transfer != NULL) {
+		for (size_t i = 0; i < stream->num_transfers; i++) {
+			if (stream->transfer[i] != NULL) {
+				libusb_free_transfer(stream->transfer[i]);
+				stream->transfer[i] = NULL;
+			}
+		}
+		free(stream->transfer);
+		stream->transfer = NULL;
+	}
+}
+
 int
 uvc_fs_destroy(struct xrt_fs *xfs)
 {

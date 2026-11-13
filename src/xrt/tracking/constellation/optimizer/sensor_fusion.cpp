@@ -93,6 +93,8 @@ DEBUG_GET_ONCE_NUM_OPTION(sensor_fusion_neck_back_mm, "T_CONSTELLATION_SENSOR_FU
  * processCameraSampleLocked: 0 none, 1 the one worn on the head, 2 every device.
  */
 DEBUG_GET_ONCE_NUM_OPTION(sensor_fusion_gap_restart, "T_CONSTELLATION_SENSOR_FUSION_GAP_RESTART", 1)
+//! A controller seen again after longer than this starts its window over, see processCameraSampleLocked. 0: never.
+DEBUG_GET_ONCE_NUM_OPTION(sensor_fusion_touch_gap_ms, "T_CONSTELLATION_SENSOR_FUSION_TOUCH_GAP_MS", 0)
 /*
  * Whose queries at the latest solve's own time, or before an IMU sample has come in after it, get that solve as it is
  * (see getTrackedPose): 0 nobody's (the relation history, as before), 1 applications', 2 the tracker's too.
@@ -109,6 +111,22 @@ DEBUG_GET_ONCE_NUM_OPTION(sensor_fusion_at_solve, "T_CONSTELLATION_SENSOR_FUSION
  * (p95 0.0055 -> 0.0094 degrees).
  */
 DEBUG_GET_ONCE_FLOAT_OPTION(sensor_fusion_head_accel_noise, "T_CONSTELLATION_SENSOR_FUSION_HEAD_ACCEL_NOISE", 5.0f)
+/*
+ * The same for a Touch controller. At the datasheet's (1) the fusion followed the accelerometer through a fast punch
+ * (to 100 m/s2, where its scale error alone is metres a second squared; the Oculus runtime's own accelerometer noise
+ * grows with the acceleration) and left the camera's poses by 10-30 cm, which the app layer then held.
+ */
+// 5: against the Oculus captures the left controller's 90th percentile 21.2 -> 14.7 mm at night, 28.7 -> 21.3 by day,
+// rotation about a degree better, the left's time more than 10 cm off 0.27 -> 0.15 % at night; the punch session's
+// left held 1.80 -> 0.98 s. Cost: by day the right lost one 0.1 s bin (95.9 -> 95.7 %), resting shake +0.02-0.06 mm
+// at the median on the right. 3 kept more >10 cm; 10 shook more.
+DEBUG_GET_ONCE_FLOAT_OPTION(sensor_fusion_touch_accel_noise, "T_CONSTELLATION_SENSOR_FUSION_TOUCH_ACCEL_NOISE", 5.0f)
+/*!
+ * A camera pose from this many LEDs or fewer weighs as if each LED's blob were this many times less sure (0: as any
+ * other). Test switch: a pose from 3-5 LEDs jitters 4 cm and more in depth from one to the next.
+ */
+DEBUG_GET_ONCE_NUM_OPTION(sensor_fusion_few_led_count, "T_CONSTELLATION_SENSOR_FUSION_FEW_LED_COUNT", 5)
+DEBUG_GET_ONCE_FLOAT_OPTION(sensor_fusion_few_led_sigma_scale, "T_CONSTELLATION_SENSOR_FUSION_FEW_LED_SIGMA_SCALE", 0.0f)
 /*
  * The IMU -> model rotation stays what calibration gave it (identity for a Touch, whose factory matrix already turns
  * the gyro into the model's axes, within 0.5 degrees of what Oculus tracked). Left free in every window it wandered off
@@ -468,6 +486,11 @@ struct StaticCameraObservationCostFunctor
 		const Quaternion<T> Q_cam_model =
 		    Quaternion<T>(predicted_T_camera_imu.rotation()) * predicted_imu_extrinsics.Q_imu_model;
 
+		const double few_scale = debug_get_float_option_sensor_fusion_few_led_sigma_scale();
+		const double sigma_px =
+		    few_scale > 0.0 && observation.num_points <= (size_t)debug_get_num_option_sensor_fusion_few_led_count()
+		        ? kBlobPositionSigmaPixels * few_scale
+		        : kBlobPositionSigmaPixels;
 		for (size_t i = 0; i < observation.num_points; i++) {
 			const auto blob_position_2d = map_vec2(this->observation.points2d[i]).cast<T>();
 			const auto T_model_led = map_vec3(this->observation.points3d[i]).cast<T>();
@@ -480,7 +503,7 @@ struct StaticCameraObservationCostFunctor
 			                      T_model_led,                          //
 			                      residual);                            //
 
-			residual /= T(kBlobPositionSigmaPixels);
+			residual /= T(sigma_px);
 		}
 
 		return true;
@@ -1181,6 +1204,21 @@ constexpr timepoint_ns kUnseenHoldMaxStepNs = 20 * U_TIME_1MS_IN_NS;
 //! How far back a hold that fell behind the IMU buffer turns from: the newest samples it still holds (it holds 5 s).
 constexpr timepoint_ns kUnseenHoldRecollectNs = static_cast<timepoint_ns>(4500) * U_TIME_1MS_IN_NS;
 
+/*
+ * The clock a solve's correction is taken in on: the monotonic one, or the recording's in a replay, which runs at any
+ * speed: on the monotonic clock its scores depended on how fast the machine happened to run it (the same build, 0.3 mm at
+ * the median), which no live session does.
+ */
+static std::atomic<timepoint_ns> g_blend_clock_ns{0};
+
+static timepoint_ns
+blendNowNs()
+{
+	const timepoint_ns replay_ns = g_blend_clock_ns.load(std::memory_order_relaxed);
+	return replay_ns != 0 ? replay_ns : static_cast<timepoint_ns>(os_monotonic_get_ns());
+}
+
+
 //! What is left at @p now_ns of a blend offset set at @p set_ns.
 static xrt_vec3
 decayedBlendOffset(const xrt_vec3 &offset, timepoint_ns set_ns, timepoint_ns now_ns)
@@ -1434,6 +1472,12 @@ integrateToTimestamp(const double world_gravity_mag,
 }; // namespace
 
 namespace xrt::tracking::constellation::optimizer::sensor_fusion {
+
+void
+sensorFusionSetReplayClock(timepoint_ns now_ns)
+{
+	g_blend_clock_ns.store(now_ns, std::memory_order_relaxed);
+}
 
 /*
  *
@@ -2701,7 +2745,9 @@ SensorFusion::runFusionLocked()
 	options.sparse_linear_algebra_library_type = ceres::SparseLinearAlgebraLibraryType::EIGEN_SPARSE;
 	options.minimizer_progress_to_stdout = false;
 	options.logging_type = ceres::LoggingType::PER_MINIMIZER_ITERATION;
-	options.num_threads = static_cast<int>(std::thread::hardware_concurrency());
+	// One thread for a deterministic run (a replay): with several, the cost's sums come in an order of their own each
+	// run, and a far controller's few LEDs turned the last bits into a different track (293 frames of a recording).
+	options.num_threads = this->deterministic ? 1 : static_cast<int>(std::thread::hardware_concurrency());
 	// @todo Tune the tolerances to actual numbers.
 
 	// Ceres does not take ownership, and the callback only has to outlive the `Solve` below.
@@ -2832,7 +2878,7 @@ SensorFusion::runFusionLocked()
 		 * it was and catches up; a large one, a jump to a different place, is taken at once.
 		 */
 		{
-			const timepoint_ns now_ns = os_monotonic_get_ns();
+			const timepoint_ns now_ns = blendNowNs();
 			xrt_vec3 offset{0.0f, 0.0f, 0.0f};
 			/*
 			 * Seen again after applications were handed the held pose: it goes straight to the solve, as the
@@ -3176,6 +3222,20 @@ SensorFusion::processCameraSampleLocked(const constellation::CameraSample &sampl
 		    !imuBridges(this->device, this->keyframeLocked(0).timestamp_ns, sample.timestamp_ns)) {
 			SF_DEBUG(this, "Device %d seen again after %.0f ms, longer than its IMU samples bridge: the window starts over.",
 			         this->device.id, time_ns_to_s(sample.timestamp_ns - this->keyframeLocked(0).timestamp_ns) * 1000.0);
+			this->dropWindowLocked();
+			this->num_gap_restarts++;
+		}
+
+		/*
+		 * A controller seen again after longer than its IMU can carry it: its samples bridge the gap, but what they make of
+		 * seconds is far from the new solve (in a recording 2.1 m after 3.7 s out of view), which held the app back and
+		 * sent the tracker's next frames looking in the wrong place, the controller found only by the next slow search.
+		 * Started over from the new solve, the next frame finds it.
+		 */
+		const int64_t touch_gap_ms = debug_get_num_option_sensor_fusion_touch_gap_ms();
+		if (!this->head && touch_gap_ms > 0 && this->num_keyframes > 0 &&
+		    sample.timestamp_ns - this->keyframeLocked(0).timestamp_ns >
+		        static_cast<timepoint_ns>(touch_gap_ms) * U_TIME_1MS_IN_NS) {
 			this->dropWindowLocked();
 			this->num_gap_restarts++;
 		}
@@ -3726,7 +3786,7 @@ SensorFusion::getTrackedPose(timepoint_ns requested_time_ns,
 		math_quat_rotate(&out_relation.pose.orientation, &Qcv_imu_model, &out_relation.pose.orientation);
 		// What is left of the last correction's blend fades out on the held pose as on the carried one.
 		out_relation.pose.position = out_relation.pose.position +
-		                             decayedBlendOffset(blend_offset, blend_offset_ns, os_monotonic_get_ns());
+		                             decayedBlendOffset(blend_offset, blend_offset_ns, blendNowNs());
 
 		math_pose_convert_from_opencv(&out_relation.pose, &out_relation.pose);
 		math_vec3_convert_from_opencv(&out_relation.linear_velocity, &out_relation.linear_velocity);
@@ -3851,7 +3911,7 @@ SensorFusion::getTrackedPose(timepoint_ns requested_time_ns,
 
 	if (for_app) {
 		out_relation.pose.position = out_relation.pose.position +
-		                             decayedBlendOffset(blend_offset, blend_offset_ns, os_monotonic_get_ns());
+		                             decayedBlendOffset(blend_offset, blend_offset_ns, blendNowNs());
 	}
 
 	// Convert to OpenXR coordinate space before outputting
@@ -4020,7 +4080,8 @@ SensorFusion::preintegrateDeviceLocked(bool &work_remaining, bool &wants_imu_wak
 		}
 
 		const double accel_noise_scale =
-		    this->head ? static_cast<double>(debug_get_float_option_sensor_fusion_head_accel_noise()) : 1.0;
+		    this->head ? static_cast<double>(debug_get_float_option_sensor_fusion_head_accel_noise())
+		               : static_cast<double>(debug_get_float_option_sensor_fusion_touch_accel_noise());
 		preintegration.imu_preintegration = preintegrate(std::span<const xrt_imu_sample>(samples_buf.data(),
 		                                                                                 num_samples), //
 		                                                 first_after,                                  //

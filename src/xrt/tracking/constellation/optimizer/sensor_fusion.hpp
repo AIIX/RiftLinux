@@ -209,6 +209,10 @@ struct DevicePreintegration
 	}
 };
 
+//! A replay's clock for how a solve's correction is taken in; never set live, which uses the monotonic clock.
+void
+sensorFusionSetReplayClock(timepoint_ns now_ns);
+
 /*!
  * The IMU intrinsics the rig calibration happened to solve for, as the fusion takes them in as a seed.
  *

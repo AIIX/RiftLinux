@@ -1286,6 +1286,15 @@ struct oxr_instance
 		 * calling xrCreateSwapchain.
 		 */
 		bool no_usage_bit_validation_in_create_swapchain;
+
+		/*!
+		 * Chromium (WebXR over OpenXR on Linux) hands its images upside down and says so by negating the vertical
+		 * angles of each view's field of view, without swapping them. That is right only for a field of view that
+		 * reaches as far up as down; on a Rift CV1 (41.6 degrees up, 48 down) every row lands at the wrong height and
+		 * the picture squeezes and stretches as the head pitches. Such a field of view is read as an upside-down
+		 * image of the true one.
+		 */
+		bool negated_fov_means_flip;
 	} quirks;
 
 	//! Debug messengers

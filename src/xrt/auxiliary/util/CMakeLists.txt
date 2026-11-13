@@ -87,6 +87,8 @@ add_library(
 	u_misc.c
 	u_notice.cpp
 	u_notice.h
+	u_screenshot.c
+	u_screenshot.h
 	u_misc.h
 	u_native_images.h
 	u_native_images_debug.h
@@ -182,6 +184,9 @@ if(XRT_HAVE_SYSTEM_CJSON)
 else()
 	target_link_libraries(aux_util PUBLIC xrt-external-cjson)
 endif()
+
+# The screenshot's PNG writer (header only).
+target_link_libraries(aux_util PRIVATE xrt-external-stb)
 
 # Is basically used everywhere, only used in debugging.
 if(XRT_FEATURE_TRACING AND XRT_HAVE_PERCETTO)

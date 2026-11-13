@@ -360,6 +360,35 @@ struct ipc_client_description
 	struct xrt_application_info info;
 };
 
+/*!
+ * RiftLinux: a screenshot of what the headset shows, written as a PNG to @p path (libmonado
+ * mnd_root_take_screenshot); @p flags 0.
+ */
+//! A controller's optional IMU calibration, as u_notice_controller_calibration (RiftLinux).
+struct ipc_controller_calibration
+{
+	int32_t state;
+	int32_t progress;
+	int32_t round;
+	float rotation_deg;
+	float bias_m_s2;
+	float residual_deg;
+	int32_t reason;
+	int32_t overall_progress;
+	float orientation_fill[14];
+	int32_t orientation_now;
+	int32_t next_orientation;
+	int32_t leds;
+	bool resting;
+	bool suggested;
+};
+
+struct ipc_screenshot_request
+{
+	char path[1024];
+	uint32_t flags;
+};
+
 struct ipc_client_list
 {
 	uint32_t ids[IPC_MAX_CLIENTS];

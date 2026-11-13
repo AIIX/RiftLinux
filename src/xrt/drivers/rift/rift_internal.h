@@ -13,6 +13,7 @@
 
 #include "xrt/xrt_byte_order.h"
 
+#include "util/u_notice.h"
 #include "util/u_device.h"
 #include "util/u_logging.h"
 #include "util/u_distortion_mesh.h"
@@ -37,6 +38,7 @@
 #include <assert.h>
 
 #include "rift_interface.h"
+#include "constellation/t_touch_app_pose.h"
 
 
 #define HMD_TRACE(hmd, ...) U_LOG_XDEV_IFL_T(&hmd->base, hmd->log_level, __VA_ARGS__)
@@ -794,18 +796,9 @@ struct rift_touch_controller
 		} imu_history[RIFT_TOUCH_IMU_HISTORY];
 		uint32_t imu_history_count;
 
-		//! The app's last pose was the held one; the next tracked one slides in from it, see
-		//! touch_get_app_relation.
-		bool app_was_held;
-		struct xrt_pose app_held_pose;
-		int64_t blend_start_ns;
-		struct xrt_pose blend_from;
-
-		//! Where the app was last shown the controller tracked, for the held position to start from.
-		bool have_app_tracked;
-		struct xrt_vec3 app_tracked_position;
-		//! Where the app sees the controller held this time, chosen when the hold starts.
-		struct xrt_vec3 app_hold_position;
+		//! What the app is shown around the sensors losing it, see touch_get_app_relation.
+		struct t_touch_app_pose app;
+		struct t_touch_app_pose_params app_params;
 	} pose_hold;
 
 	struct
@@ -827,6 +820,21 @@ struct rift_touch_controller
 		struct xrt_imu_sample last_imu_sample;
 		//! What the factory calibration leaves of the gyro's bias, measured whenever the controller lies still.
 		struct m_gyro_rest_bias gyro_rest_bias;
+
+		/*!
+		 * The IMU alignment the tracker learned in the background (t_constellation_tracker_get_imu_align), kept per
+		 * serial like the gyro's bias and given back at the next start; asked for once a second.
+		 */
+		struct
+		{
+			bool loaded;
+			bool saved_used;
+			struct xrt_quat saved_rot;
+			struct xrt_vec3 saved_bias;
+			timepoint_ns polled_ns;
+			bool in_use;
+		} imu_align;
+
 		//! Whether the bias saved last session was looked for, and when and what was saved since.
 		bool gyro_bias_loaded;
 		timepoint_ns gyro_bias_saved_ns;
@@ -1122,6 +1130,25 @@ struct rift_hmd
 	//! Interpupillary distance of the headset, in meters.
 	float default_icd;
 	float icd_override_m;
+
+	//! The IPD slider (rift_ipd_update): its reading in use, millimetres (0 before the first), and the first one.
+	float ipd_slider_mm;
+	float ipd_slider_first_mm;
+	bool ipd_slider_moved;
+	//! The reading the slider rests at (within its jitter), and since when.
+	float ipd_still_mm;
+	timepoint_ns ipd_still_ns;
+	//! What u_notice_set_ipd was last told (ipd_told_mm 0: nothing yet).
+	struct u_notice_ipd ipd_told;
+	float ipd_told_mm;
+	//! A change of the distance in use not yet posted as a notice, and when one was last posted.
+	bool ipd_notice_due;
+	timepoint_ns ipd_notice_ns;
+	//! Since when the distance in use is what it is, and whether that is still to be logged.
+	timepoint_ns ipd_changed_ns;
+	bool ipd_log_due;
+	//! Test only (RIFTLINUX_TEST_IPD_SWEEP): when the headset started.
+	timepoint_ns ipd_test_start_ns;
 
 	//! Worn: by the wear sensor, or moving as a head does (rift_head_motion_update); what the display and apps follow.
 	bool presence;

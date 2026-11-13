@@ -10,6 +10,7 @@
  */
 
 #include "util/u_misc.h"
+#include "util/u_notice.h"
 #include "util/u_trace_marker.h"
 
 #include "xrt/xrt_body_tracker.h"
@@ -107,6 +108,8 @@ common_shutdown(volatile struct ipc_client_state *ics)
 
 	ics->server->threads[ics->server_thread_index].state = IPC_THREAD_STOPPING;
 	ics->server_thread_index = -1;
+	// RiftLinux: the lens test's pattern goes when the client that asked for it goes.
+	u_notice_drop_lens_pattern((int64_t)ics->client_state.id);
 	memset((void *)&ics->client_state, 0, sizeof(struct ipc_app_state));
 
 	// Decrement the connected client counter

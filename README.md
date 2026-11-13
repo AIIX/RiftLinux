@@ -36,7 +36,7 @@ in SteamVR, motion smoothing, Auto-HDR, and tracking measured against the Oculus
 <https://aiix.github.io/RiftLinux/>): [Getting started](docs/getting-started.md), [FAQ](docs/faq.md),
 [Troubleshooting](docs/troubleshooting.md).
 
-## Project status (2 November 2026, release 0.1.3, pre-release 0.1.4)
+## Project status (14 November 2026, release 0.1.5)
 
 Used daily on the maintainer's machine, which runs two systems: Ubuntu 25.04 (GNOME 48, X11 and Wayland) and CachyOS
 (KDE Plasma 6.8, Wayland), with an NVIDIA GPU (drivers 580 and 615), SteamVR 2.17 and 2.18 and two or three sensors. Every
@@ -50,7 +50,7 @@ them yourself (see [Build](#build)).
 | Area | State | Where it stands |
 | --- | --- | --- |
 | Head tracking, 6DoF | ✅ Done | Smooth, no bobbing; position held through short occlusions; the view turns with the headset's own gyro, so a wrongly placed sensor cannot turn the world around you |
-| Touch controllers | ✅ Done | Tracked as the Oculus runtime tracks them: on Oculus' own camera frames, within 1-2 points of Oculus' tracked share per movement, day and night |
+| Touch controllers | ✅ Done | On two sessions recorded on Windows, replayed from the same camera frames: tracked at least as much of each session as on Windows, day and night, no jumps over 5 cm; fast punches and fast wrist turns kept up with; a controller far from the sensors, seen by only three or four LEDs, found again quickly and shown where it is; a controller whose motion sensor sits turned is learned and corrected |
 | Two sensors | ✅ Done | Placed from your first movements and saved; a moved or knocked sensor is found and placed again automatically, at start or mid-game; sensors tilted alike are levelled by the headset's gravity, and measured again by themselves when tilted too far |
 | Room scale | ✅ Done | Tested and works with three sensors: a sensor behind you is placed by itself, and the headset and both controllers stay tracked all the way around |
 | Sensors behind you | ✅ Done | The headband's rear LEDs are measured on your headset by themselves and tracked, as the Oculus runtime does: with your back to the sensors, the headset stays tracked |
@@ -67,17 +67,16 @@ them yourself (see [Build](#build)).
 | NVIDIA | ✅ Done | Drivers 580 and 615; on Wayland with a VRR monitor the picture can tear (NVIDIA's bug): one setting cures it ([Wayland](#wayland)) |
 | AMD and Intel graphics | ❓ Not tested | Expected to work (Vulkan) |
 | Pairing controllers without Windows | ✅ Done | `riftlinux-setup pair`, with SteamVR closed: the same steps as the Oculus software (compared on USB); tested with both Touch controllers and the Oculus Remote |
-| Desktop in VR | ❌ SteamVR / 📋 | SteamVR's Desktop tab is empty on Linux; WayVR works as an overlay (SDR), in SteamVR and in RiftLinux's own runtime; KWin's VR mode later |
-| RiftLinux desktop app | 📋 Planned | After the driver |
+| Desktop in VR | ✅ Rift Home | [Rift Home](https://github.com/AIIX/RiftHome) 0.1.0, a VR desktop made for RiftLinux: your Linux apps around you as windows, used with the Touch controllers (needs RiftLinux 0.1.5 or later). SteamVR's Desktop tab stays empty on Linux; WayVR works as an overlay |
 
 ## Highlights
 
 - **Install once, play.** One package for your distribution; it registers the driver with SteamVR for every user,
   and the driver gives SteamVR its room, sets the OpenXR runtime and starts in direct mode. A welcome panel in the
   headset says how the Oculus button works.
-- **Full 6DoF tracking, Oculus quality.** Head and Touch controllers tracked from the Constellation sensors, fused with
-  each device's IMU. Scored on the Oculus runtime's own camera frames: within 1-2 points of Oculus' tracked share per
-  movement, day and night.
+- **Full 6DoF tracking.** Head and Touch controllers tracked from the Constellation sensors, fused with each device's
+  IMU. On two sessions recorded on Windows and replayed from the same camera frames, both controllers were tracked at
+  least as much of each session as on Windows, day and night.
 - **Plays SteamVR games.** Linux games, Windows VR games through Proton, OpenXR games through SteamVR.
 - **OpenXR without SteamVR.** RiftLinux's own runtime runs OpenXR applications on the Rift directly: right-click a
   program, *Run with the Rift*. The same tracking, picture and Rift tab, with a button to close the application.
@@ -220,7 +219,7 @@ ArchWiki, vronlinux.org, read in October 2026.
 - A **black level** setting for the CV1's crushed near-blacks (OLED black kept).
 - Open, replayable tracking: sessions recorded and replayed, scored against the Oculus runtime.
 
-## Features and fixes in detail
+## Features in detail
 
 451 commits on top of Monado, 435 of them RiftLinux's own (about 42,000 lines of code), each measured on the hardware
 or in replays of recorded sessions. Taken in along the way: two unmerged upstream drafts, 16
@@ -236,19 +235,21 @@ made them work.
 - Touch tracked optically from both sensors, its IMU fused with the camera solves.
 - Pose ambiguities of the Touch's LED ring (mirrored and flipped poses) resolved with the controller's own sense of
   gravity; few-LED and edge-on views solved; solves bound to a recent prior, with a held prior after short occlusions.
-- Calibration errors fixed: Touch IMU offsets were applied in the wrong order (left controller tilted 5-7°); each
-  controller's gyro bias measured at rest and kept per serial; idle radio reports no longer read as motion.
-- A sign error in the prior check (all devices) that failed about half of all comparisons.
-- Searches bounded in time (a session could hang), static sun spots left out of blind searches (daylight), LED pulse
+- Each Touch controller's factory IMU calibration applied as on Windows, its gyro bias measured at rest and kept per
+  serial, and idle radio reports told apart from motion.
+- Each controller's motion sensor learned against its LEDs while you play (a turned sensor or an accelerometer that
+  reads off), with no calibration step; fast punches, and wrist turns faster than the gyro can read, followed; a
+  controller seen by only three or four LEDs identified and found again quickly.
+- Searches bounded in time, static sun spots left out of blind searches (daylight), LED pulse
   and radio settings as the Oculus runtime sends them (from USB captures).
 - Smoother output: corrections blended in, dead reckoning through short gaps, exposures of both sensors merged.
 - Measured against Oculus: this tracker was run on the Oculus runtime's own camera frames, captured on Windows, and
   scored against the poses Oculus gave for them.
 
 **Lens and display**
-- Distortion texture coordinates now index the field of view the views are rendered with (were wrong for the CV1).
-- SteamVR: projection top and bottom were swapped; per-eye render target size.
-- The CV1's display brightness and persistence set as the Oculus runtime does (Monado sent none: brightness 0).
+- Lens distortion matched to the field of view the views are rendered with.
+- SteamVR: the CV1's projection and per-eye render size.
+- The CV1's display brightness and persistence set as the Oculus runtime does.
 - A headset taken off shows black and stays connected (no monitor unplugged for the desktop), its display switched
   off after a while black (OLED burn-in); on at once when worn. Worn is the wear sensor, or, for face shields and pads
   it cannot see through, moving and turning as a head does for a while.
@@ -282,7 +283,7 @@ made them work.
 - Stability: SteamVR closed and started again when its compositor stops showing frames; a shutdown that waits for
   good on a process that already ended is ended, together with SteamVR's monitor, so Steam can start it again; the
   headset's display switched off when nothing runs it; frames handed over after SteamVR's own work, so its
-  compositor no longer waits every frame.
+  compositor never waits on them.
 - SteamVR's standby follows the wear sensor (SteamVR's own rule, which also wakes on movement, is a setting).
 - Games added to Steam as a Windows program start from SteamVR Home's library, through Steam.
 - Steam's menu closed once a game shows; SteamVR's menu shown in front of you once the room is placed; the Touch
@@ -562,6 +563,17 @@ include them (`riftlinux-runtime`); build them yourself to work on them.
       pulseaudio-libs-devel
   ```
 
+  NixOS: the repository's flake builds the runtime with everything above and has a NixOS module that makes it the
+  system's OpenXR runtime (NixOS's Monado service) and gives the headset's devices to the logged-in user. In your
+  system's flake, add the input `riftlinux.url = "github:AIIX/RiftLinux";`, then in the configuration:
+
+  ```nix
+  imports = [ inputs.riftlinux.nixosModules.default ];
+  services.riftlinux.enable = true;
+  ```
+
+  The SteamVR driver is not set up on NixOS; OpenXR applications and OpenVR ones through xrizer use the runtime.
+
 - **Build.** With OpenHMD installed, Monado would build its OpenHMD driver and switch its own Rift driver off; the
   option keeps it on:
 
@@ -595,13 +607,17 @@ lists both. A file that cannot be read is left as it is and the last good one (`
 | `steamvr.close_menu_for_games` | `true` | Steam's menu, which Steam opens as a game starts, closes once the game shows (one opened with the menu button while the game runs stays); `false` keeps it; `riftlinux-setup game-menu close\|keep` |
 | `steamvr.standby` | `"worn"` | SteamVR's standby ends when the headset is worn (moving it where it lies does not wake SteamVR); `"pick-up"`: also when it moves, by SteamVR's own rule, as on Windows (the picture still waits until it is worn); `riftlinux-setup standby worn\|pick-up` |
 | `controllers.sleep_after_min` | `5` | Minutes (1 to 60) after the headset is taken off before the Touch controllers may go to sleep (a button wakes them); negative: kept awake while SteamVR runs; `riftlinux-setup controller-sleep 3\|5\|7\|off` |
-| `headset.wear_sensor` | `true` | `false`: the headset counts as worn whenever SteamVR or the own runtime runs (a wear sensor that misses the face: face shield, thick pad); the display then never switches off by itself; `riftlinux-setup wear-sensor on\|off\|test` |
+| `controllers.tracking` | `"current"` | `"0.1.4"`: the controllers' tracking as it was up to RiftLinux 0.1.4, if the current one doesn't suit your setup; `riftlinux-setup controller-tracking` |
+| `controllers.coast_ms` | `1000` | How long a Touch controller the sensors no longer see keeps moving on its motion sensor before it stays where it is, 150 to 2000 ms (300 before 0.1.5); `riftlinux-setup controller-coast` |
+| `controllers.imu_align` | `true` | A Touch controller whose motion sensor disagrees with its LEDs (turned, or its accelerometer off) is learned and corrected by itself while you play, kept for it (a few degrees off: only the check of which way is down allows for it, learned anew each session); `false`: tracked as before; `riftlinux-setup controller-alignment status\|on\|off\|forget` ([A controller that freezes or jumps](docs/settings.md#a-controller-that-freezes-or-jumps-in-view)) |
+| `headset.wear_sensor` | `true` | `false`: the headset counts as worn whenever SteamVR or RiftLinux's own runtime runs (a wear sensor that misses the face: face shield, thick pad); the display then never switches off by itself; `riftlinux-setup wear-sensor on\|off\|test` |
 | `headset.worn_above`, `headset.unworn_below` | `30`, `15` | The wear sensor's levels: worn above the first, not worn below the second; `riftlinux-setup wear-sensor levels` |
 | `headset.worn_by_motion` | `true` | Moving as on a head counts as worn, whatever the wear sensor reads (face shields, thick pads); `false`: the wear sensor alone; `riftlinux-setup wear-sensor motion on\|off` |
 | `headset.worn_by_motion_after_s` | `20` | Seconds of moving and turning as on a head before it counts as worn (a headset held in the hands moves alike for a while); `riftlinux-setup wear-sensor motion high\|medium\|low\|<seconds>` (8, 20, 30 s) |
 | `headset.display_off_after_s` | `5` | Seconds not worn before the display goes black (or off); negative: never (burn-in risk); `riftlinux-setup display-off` |
+| `headset.ipd_mm` | not set | The distance between your eyes set by hand (50 to 80 mm), for a headset whose IPD slider is not read; not set or `0` follows the slider; `riftlinux-setup ipd` |
 | `headset.not_worn`, `headset.black_then_off_min` | `"black"`, `10` | Not worn: the display kept on showing black, switched off after 10 minutes black (`"off"`: switched off at once, a monitor unplugged for the desktop); `riftlinux-setup not-worn` |
-| `notices.enabled`, `.sensors`, `.calibration`, `.tracking`, `.display`, `.system` | `true` | ⚡ Notices in the headset, all or per kind (`.tracking` includes the controller hint, `.system` the real-time notices) |
+| `notices.enabled`, `.sensors`, `.calibration`, `.tracking`, `.display`, `.system`, `.ipd` | `true` | ⚡ Notices in the headset, all or per kind (`.tracking` includes the controller hint, `.system` the real-time notices, `.ipd` the distance between the eyes as it changes) |
 | `notices.welcome_shown` | set after the welcome | `false` shows the welcome panel again at the next put-on |
 | `tracking.floor_m` | set by *Set floor* | Where the floor is; kept through measuring the sensors again |
 | `tracking.eye_height_m` | learned | Your standing eye height, learned while you play; keeps the floor right when the sensors are measured again |
@@ -613,7 +629,7 @@ lists both. A file that cannot be read is left as it is and the last good one (`
 | `display.direct_mode` | `true` | 🧪 SteamVR's frames through Monado's compositor; `false` gives SteamVR's own compositor (Rift tab, Display & status; or `riftlinux-setup direct-mode on\|off`; from SteamVR's next start) |
 | `display.auto_hdr`, `display.auto_hdr_strength`, `display.auto_hdr_colour_strength` | `false`, `50`, `50` | 🧪⚡ Auto-HDR (SDR content), its contrast and highlights in %, its colour (vibrance) in % (50: the defaults below, 100: twice); set from the Rift tab |
 | `display.auto_hdr_highlights`, `_shadows`, `_colour`, `_knee` | `0.6`, `0.10`, `0.2`, `0.55` | 🧪 Auto-HDR's strengths at 50 % |
-| `display.black_level` | `2.3` in SteamVR, `0` in the own runtime | Panel levels shown as black lifted to the first visible one, black kept black (2.3 chosen on the maintainer's CV1 with the test pattern; 0 off; at most 6) |
+| `display.black_level` | `2.3` in SteamVR, `0` in RiftLinux's own runtime | Panel levels shown as black lifted to the first visible one, black kept black (2.3 chosen on the maintainer's CV1 with the test pattern; 0 off; at most 6) |
 | `display.dither_bits` | `8` | 🧪 Dither to the link's bit depth (0 off) |
 | `display.direct_mode_fast_path` | `true` | 🧪⚡ A single game image goes straight into the lens pass (one resampling, sharper); `false` = through the layer renderer; switched live from the Rift tab |
 | `display.direct_mode_fence` | `true` | 🧪 A frame goes to Monado's compositor once the GPU has finished drawing it, when SteamVR's images carry GPU fences (SteamVR's log says whether they do); `false`: not waited for |
@@ -636,6 +652,7 @@ lists both. A file that cannot be read is left as it is and the last good one (`
 | `display.hdr_white` | `0.88` | 🧪⚡ HDR content's reference white as panel lightness (about sRGB 215); the room above it is for highlights |
 | `display.hdr_bright`, `display.hdr_white_bright` | `false`, `0.94` | 🧪⚡ HDR Bright: HDR content's white placed at this lightness instead of 0.88 (about sRGB 235 instead of 215), everything below it brighter, highlights with less room; set from the Rift tab |
 | `display.backdrop_blur` | `true` | Own runtime: frosted glass (what is behind a layer blurred) for the layers an application asks it for with `XR_MNDX_composition_layer_backdrop_blur`; `false`: those layers without it; nothing else is touched (`riftlinux-setup backdrop-blur`) |
+| `display.lsfg_vk` | `false` | lsfg-vk (Lossless Scaling's frame generation for Linux), when installed, kept out of SteamVR's server, its helper and RiftLinux's own runtime, where it crashed SteamVR as the display started; `true`: allowed there as before; games keep it either way (`riftlinux-setup lsfg-vk`) |
 | `display.hdr_test` | off | 🧪 An HDR10 test chart in front of you: `"static"`, `"none"` or `"scene"` metadata |
 | `display.direct_mode_max_layers` | `16` | 🧪 At most this many of SteamVR's layers a frame (for finding a layer that misbehaves) |
 | `display.direct_mode_format_compositor`, `display.direct_mode_format_app` | sRGB | 🧪 `"unorm"`: SteamVR's compositor's or the application's images read as UNORM instead of sRGB (for comparing) |
@@ -656,13 +673,20 @@ More switches are Monado environment variables, documented where they are read
 (`XRT_COMPOSITOR_*` in `src/xrt/auxiliary/render/`, `RIFT_*` in `src/xrt/drivers/rift/`, `CONSTELLATION_TRACKER_*` in
 `src/xrt/tracking/constellation/`).
 
-## RiftLinux app (coming)
+## Rift Home
 
-<!-- Placeholder: download link and screenshots go here when the app is released. -->
+[Rift Home](https://github.com/AIIX/RiftHome) is a VR desktop made for RiftLinux. It started as a test environment for
+HDR video in the headset and grew into a full VR desktop. It runs on RiftLinux's own OpenXR runtime and puts your Linux
+apps around you as windows, used with the Touch controllers.
 
-A desktop app (Qt, for any desktop, shipped as a Flatpak) is planned after the driver: sensor and controller status,
-calibration, pairing, the settings above, notices, and picture settings with a before/after view. It uses
-`riftlinux-setup` underneath; nothing in the driver depends on it.
+- Wayland apps, and X11 apps through XWayland, as windows you move, resize, tilt or curve; their places are kept.
+- A Home launcher, a dock, your apps' notifications, and a virtual keyboard under the text field you type into.
+- HDR10 and HLG video in Firefox or mpv, and a cinema mode for one big screen.
+- Steam and Proton games as windows, with a game mode that turns the Touch controllers into a gamepad.
+- Three HDR rooms, recline for bed or sofa, and Wi-Fi, Bluetooth, sound and controller settings inside the headset.
+
+Rift Home 0.1.0 needs RiftLinux 0.1.5 or later. Start it as its own session from the login screen, or from your app
+menu with SteamVR closed.
 
 ## Known issues
 

@@ -479,6 +479,11 @@ struct ipc_server
 		int active_client_index;
 		int last_active_client_index;
 
+		//! RiftLinux: the clients shown as primary, most recent first (their ids), for showing the one before when
+		//! the primary application ends.
+		uint32_t recent_ids[IPC_MAX_CLIENTS];
+		uint32_t recent_count;
+
 		// Counter for total number of connected clients
 		uint32_t connected_client_count;
 
@@ -683,6 +688,15 @@ get_ism_handle(volatile struct ipc_client_state *ics)
  */
 void
 ipc_server_set_panel_focus(struct ipc_server *s, bool panel_open);
+
+/*!
+ * RiftLinux: whether another application is active that was shown before the one shown now (the Rift panel's
+ * Switch application), and showing it.
+ */
+bool
+ipc_server_has_previous_client(struct ipc_server *s);
+bool
+ipc_server_switch_to_previous_client(struct ipc_server *s);
 
 #ifdef __cplusplus
 }

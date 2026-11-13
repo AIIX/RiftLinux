@@ -36,6 +36,7 @@
 #include <atomic>
 #include <algorithm>
 #include <limits>
+#include <mutex>
 #include <set>
 #include <string>
 #include <cstring>
@@ -89,6 +90,24 @@ DEBUG_GET_ONCE_FLOAT_OPTION(constellation_tracker_rig_moved_m, "CONSTELLATION_TR
  * 0 turns the watch off and the old check on.
  */
 DEBUG_GET_ONCE_BOOL_OPTION(constellation_tracker_rig_watch, "CONSTELLATION_TRACKER_RIG_WATCH", true)
+//! RiftLinux: a controller's IMU alignment learned in the background (Device::imu_align), used only for a clear fault.
+DEBUG_GET_ONCE_BOOL_OPTION(constellation_tracker_imu_align, "CONSTELLATION_TRACKER_IMU_ALIGN", true)
+//! Test only: the learned alignment for the gravity check alone, the fusion left with the raw IMU.
+DEBUG_GET_ONCE_BOOL_OPTION(constellation_tracker_imu_align_gate_only, "CONSTELLATION_TRACKER_IMU_ALIGN_GATE_ONLY", false)
+//! Test only: the alignment learner's inputs written to this file (raw IMU, each controller solve), checked offline.
+DEBUG_GET_ONCE_OPTION(constellation_tracker_imu_align_dump, "CONSTELLATION_TRACKER_IMU_ALIGN_DUMP", "")
+
+static std::mutex g_align_dump_lock;
+
+static FILE *
+align_dump_file()
+{
+	static FILE *file = []() -> FILE * {
+		const char *path = debug_get_option_constellation_tracker_imu_align_dump();
+		return path != nullptr && path[0] != '\0' ? fopen(path, "w") : nullptr;
+	}();
+	return file;
+}
 DEBUG_GET_ONCE_FLOAT_OPTION(constellation_tracker_rig_watch_deg, "CONSTELLATION_TRACKER_RIG_WATCH_DEG", 1.0f)
 /*!
  * A device's adjustable LED part (the Rift CV1's rear headband, when its driver hands it over): measured where it
@@ -132,6 +151,14 @@ DEBUG_GET_ONCE_BOOL_OPTION(constellation_tracker_remeasure, "CONSTELLATION_TRACK
  * next start, so a first measuring can use quick placement. CONSTELLATION_TRACKER_DOWN_SAVED=0 learns it anew.
  */
 DEBUG_GET_ONCE_BOOL_OPTION(constellation_tracker_down_saved, "CONSTELLATION_TRACKER_DOWN_SAVED", true)
+//! How many orientation bins an IMU seat calibration's round needs; lower only to replay recordings of ordinary play.
+DEBUG_GET_ONCE_NUM_OPTION(constellation_tracker_imu_calibration_bins, "CONSTELLATION_TRACKER_IMU_CALIBRATION_BINS", 6)
+//! How far an IMU calibration's down directions must spread, in 1/100s (see its use); lower only to replay ordinary play.
+DEBUG_GET_ONCE_NUM_OPTION(constellation_tracker_imu_calibration_spread, "CONSTELLATION_TRACKER_IMU_CALIBRATION_SPREAD", 10)
+//! How long an IMU calibration may take, seconds; longer only to replay recordings of ordinary play.
+DEBUG_GET_ONCE_NUM_OPTION(constellation_tracker_imu_calibration_timeout_s, "CONSTELLATION_TRACKER_IMU_CALIBRATION_TIMEOUT_S", 180)
+//! Test only: a calibration counts as held with the trigger throughout (replays have no trigger).
+DEBUG_GET_ONCE_BOOL_OPTION(constellation_tracker_imu_calibration_held, "CONSTELLATION_TRACKER_IMU_CALIBRATION_HELD", false)
 #define CT_DOWN_SAVE_SOLVES 4000
 #define CT_DOWN_SAVE_LEVEL_DEG 3.0f
 #define CT_DOWN_SAVE_LEVEL_NS (30LL * U_TIME_1S_IN_NS)
@@ -237,6 +264,20 @@ DEBUG_GET_ONCE_BOOL_OPTION(constellation_tracker_load_rig, "CONSTELLATION_TRACKE
 DEBUG_GET_ONCE_FLOAT_OPTION(constellation_tracker_gravity_tolerance_deg,
                             "CONSTELLATION_TRACKER_GRAVITY_TOLERANCE_DEG",
                             8.0f)
+/*
+ * After the gyro hit the end of its range (ImuTilt::clipped) the IMU's down is off by what it could not read: a recorded
+ * fast turn left it 9.5-12 degrees off, and the check, in the search and after it, turned away every right pose for
+ * 2.9 s; the flipped ring's wrong poses were 55 degrees off. Until a solve of CONSTELLATION_TRACKER_GRAVITY_REANCHOR_LEDS
+ * or more sets it again, solves may be this far off it, and (CONSTELLATION_TRACKER_GRAVITY_CLIP_UNBIND) the prior, whose
+ * orientation came through the same gyro, does not bind. 0: as any other time.
+ */
+// 20 with the prior unbound: that controller's longest hold went from 3.03 to 0.34 s, no steps over 10 cm; the Oculus
+// day and night captures, which never reach the gyro's end, are unchanged to the last digit.
+DEBUG_GET_ONCE_FLOAT_OPTION(constellation_tracker_gravity_clip_tolerance_deg,
+                            "CONSTELLATION_TRACKER_GRAVITY_CLIP_TOLERANCE_DEG",
+                            20.0f)
+DEBUG_GET_ONCE_NUM_OPTION(constellation_tracker_gravity_reanchor_leds, "CONSTELLATION_TRACKER_GRAVITY_REANCHOR_LEDS", 6)
+DEBUG_GET_ONCE_BOOL_OPTION(constellation_tracker_gravity_clip_unbind, "CONSTELLATION_TRACKER_GRAVITY_CLIP_UNBIND", true)
 
 /*
  * A device solved within the last CONSTELLATION_TRACKER_PRIOR_FRESH_MS has a prior good to a degree or two, and a solve
@@ -253,6 +294,30 @@ DEBUG_GET_ONCE_FLOAT_OPTION(constellation_tracker_prior_pos_tolerance_m,
                             "CONSTELLATION_TRACKER_PRIOR_POS_TOLERANCE_M",
                             0.10f)
 DEBUG_GET_ONCE_NUM_OPTION(constellation_tracker_prior_fresh_ms, "CONSTELLATION_TRACKER_PRIOR_FRESH_MS", 500)
+/*
+ * A Touch's prediction for the camera checks from its own IMU-driven filter (t_touch_ekf.hpp), as the Oculus runtime's,
+ * instead of the fusion's: carried by the gyro and accelerometer from pose to pose, it keeps up with a fast punch.
+ */
+// On (controllers.tracking "0.1.4" turns it off): replays of a recorded session of fast punches held the left
+// controller 2.7 s of 90 instead of 11.2; against the Oculus captures at least as many seconds tracked, no jumps.
+DEBUG_GET_ONCE_BOOL_OPTION(constellation_tracker_ekf_prior, "CONSTELLATION_TRACKER_EKF_PRIOR", true)
+/*!
+ * LEDs a Touch needs to be found with no prior (0: as its driver gives, 7). Far from the sensors a Touch shows 5-6: it
+ * stayed lost while in view. The Oculus runtime finds a controller again from 5 matched LEDs.
+ */
+DEBUG_GET_ONCE_NUM_OPTION(constellation_tracker_touch_min_leds_no_prior, "CONSTELLATION_TRACKER_TOUCH_MIN_LEDS_NO_PRIOR", 0)
+//! The filter's camera pose sigmas at six or more LEDs (scaled by 6 / LEDs below that), and its IMU noise floors.
+DEBUG_GET_ONCE_FLOAT_OPTION(constellation_tracker_ekf_sigma_pos_mm, "CONSTELLATION_TRACKER_EKF_SIGMA_POS_MM", 5.0f)
+DEBUG_GET_ONCE_FLOAT_OPTION(constellation_tracker_ekf_sigma_rot_deg, "CONSTELLATION_TRACKER_EKF_SIGMA_ROT_DEG", 0.86f)
+DEBUG_GET_ONCE_FLOAT_OPTION(constellation_tracker_ekf_accel_noise, "CONSTELLATION_TRACKER_EKF_ACCEL_NOISE", 0.5f)
+DEBUG_GET_ONCE_FLOAT_OPTION(constellation_tracker_ekf_gyro_noise, "CONSTELLATION_TRACKER_EKF_GYRO_NOISE", 0.01f)
+/*
+ * The filter's R from the solve's own covariance (its shape: a few LEDs are millimetres across and centimetres in depth),
+ * its sigmas times this; it assumes 0.16 px per blob, some 20 times the scatter of a still controller's solves. 0: the
+ * sigmas above instead.
+ */
+// 0.1: 0.07 and 0.15 each lost the left controller over a point of the daytime Oculus capture.
+DEBUG_GET_ONCE_FLOAT_OPTION(constellation_tracker_ekf_cov_scale, "CONSTELLATION_TRACKER_EKF_COV_SCALE", 0.1f)
 
 /*
  * A device the cameras lost may hand over a prior whose orientation its IMU still tracks, and whose position is held
@@ -270,6 +335,26 @@ DEBUG_GET_ONCE_NUM_OPTION(constellation_tracker_held_prior_ms, "CONSTELLATION_TR
  * CONSTELLATION_TRACKER_PRIOR_DISTRUST_MS, at least 3 and none agreeing, the next is taken as it is.
  */
 DEBUG_GET_ONCE_NUM_OPTION(constellation_tracker_prior_distrust_ms, "CONSTELLATION_TRACKER_PRIOR_DISTRUST_MS", 300)
+/*
+ * As the Oculus runtime reseeds its filter from poses it agrees with none of: three solves the prior turned away, each
+ * of this many LEDs or more at 0.20 px or less, within 60 ms and agreeing with each other (3 cm plus 4 m/s, 5 degrees),
+ * end the wait above at once. 0: only the wait.
+ */
+// 8: on a recorded session of fast punches the left controller was held 1.80 s of 90 instead of 2.66, its longest hold
+// 0.29 s instead of 0.39, no more steps; the Oculus day and night captures unchanged to the last digit. 7 held 1.86 s
+// but moved the night capture a little (median 0.11 mm); 6 tracked the right controller worse.
+DEBUG_GET_ONCE_NUM_OPTION(constellation_tracker_reseed_leds, "CONSTELLATION_TRACKER_RESEED_LEDS", 8)
+/*
+ * While a controller is not seen, the orientation its IMU kept drifts: for one whose IMU is being corrected (Device::
+ * imu_align) by what the correction leaves; held to 8 degrees of it, a search found nothing for 10 s on a recording while
+ * the controller was in full view, its kept orientation 14 degrees off after a fast turn. For such a controller the
+ * tolerance grows with the time unseen (8, 12, 16, then 20 degrees from 2 s); a flipped pose (90-180 degrees), what the
+ * held prior is there for, stays out. Measured for every controller: night better, day more jumps (1 -> 4): not taken.
+ */
+DEBUG_GET_ONCE_BOOL_OPTION(constellation_tracker_held_prior_rot_growth, "CONSTELLATION_TRACKER_HELD_PRIOR_ROT_GROWTH", true)
+static constexpr float kHeldRotGrowthDeg[ConstellationTracker::kHeldRotSteps] = {0.0f, 4.0f, 8.0f, 12.0f};
+static constexpr timepoint_ns kHeldRotStepNs[ConstellationTracker::kHeldRotSteps - 1] = {
+    500 * U_TIME_1MS_IN_NS, 1000 * U_TIME_1MS_IN_NS, 2000 * U_TIME_1MS_IN_NS};
 #define CT_PRIOR_DISTRUST_MIN_SOLVES 3
 
 /*!
@@ -920,11 +1005,25 @@ Camera::gravityForSample(const Device *device,
 	return true;
 }
 
+//! While calibrating, a device's solves count against its IMU's down within this, and pairs farther off are left out.
+static constexpr float kImuCalibrationToleranceRad = DEG_TO_RAD(30.0f);
+
+float
+Camera::gravityTolerance(const Device *device) const
+{
+	const float clip_tolerance_deg = debug_get_float_option_constellation_tracker_gravity_clip_tolerance_deg();
+	if (clip_tolerance_deg > 0.0f && device->imu_tilt.clipped()) {
+		return std::max(this->tracker->gravity_tolerance_rad, static_cast<float>(DEG_TO_RAD(clip_tolerance_deg)));
+	}
+	return this->tracker->gravity_tolerance_rad;
+}
+
 bool
 Camera::poseMatchesGravity(Device *device,
                            const CameraSample &sample,
                            const xrt_pose &Tcv_cam_device,
-                           SolveSource source)
+                           SolveSource source,
+                           uint32_t matched_blobs)
 {
 	xrt_vec3 camera_gravity;
 	xrt_vec3 device_gravity;
@@ -933,7 +1032,13 @@ Camera::poseMatchesGravity(Device *device,
 	}
 
 	const float error_rad = pose_metrics_gravity_error_rad(&Tcv_cam_device, &camera_gravity, &device_gravity);
-	if (error_rad <= this->tracker->gravity_tolerance_rad) {
+	// RiftLinux: an IMU seat calibration takes the pair, and checks its device's solves with a wide tolerance.
+	float tolerance_rad = this->gravityTolerance(device);
+	if (device->imu_calibration.active.load()) {
+		collectImuCalibration(device, sample, Tcv_cam_device, camera_gravity, device_gravity, error_rad, matched_blobs);
+		tolerance_rad = std::max(tolerance_rad, kImuCalibrationToleranceRad);
+	}
+	if (error_rad <= tolerance_rad) {
 		return true;
 	}
 
@@ -950,6 +1055,746 @@ Camera::poseMatchesGravity(Device *device,
 	return false;
 }
 
+
+/*
+ *
+ * The advice to calibrate a controller (RiftLinux): counts only, nothing in tracking reads them.
+ *
+ */
+
+//! Counted from a solve of this many LEDs, of a device resting this long, at most this often per sensor and orientation.
+static constexpr uint32_t kImuAdviceMinLeds = 8;
+static constexpr timepoint_ns kImuAdviceRestNs = 250 * U_TIME_1MS_IN_NS;
+static constexpr timepoint_ns kImuAdviceEveryNs = 100 * U_TIME_1MS_IN_NS;
+//! Farther off than this is a wrong solve, not a disagreement: not counted.
+static constexpr float kImuAdviceWrongRad = DEG_TO_RAD(25.0f);
+//! Off: the solve's down this far from the IMU's.
+static constexpr float kImuAdviceOffRad = DEG_TO_RAD(5.0f);
+/*!
+ * A steady orientation also averages this far off. A healthy controller lying still far away can sit steadily close to
+ * the line above (a recording: 5.7 degrees at 1581 of 1581 readings, 4.9 at 5261), and one whose IMU is really turned
+ * 10 degrees, where the gravity check starts turning it away, averages 6.4 to 9.9.
+ */
+static constexpr uint32_t kImuAdviceSteadyHundredths = 600;
+//! Enough to say anything of a sensor, or of an orientation (2 s at rest, at the rate above).
+static constexpr uint32_t kImuAdviceEnough = 20;
+//! An orientation is steadily off when this many of 10 are; a sensor sees it off when this many of 10 are, over all.
+static constexpr uint32_t kImuAdviceSteadyOf10 = 7;
+static constexpr uint32_t kImuAdviceSensorOf10 = 5;
+//! A sensor that sees the headset off this many of 10 is misplaced itself.
+static constexpr uint32_t kImuAdviceReferenceOf10 = 3;
+//! Advised for steady disagreement in this many orientations.
+static constexpr uint32_t kImuAdviceOrientations = 2;
+
+static size_t
+imu_calibration_bin(const xrt_vec3 &v);
+
+void
+Camera::countImuAdvice(Device *device,
+                       const CameraSample &sample,
+                       const xrt_pose &Tcv_cam_device,
+                       uint32_t matched_blobs)
+{
+	if (matched_blobs < kImuAdviceMinLeds || device->imu_calibration.active.load()) {
+		return;
+	}
+	std::shared_ptr<CameraMosaic> camera_mosaic = this->mosaic.lock();
+	if (!camera_mosaic) {
+		return;
+	}
+	const size_t slot = camera_mosaic->index * 4 + this->index;
+	xrt_vec3 camera_gravity;
+	xrt_vec3 device_gravity;
+	if (slot >= Device::ImuAdvice::kSlots || !this->gravityForSample(device, sample, camera_gravity, device_gravity) ||
+	    !device->imu_tilt.restingAt(sample.timestamp_ns, kImuAdviceRestNs)) {
+		return;
+	}
+	const float error_rad = pose_metrics_gravity_error_rad(&Tcv_cam_device, &camera_gravity, &device_gravity);
+	if (error_rad > kImuAdviceWrongRad) {
+		return;
+	}
+	// The orientation by what is up in OpenXR coordinates, as a calibration's: this is OpenCV's down.
+	const xrt_vec3 up = {-device_gravity.x, device_gravity.y, device_gravity.z};
+	Device::ImuAdvice::Bin &bin = device->imu_advice.bins[slot][imu_calibration_bin(up)];
+	if (sample.timestamp_ns - bin.last_ns.load() < kImuAdviceEveryNs) {
+		return;
+	}
+	bin.last_ns.store(sample.timestamp_ns);
+	bin.samples.fetch_add(1);
+	bin.off.fetch_add(error_rad > kImuAdviceOffRad ? 1 : 0);
+	bin.hundredths.fetch_add(static_cast<uint32_t>(RAD_TO_DEG(error_rad) * 100.0f));
+}
+
+//! The advice from a device's counts and the headset's.
+static t_constellation_imu_advice
+imu_advice_from(const Device &device, const Device &reference)
+{
+	using Advice = Device::ImuAdvice;
+	t_constellation_imu_advice out = {};
+	uint32_t reference_sensors = 0;
+	uint32_t bin_samples[Advice::kBins] = {};
+	uint32_t bin_off[Advice::kBins] = {};
+	uint64_t bin_hundredths[Advice::kBins] = {};
+	for (size_t slot = 0; slot < Advice::kSlots; slot++) {
+		uint32_t samples = 0;
+		uint32_t off = 0;
+		uint32_t reference_samples = 0;
+		uint32_t reference_off = 0;
+		for (size_t bin = 0; bin < Advice::kBins; bin++) {
+			samples += device.imu_advice.bins[slot][bin].samples.load();
+			off += device.imu_advice.bins[slot][bin].off.load();
+			reference_samples += reference.imu_advice.bins[slot][bin].samples.load();
+			reference_off += reference.imu_advice.bins[slot][bin].off.load();
+		}
+		reference_sensors += reference_samples >= kImuAdviceEnough ? 1 : 0;
+		if (samples < kImuAdviceEnough) {
+			continue;
+		}
+		// A sensor that sees it fine says it is not the controller. A sensor that sees the headset off, or has
+		// not seen enough of it to say, says nothing for the controller either.
+		if (off * 10 < samples * kImuAdviceSensorOf10 || reference_samples < kImuAdviceEnough ||
+		    reference_off * 10 >= reference_samples * kImuAdviceReferenceOf10) {
+			out.sensors = 0;
+			return out;
+		}
+		out.sensors++;
+		out.samples += samples;
+		out.off += off;
+		for (size_t bin = 0; bin < Advice::kBins; bin++) {
+			bin_samples[bin] += device.imu_advice.bins[slot][bin].samples.load();
+			bin_off[bin] += device.imu_advice.bins[slot][bin].off.load();
+			bin_hundredths[bin] += device.imu_advice.bins[slot][bin].hundredths.load();
+		}
+	}
+	for (size_t bin = 0; bin < Advice::kBins; bin++) {
+		if (bin_samples[bin] >= kImuAdviceEnough && bin_off[bin] * 10 >= bin_samples[bin] * kImuAdviceSteadyOf10 &&
+		    bin_hundredths[bin] >= static_cast<uint64_t>(bin_samples[bin]) * kImuAdviceSteadyHundredths) {
+			out.steady_orientations++;
+		}
+	}
+	// With more than one sensor seeing the headset, one sensor alone says nothing: it may have moved.
+	const bool enough_sensors = out.sensors >= 1 && (out.sensors >= 2 || reference_sensors <= 1);
+	out.advised = enough_sensors && out.steady_orientations >= kImuAdviceOrientations;
+	return out;
+}
+
+
+/*
+ *
+ * IMU seat calibration (RiftLinux).
+ *
+ */
+
+/*!
+ * A pair needs a solve from this many LEDs. Few LEDs barely fix the orientation, which then stays near the IMU's
+ * prediction: on recordings with the IMU turned 10 degrees, the fit found 7.0-8.4 degrees from all solves, 8.4-9.1 from
+ * 8 LEDs and up, 8.8-10.4 from 10 and up; rounds take care of what is left.
+ */
+static constexpr uint32_t kImuCalibrationMinLeds = 8;
+//! A pair is taken when the device has rested this long (hand-held still is enough).
+static constexpr timepoint_ns kImuCalibrationRestNs = 60 * U_TIME_1MS_IN_NS;
+//! A round fits once enough orientation bins (constellation_tracker_imu_calibration_bins) hold this many pairs each.
+static constexpr uint32_t kImuCalibrationPerBin = 15;
+//! No bin takes more than this, so the orientations held longest do not outweigh the rest.
+static constexpr uint32_t kImuCalibrationBinCap = 120;
+/*!
+ * Done once a round's fit is below this, failed after this many rounds or this long. A healthy controller's first
+ * round finds about 1 degree (replays, 1.1): one pass of poses; a turned one needs two or three.
+ */
+static constexpr float kImuCalibrationDoneDeg = 1.5f;
+static constexpr int kImuCalibrationRounds = 4;
+//! A pair takes a resting reading this close to its camera sample.
+static constexpr timepoint_ns kImuCalibrationRestAgeNs = 100 * U_TIME_1MS_IN_NS;
+//! A round that cannot fit yet (the bias) is tried again this often.
+static constexpr timepoint_ns kImuCalibrationRetryNs = 250 * U_TIME_1MS_IN_NS;
+//! A round's correction reaches the samples within this.
+static constexpr timepoint_ns kImuCalibrationSettleNs = 500 * U_TIME_1MS_IN_NS;
+/*!
+ * Failed when the corrected IMU's down still disagrees with the solves' by more than this (90th percentile). Replays
+ * with the driver's held prior: a controller turned 10 degrees left 4.0-5.3 after the first round (turned and biased
+ * 4.0-4.6), a healthy one 2.5; solves that disagree among themselves leave 19.
+ */
+static constexpr float kImuCalibrationMaxResidualDeg = 6.0f;
+//! Failed for a correction larger than this: not a seat, something else.
+static constexpr float kImuCalibrationMaxDeg = 25.0f;
+//! A bias over this (17 degrees of tilt) is no bias to trust; under this a round has nothing left to take out.
+static constexpr float kImuCalibrationMaxBias = 3.0f;
+static constexpr float kImuCalibrationDoneBias = 0.15f;
+//! A resting accelerometer reading: the mean of this many samples in a row (50 ms at 500 Hz) that vary less than this.
+static constexpr uint32_t kImuCalibrationWindow = 25;
+static constexpr float kImuCalibrationWindowStd = 0.06f;
+//! The resting readings fit one sphere when 90 % are this close to it (our recordings: 0.03-0.07 after the bias).
+static constexpr float kImuCalibrationSphereFit = 0.15f;
+/*!
+ * Held in a hand (the trigger held), the resting readings spread more about the sphere: the maintainer's session,
+ * both Touch controllers, every set of the guided poses: half within 0.06-0.07 m/s2, 90 % within
+ * 0.16-0.19 (lying still: 0.02-0.04), each set's bias alike (0.11-0.15). At 0.15 no set made a round and the poses
+ * went round again and again. A hand's readings: 90 % within this, half within the next.
+ */
+static constexpr float kImuCalibrationSphereFitHand = 0.30f;
+static constexpr float kImuCalibrationSphereFitHandMedian = 0.12f;
+//! Sets of the guided poses in a row without a round before it ends (reason UNSETTLED), never round and round.
+static constexpr uint32_t kImuCalibrationMaxSets = 3;
+//! An orientation asked for is given up on after this many still windows (8 s) with no solve of enough LEDs.
+static constexpr uint32_t kImuCalibrationGiveUpWindows = 160;
+//! The LEDs on the latest solve say nothing after this.
+static constexpr timepoint_ns kImuCalibrationLedsAgeNs = 250 * U_TIME_1MS_IN_NS;
+/*!
+ * The guided steps: the poses asked for (orientations, the status's table) and the up direction each means, in the
+ * order a person takes them (the maintainer's photographs of how hands hold them): pointing up with the buttons facing
+ * you first, a pose anyone finds, then down, the buttons to the left, to the right, pointing at the sensors as usually
+ * held, upside down. Turning about the vertical does not change what the accelerometer sees: one of each is enough.
+ */
+static constexpr int kImuCalibrationStepCount = 4;
+static constexpr int kImuCalibrationSteps[kImuCalibrationStepCount] = {5, 4, 0, 1};
+static const xrt_vec3 kImuCalibrationStepUp[kImuCalibrationStepCount] = {
+    {0.0f, 0.0f, -1.0f}, {0.0f, 0.0f, 1.0f}, {1.0f, 0.0f, 0.0f}, {-1.0f, 0.0f, 0.0f}};
+/*!
+ * Before the poses: close enough to the sensors. From the maintainer's bed (2-3 m) most poses showed 4-7 LEDs, a
+ * reading needs 8, and a pose never filled; at a desk's distance 10-12. Close enough is this share of the controller's
+ * solves (a running mean) with 8 LEDs or more; the person goes on with the trigger, as with each pose (nothing goes on
+ * by itself: the maintainer).
+ */
+static constexpr float kImuCalibrationCloseShare = 0.6f;
+//! No solve this long: not seen, so not close enough.
+static constexpr timepoint_ns kImuCalibrationCloseAgeNs = 300 * U_TIME_1MS_IN_NS;
+/*!
+ * A step needs this many pairs and resting readings with the trigger held: the resting readings, 50 ms each, set
+ * how long it takes (about 1.5 s held still), so that the circle visibly fills.
+ */
+static constexpr uint32_t kImuCalibrationStepPairs = 30;
+static constexpr uint32_t kImuCalibrationStepRests = 30;
+/*!
+ * A step held this far from the pose shown is turned away (the opposite of it, near enough), and one this near a pose
+ * done before. Hands turn the controller their own way for a pose (the maintainer's, photographed: rolled and upside
+ * down 60-90 degrees from the pictures); the fit needs six directions well apart, not the pictures' exactly.
+ */
+static constexpr float kImuCalibrationStepMaxDeg = 100.0f;
+static constexpr float kImuCalibrationStepMinApartDeg = 30.0f;
+/*!
+ * Still enough for a hand, with the trigger held: in the Oculus captures, held still, 44-100 % of 50 ms windows have no
+ * gyro sample over 0.2 rad/s and accelerometer spread under 0.12 m/s² (the limits for a device lying still pass
+ * 32-67 %); punches and waves 19-42 %.
+ */
+static constexpr float kImuCalibrationHeldGyro = 0.2f;
+static constexpr float kImuCalibrationHeldStd = 0.12f;
+
+//! The bin of a down direction: the nearest of the 6 axis directions and 8 diagonals.
+static size_t
+imu_calibration_bin(const xrt_vec3 &v)
+{
+	static const float k = 0.57735027f;
+	static const xrt_vec3 dirs[14] = {{1, 0, 0},   {-1, 0, 0},  {0, 1, 0},  {0, -1, 0},  {0, 0, 1},
+	                                  {0, 0, -1},  {k, k, k},   {k, k, -k}, {k, -k, k},  {k, -k, -k},
+	                                  {-k, k, k},  {-k, k, -k}, {-k, -k, k}, {-k, -k, -k}};
+	size_t best = 0;
+	float best_dot = -2.0f;
+	for (size_t i = 0; i < 14; i++) {
+		const float d = m_vec3_dot(v, dirs[i]);
+		if (d > best_dot) {
+			best_dot = d;
+			best = i;
+		}
+	}
+	return best;
+}
+
+/*!
+ * The rotation that best turns each @p pairs first into its second (Horn's quaternion method: the largest
+ * eigenvector of his 4x4 matrix, by power iteration on it shifted to be positive).
+ */
+static xrt_quat
+imu_calibration_fit(const std::vector<std::pair<xrt_vec3, xrt_vec3>> &pairs)
+{
+	double S[3][3] = {};
+	for (const auto &[u, v] : pairs) {
+		const double a[3] = {u.x, u.y, u.z}, b[3] = {v.x, v.y, v.z};
+		for (int r = 0; r < 3; r++) {
+			for (int c = 0; c < 3; c++) {
+				S[r][c] += a[r] * b[c];
+			}
+		}
+	}
+	const double xx = S[0][0], xy = S[0][1], xz = S[0][2], yx = S[1][0], yy = S[1][1], yz = S[1][2], zx = S[2][0],
+	             zy = S[2][1], zz = S[2][2];
+	double N[4][4] = {{xx + yy + zz, yz - zy, zx - xz, xy - yx},
+	                  {yz - zy, xx - yy - zz, xy + yx, zx + xz},
+	                  {zx - xz, xy + yx, -xx + yy - zz, yz + zy},
+	                  {xy - yx, zx + xz, yz + zy, -xx - yy + zz}};
+	double shift = 0.0;
+	for (int r = 0; r < 4; r++) {
+		for (int c = 0; c < 4; c++) {
+			shift += fabs(N[r][c]);
+		}
+	}
+	for (int r = 0; r < 4; r++) {
+		N[r][r] += shift;
+	}
+	double q[4] = {1.0, 0.0, 0.0, 0.0};
+	for (int it = 0; it < 500; it++) {
+		double n[4] = {};
+		for (int r = 0; r < 4; r++) {
+			for (int c = 0; c < 4; c++) {
+				n[r] += N[r][c] * q[c];
+			}
+		}
+		const double len = sqrt(n[0] * n[0] + n[1] * n[1] + n[2] * n[2] + n[3] * n[3]);
+		for (int r = 0; r < 4; r++) {
+			q[r] = n[r] / len;
+		}
+	}
+	xrt_quat out = {static_cast<float>(q[1]), static_cast<float>(q[2]), static_cast<float>(q[3]),
+	                static_cast<float>(q[0])};
+	math_quat_normalize(&out);
+	return out;
+}
+
+/*!
+ * The accelerometer's bias from resting readings: a - b has one length in every orientation (a sphere's centre, linear
+ * least squares on 2 a.b + c = |a|²), each orientation bin counting alike. False when the readings do not surround the
+ * centre enough to tell. Our own Touch pair, on recordings: left 0.27-0.31 m/s², right 0.10-0.11, radius 9.79-9.84.
+ */
+static bool
+imu_calibration_sphere_fit(const std::vector<xrt_vec3> &readings,
+                           const std::array<uint32_t, 14> &bins,
+                           bool hand,
+                           xrt_vec3 &out_bias,
+                           float &out_radius,
+                           float &out_p50,
+                           float &out_p90)
+{
+	out_p50 = out_p90 = -1.0f;
+	if (readings.size() < 20) {
+		return false;
+	}
+	double N[4][4] = {};
+	double rhs[4] = {};
+	// How much the directions spread on each axis: readings on one side leave the centre open along it.
+	double sum[3] = {};
+	double scatter[3][3] = {};
+	double weight_sum = 0.0;
+	for (const xrt_vec3 &a : readings) {
+		const uint32_t in_bin = bins[imu_calibration_bin(m_vec3_normalize(a))];
+		const double w = in_bin > 0 ? 1.0 / in_bin : 0.0;
+		const double row[4] = {2.0 * a.x, 2.0 * a.y, 2.0 * a.z, 1.0};
+		const double y = static_cast<double>(a.x) * a.x + static_cast<double>(a.y) * a.y + static_cast<double>(a.z) * a.z;
+		for (int r = 0; r < 4; r++) {
+			for (int c = 0; c < 4; c++) {
+				N[r][c] += w * row[r] * row[c];
+			}
+			rhs[r] += w * row[r] * y;
+		}
+		const xrt_vec3 u = m_vec3_normalize(a);
+		const double d[3] = {u.x, u.y, u.z};
+		for (int r = 0; r < 3; r++) {
+			sum[r] += w * d[r];
+			for (int c = 0; c < 3; c++) {
+				scatter[r][c] += w * d[r] * d[c];
+			}
+		}
+		weight_sum += w;
+	}
+	if (weight_sum <= 0.0) {
+		return false;
+	}
+	// The smallest spread of the directions (the scatter's smallest eigenvalue): power iteration on trace * I - scatter.
+	double trace = 0.0;
+	for (int r = 0; r < 3; r++) {
+		for (int c = 0; c < 3; c++) {
+			scatter[r][c] = scatter[r][c] / weight_sum - sum[r] * sum[c] / (weight_sum * weight_sum);
+		}
+		trace += scatter[r][r];
+	}
+	double v[3] = {0.577, 0.577, 0.577};
+	double smallest = 0.0;
+	for (int it = 0; it < 200; it++) {
+		double n[3] = {};
+		for (int r = 0; r < 3; r++) {
+			n[r] = trace * v[r];
+			for (int c = 0; c < 3; c++) {
+				n[r] -= scatter[r][c] * v[c];
+			}
+		}
+		const double len = sqrt(n[0] * n[0] + n[1] * n[1] + n[2] * n[2]);
+		if (len <= 0.0) {
+			return false;
+		}
+		smallest = trace - len;
+		for (int r = 0; r < 3; r++) {
+			v[r] = n[r] / len;
+		}
+	}
+	double b[3] = {};
+	double c = 0.0;
+	if (smallest < 0.02) {
+		/*
+		 * The readings lie about one plane (the guided poses: up, down and the buttons to either side all turn it
+		 * about one axis): the centre is fitted in that plane, nothing said of its offset out of it.
+		 */
+		double e1[3] = {v[1], -v[0], 0.0};
+		if (fabs(v[2]) > 0.9) {
+			e1[0] = 0.0;
+			e1[1] = v[2];
+			e1[2] = -v[1];
+		}
+		const double l1 = sqrt(e1[0] * e1[0] + e1[1] * e1[1] + e1[2] * e1[2]);
+		for (double &x : e1) {
+			x /= l1;
+		}
+		const double e2[3] = {v[1] * e1[2] - v[2] * e1[1], v[2] * e1[0] - v[0] * e1[2], v[0] * e1[1] - v[1] * e1[0]};
+		// They must spread within it: the scatter's smallest eigenvalue in the plane.
+		const auto quad = [&](const double *x, const double *y) {
+			double s = 0.0;
+			for (int r = 0; r < 3; r++) {
+				for (int k = 0; k < 3; k++) {
+					s += x[r] * scatter[r][k] * y[k];
+				}
+			}
+			return s;
+		};
+		const double m11 = quad(e1, e1), m12 = quad(e1, e2), m22 = quad(e2, e2);
+		const double in_plane = 0.5 * (m11 + m22) - sqrt(0.25 * (m11 - m22) * (m11 - m22) + m12 * m12);
+		if (in_plane < 0.02) {
+			return false;
+		}
+		double P[3][3] = {};
+		double prhs[3] = {};
+		for (const xrt_vec3 &a : readings) {
+			const uint32_t in_bin = bins[imu_calibration_bin(m_vec3_normalize(a))];
+			const double w = in_bin > 0 ? 1.0 / in_bin : 0.0;
+			const double row[3] = {2.0 * (a.x * e1[0] + a.y * e1[1] + a.z * e1[2]),
+			                       2.0 * (a.x * e2[0] + a.y * e2[1] + a.z * e2[2]), 1.0};
+			const double y = static_cast<double>(a.x) * a.x + static_cast<double>(a.y) * a.y + static_cast<double>(a.z) * a.z;
+			for (int r = 0; r < 3; r++) {
+				for (int k = 0; k < 3; k++) {
+					P[r][k] += w * row[r] * row[k];
+				}
+				prhs[r] += w * row[r] * y;
+			}
+		}
+		for (int i = 0; i < 3; i++) {
+			int pivot = i;
+			for (int r = i + 1; r < 3; r++) {
+				if (fabs(P[r][i]) > fabs(P[pivot][i])) {
+					pivot = r;
+				}
+			}
+			if (fabs(P[pivot][i]) < 1e-9) {
+				return false;
+			}
+			for (int k = 0; k < 3; k++) {
+				std::swap(P[i][k], P[pivot][k]);
+			}
+			std::swap(prhs[i], prhs[pivot]);
+			for (int r = 0; r < 3; r++) {
+				if (r != i) {
+					const double f = P[r][i] / P[i][i];
+					for (int k = 0; k < 3; k++) {
+						P[r][k] -= f * P[i][k];
+					}
+					prhs[r] -= f * prhs[i];
+				}
+			}
+		}
+		const double s1 = prhs[0] / P[0][0], s2 = prhs[1] / P[1][1];
+		for (int r = 0; r < 3; r++) {
+			b[r] = s1 * e1[r] + s2 * e2[r];
+		}
+		c = prhs[2] / P[2][2];
+	} else {
+	// Gaussian elimination with pivoting.
+	for (int i = 0; i < 4; i++) {
+		int pivot = i;
+		for (int r = i + 1; r < 4; r++) {
+			if (fabs(N[r][i]) > fabs(N[pivot][i])) {
+				pivot = r;
+			}
+		}
+		if (fabs(N[pivot][i]) < 1e-9) {
+			return false;
+		}
+		for (int c = 0; c < 4; c++) {
+			std::swap(N[i][c], N[pivot][c]);
+		}
+		std::swap(rhs[i], rhs[pivot]);
+		for (int r = 0; r < 4; r++) {
+			if (r != i) {
+				const double f = N[r][i] / N[i][i];
+				for (int c = 0; c < 4; c++) {
+					N[r][c] -= f * N[i][c];
+				}
+				rhs[r] -= f * rhs[i];
+			}
+		}
+	}
+	b[0] = rhs[0] / N[0][0];
+	b[1] = rhs[1] / N[1][1];
+	b[2] = rhs[2] / N[2][2];
+	c = rhs[3] / N[3][3];
+	}
+	const double radius_sq = c + b[0] * b[0] + b[1] * b[1] + b[2] * b[2];
+	if (radius_sq <= 0.0) {
+		return false;
+	}
+	out_bias = {static_cast<float>(b[0]), static_cast<float>(b[1]), static_cast<float>(b[2])};
+	out_radius = static_cast<float>(sqrt(radius_sq));
+
+	// Readings that do not sit on one sphere are no bias's work: moving, or the sphere is a poor fit of too few.
+	std::vector<float> off;
+	off.reserve(readings.size());
+	for (const xrt_vec3 &a : readings) {
+		off.push_back(fabsf(m_vec3_len(a - out_bias) - out_radius));
+	}
+	std::sort(off.begin(), off.end());
+	out_p50 = off[off.size() / 2];
+	out_p90 = off[off.size() * 9 / 10];
+	return hand ? out_p90 < kImuCalibrationSphereFitHand && out_p50 < kImuCalibrationSphereFitHandMedian
+	            : out_p90 < kImuCalibrationSphereFit;
+}
+
+static float
+imu_calibration_angle_deg(const xrt_quat &q)
+{
+	return RAD_TO_DEG(2.0f * acosf(CLAMP(fabsf(q.w), 0.0f, 1.0f)));
+}
+
+void
+Camera::collectImuCalibration(Device *device,
+                              const CameraSample &sample,
+                              const xrt_pose &Tcv_cam_device,
+                              const xrt_vec3 &camera_gravity,
+                              const xrt_vec3 &device_gravity,
+                              float error_rad,
+                              uint32_t matched_blobs)
+{
+	auto &cal = device->imu_calibration;
+	// What the sensors see of it just now, the most of any of them, for guiding the user.
+	if (matched_blobs >= cal.last_leds.load() ||
+	    sample.timestamp_ns - cal.last_leds_ns.load() > kImuCalibrationLedsAgeNs / 2) {
+		cal.last_leds.store(matched_blobs);
+		cal.last_leds_ns.store(sample.timestamp_ns);
+	}
+	{
+		// "Come closer": how well the sensors see it, from every solve of it.
+		std::unique_lock<os::Mutex> lock(cal.lock);
+		if (cal.active.load() && cal.step < 0) {
+			const float good = matched_blobs >= kImuCalibrationMinLeds ? 1.0f : 0.0f;
+			cal.close_share += 0.08f * (good - cal.close_share);
+			cal.close_last_ns = sample.timestamp_ns;
+		}
+	}
+	// Held with the trigger, the resting reading taken just now (with a hand's limits) says it was still enough.
+	if (matched_blobs < kImuCalibrationMinLeds || error_rad > kImuCalibrationToleranceRad ||
+	    !(cal.held.load() || cal.steps_complete.load() ||
+	      device->imu_tilt.restingAt(sample.timestamp_ns, kImuCalibrationRestNs))) {
+		return;
+	}
+
+	// The solve's down in the device's frame, as the error above compares it.
+	xrt_quat inverse = Tcv_cam_device.orientation;
+	math_quat_invert(&inverse, &inverse);
+	xrt_vec3 solve_down;
+	math_quat_rotate_vec3(&inverse, &camera_gravity, &solve_down);
+
+	std::unique_lock<os::Mutex> lock(cal.lock);
+	if (!cal.active.load() || cal.status.state != T_CONSTELLATION_IMU_CALIBRATION_COLLECTING) {
+		return;
+	}
+	if (sample.timestamp_ns < cal.collect_from_ns) {
+		return;
+	}
+
+	// The accelerometer's reading from just now, in the solve's coordinates.
+	if (cal.last_rest_ns == 0 || sample.timestamp_ns - cal.last_rest_ns > kImuCalibrationRestAgeNs ||
+	    cal.last_rest_ns - sample.timestamp_ns > kImuCalibrationRestAgeNs) {
+		return;
+	}
+	const xrt_vec3 reading = {cal.last_rest.x, -cal.last_rest.y, -cal.last_rest.z};
+	const size_t bin = imu_calibration_bin(m_vec3_normalize(cal.last_rest));
+	if (cal.bins[bin] < kImuCalibrationBinCap) {
+		if (cal.bins[bin] < kImuCalibrationPerBin) {
+			cal.last_progress_ns = sample.timestamp_ns;
+			cal.waited_windows[bin] = 0;
+		}
+		cal.bins[bin]++;
+		cal.pairs.emplace_back(reading, m_vec3_normalize(solve_down));
+	}
+	if (cal.held.load() && cal.step_result == 0 && cal.step >= 0 && !cal.wait_release && !cal.steps_complete.load()) {
+		cal.step_pairs++;
+		cal.last_progress_ns = sample.timestamp_ns;
+		device->imuCalibrationStepCheck();
+	}
+
+	uint32_t filled = 0, toward = 0;
+	for (uint32_t n : cal.bins) {
+		filled += n >= kImuCalibrationPerBin ? 1 : 0;
+		toward += std::min(n, kImuCalibrationPerBin);
+	}
+	const uint32_t bins_needed = static_cast<uint32_t>(debug_get_num_option_constellation_tracker_imu_calibration_bins());
+	uint32_t steps_done = 0;
+	for (bool done : cal.step_done) {
+		steps_done += done ? 1 : 0;
+	}
+	uint32_t rest_toward = 0;
+	for (uint32_t n : cal.rest_bins) {
+		rest_toward += std::min(n, kImuCalibrationPerBin);
+	}
+	// Both have to get there: the solves' orientations and the resting readings'.
+	const int pairs_progress = static_cast<int>(100 * toward / (bins_needed * kImuCalibrationPerBin));
+	const int rest_progress = static_cast<int>(100 * rest_toward / (bins_needed * kImuCalibrationPerBin));
+	(void)pairs_progress;
+	(void)rest_progress;
+	device->refreshImuCalibrationStatus();
+	// The poses held, or (no trigger: a device lying in each, a replay) enough orientations.
+	if (filled < bins_needed && steps_done < static_cast<uint32_t>(kImuCalibrationStepCount)) {
+		return;
+	}
+	// Tried again as resting readings come in, not at every solve.
+	if (sample.timestamp_ns - cal.fit_tried_ns < kImuCalibrationRetryNs) {
+		return;
+	}
+	cal.fit_tried_ns = sample.timestamp_ns;
+
+	/*
+	 * A round: the accelerometer's bias from its resting readings, then the rotation that takes the readings' down,
+	 * the bias out, to the solves', and what that leaves.
+	 */
+	xrt_vec3 bias = XRT_VEC3_ZERO;
+	float radius = static_cast<float>(MATH_GRAVITY_M_S2);
+	const bool hand_readings = 2 * static_cast<size_t>(cal.rest_hand) > cal.rest_accel.size();
+	float off_p50 = -1.0f, off_p90 = -1.0f;
+	/*
+	 * The guided poses all held and still no round: said in the log with why, the poses asked for once more, and
+	 * after kImuCalibrationMaxSets an end with a reason (they went round and round, unsaid: the maintainer's session).
+	 */
+	const auto no_round = [&](const char *why) {
+		if (steps_done < static_cast<uint32_t>(kImuCalibrationStepCount)) {
+			return;
+		}
+		cal.sets_without_round++;
+		CT_INFO(this->tracker,
+		        "Device %d: IMU calibration: the poses held gave no round (%s: %zu readings, %s, off one sphere p50 "
+		        "%.3f p90 %.3f m/s2); set %u of %u.",
+		        device->id, why, cal.rest_accel.size(), hand_readings ? "held in a hand" : "lying still", off_p50,
+		        off_p90, cal.sets_without_round, kImuCalibrationMaxSets);
+		if (cal.sets_without_round >= kImuCalibrationMaxSets) {
+			cal.status.state = T_CONSTELLATION_IMU_CALIBRATION_FAILED;
+			cal.status.reason = T_CONSTELLATION_IMU_CALIBRATION_REASON_UNSETTLED;
+			cal.active.store(false);
+			CT_WARN(this->tracker, "Device %d: IMU calibration failed: the readings did not settle in %u sets.",
+			        device->id, kImuCalibrationMaxSets);
+			return;
+		}
+		device->imuCalibrationStepsRestart();
+	};
+	/*
+	 * Without it, no round: a bias left in comes out as a rotation that is not there (1.5 m/s² as 10.9 degrees, on a
+	 * recording). Until the readings surround the centre enough, or do not fit one sphere, it keeps collecting.
+	 */
+	if (!imu_calibration_sphere_fit(cal.rest_accel, cal.rest_bins, hand_readings, bias, radius, off_p50, off_p90)) {
+		no_round("the accelerometer's readings do not fit one sphere yet");
+		return;
+	}
+	if (m_vec3_len(bias) > kImuCalibrationMaxBias) {
+		cal.status.state = T_CONSTELLATION_IMU_CALIBRATION_FAILED;
+		cal.status.reason = T_CONSTELLATION_IMU_CALIBRATION_REASON_BIAS_TOO_LARGE;
+		cal.active.store(false);
+		CT_WARN(this->tracker, "Device %d: IMU calibration failed: a bias of %.2f m/s2 is too large to trust.",
+		        device->id, m_vec3_len(bias));
+		return;
+	}
+	const xrt_vec3 bias_cv = {bias.x, -bias.y, -bias.z};
+	std::vector<std::pair<xrt_vec3, xrt_vec3>> unbiased = cal.pairs;
+	// An accelerometer at rest reads up: down is its opposite, what the solve's is.
+	xrt_vec3 mean_down = XRT_VEC3_ZERO;
+	for (auto &pair : unbiased) {
+		pair.first = m_vec3_normalize(bias_cv - pair.first);
+		mean_down = mean_down + pair.first;
+	}
+	/*
+	 * Downs that all point nearly one way say nothing of a turn about that way, and any turn about it then fits: 1 minus
+	 * the mean's length is how far they spread, 0 for none.
+	 */
+	const float min_spread = static_cast<float>(debug_get_num_option_constellation_tracker_imu_calibration_spread()) / 100.0f;
+	if (1.0f - m_vec3_len(mean_down) / static_cast<float>(unbiased.size()) < min_spread) {
+		no_round("the solves' downs do not spread enough");
+		return;
+	}
+	const xrt_quat fit_cv = imu_calibration_fit(unbiased);
+	std::vector<float> residual;
+	residual.reserve(unbiased.size());
+	for (const auto &[u, v] : unbiased) {
+		xrt_vec3 turned;
+		math_quat_rotate_vec3(&fit_cv, &u, &turned);
+		residual.push_back(RAD_TO_DEG(acosf(CLAMP(m_vec3_dot(turned, v), -1.0f, 1.0f))));
+	}
+	std::sort(residual.begin(), residual.end());
+	const float p90 = residual[residual.size() * 9 / 10];
+	const float fit_deg = imu_calibration_angle_deg(fit_cv);
+
+	// The IMU's samples are in OpenXR coordinates, these OpenCV's: the same turn about x and the others mirrored.
+	const xrt_quat fit_xr = {fit_cv.x, -fit_cv.y, -fit_cv.z, fit_cv.w};
+	xrt_quat total;
+	math_quat_rotate(&fit_xr, &cal.status.correction, &total);
+	math_quat_normalize(&total);
+	const float total_deg = imu_calibration_angle_deg(total);
+
+	// This round's samples had the corrections so far applied: its bias, taken back through them.
+	xrt_quat before_inverse = cal.status.correction;
+	math_quat_invert(&before_inverse, &before_inverse);
+	xrt_vec3 bias_back;
+	math_quat_rotate_vec3(&before_inverse, &bias, &bias_back);
+	const xrt_vec3 bias_total = cal.status.accel_bias + bias_back;
+	const float bias_len = m_vec3_len(bias);
+
+	CT_INFO(this->tracker,
+	        "Device %d: IMU calibration round %d: %.1f degrees from %zu pairs (residual p90 %.1f), %.1f in all; "
+	        "accelerometer bias %.3f m/s2 from %zu readings (radius %.2f), (%.3f %.3f %.3f) in all.",
+	        device->id, cal.status.round, fit_deg, cal.pairs.size(), p90, total_deg, bias_len, cal.rest_accel.size(),
+	        radius, bias_total.x, bias_total.y, bias_total.z);
+
+	cal.status.residual_p90_deg = p90;
+	if (total_deg > kImuCalibrationMaxDeg || p90 > kImuCalibrationMaxResidualDeg) {
+		cal.status.state = T_CONSTELLATION_IMU_CALIBRATION_FAILED;
+		cal.status.reason = total_deg > kImuCalibrationMaxDeg ? T_CONSTELLATION_IMU_CALIBRATION_REASON_TOO_LARGE
+		                                                      : T_CONSTELLATION_IMU_CALIBRATION_REASON_SOLVES_DISAGREE;
+		cal.active.store(false);
+		CT_WARN(this->tracker, "Device %d: IMU calibration failed: %s.", device->id,
+		        total_deg > kImuCalibrationMaxDeg ? "the correction is too large to be the IMU's seat"
+		                                          : "the solves disagree among themselves");
+		return;
+	}
+	cal.status.correction = total;
+	cal.status.correction_deg = total_deg;
+	cal.status.accel_bias = bias_total;
+	cal.status.generation++;
+	if ((fit_deg < kImuCalibrationDoneDeg && bias_len < kImuCalibrationDoneBias) ||
+	    cal.status.round >= kImuCalibrationRounds) {
+		cal.status.state = T_CONSTELLATION_IMU_CALIBRATION_DONE;
+		cal.status.progress = 100;
+		cal.status.overall_progress = 100;
+		cal.active.store(false);
+		CT_INFO(this->tracker, "Device %d: IMU calibration done: %.1f degrees.", device->id, total_deg);
+		return;
+	}
+	cal.status.round++;
+	cal.status.progress = 0;
+	cal.pairs.clear();
+	cal.bins.fill(0);
+	cal.rest_accel.clear();
+	cal.rest_bins.fill(0);
+	cal.rest_hand = 0;
+	cal.sets_without_round = 0;
+	cal.window_count = 0;
+	cal.last_rest_ns = 0;
+	cal.waited_windows.fill(0);
+	cal.given_up.fill(false);
+	cal.last_progress_ns = sample.timestamp_ns;
+	cal.collect_from_ns = sample.timestamp_ns + kImuCalibrationSettleNs;
+	device->imuCalibrationStepsRestart();
+	device->refreshImuCalibrationStatus();
+}
+
 bool
 Camera::bindingPrior(Device *device,
                      const CameraSample &sample,
@@ -959,6 +1804,11 @@ Camera::bindingPrior(Device *device,
 {
 	const ConstellationTracker *tracker = this->tracker;
 	if (!device_state.Tcv_cam_device_predicted.has_value()) {
+		return false;
+	}
+	// The prior's orientation came through the same gyro, see ImuTilt::clipped.
+	if (debug_get_bool_option_constellation_tracker_gravity_clip_unbind() &&
+	    debug_get_float_option_constellation_tracker_gravity_clip_tolerance_deg() > 0.0f && device->imu_tilt.clipped()) {
 		return false;
 	}
 
@@ -987,6 +1837,17 @@ Camera::bindingPrior(Device *device,
 			return false;
 		}
 		out_pos_tolerance = &tracker->held_prior_tolerance_pos;
+		// Only for a controller whose IMU is being corrected (in full or provisionally): its kept orientation carries
+		// what the correction leaves, or a gyro still turned. For every controller it brought more jumps by day.
+		if (!device->params.head && tracker->held_prior_rot_growth &&
+		    (device->imu_align.applied.load() || device->imu_align.provisional.load())) {
+			size_t step = 0;
+			while (step < ConstellationTracker::kHeldRotSteps - 1 && since_solve_ns >= kHeldRotStepNs[step]) {
+				step++;
+			}
+			out_rot_tolerance = &tracker->held_prior_tolerance_rot[step];
+			return true;
+		}
 	}
 
 	out_rot_tolerance = &tracker->prior_tolerance_rot;
@@ -1079,7 +1940,9 @@ Camera::poseMatchesPrior(Device *device,
                          const CameraSample &sample,
                          const DeviceState &device_state,
                          const xrt_pose &Tcv_cam_device,
-                         SolveSource source)
+                         SolveSource source,
+                         uint32_t matched_blobs,
+                         float rms_px)
 {
 	const xrt_vec3 *pos_tolerance = nullptr;
 	const xrt_vec3 *rot_tolerance = nullptr;
@@ -1105,8 +1968,42 @@ Camera::poseMatchesPrior(Device *device,
 		since_ns = sample.timestamp_ns;
 	}
 	const uint32_t count = device->prior_disagree_count.fetch_add(1) + 1;
-	if (this->tracker->prior_distrust_ns > 0 && count >= CT_PRIOR_DISTRUST_MIN_SOLVES &&
-	    sample.timestamp_ns - since_ns >= this->tracker->prior_distrust_ns) {
+
+	// Three strong solves that agree with each other end the wait at once (CONSTELLATION_TRACKER_RESEED_LEDS).
+	bool reseed = false;
+	const int64_t reseed_leds = debug_get_num_option_constellation_tracker_reseed_leds();
+	if (reseed_leds > 0 && !device->params.head && matched_blobs >= static_cast<uint32_t>(reseed_leds) &&
+	    rms_px <= 0.20f && sample.Txr_world_cam.has_value()) {
+		xrt_pose Txr_cam_device;
+		math_pose_convert_from_opencv(&Tcv_cam_device, &Txr_cam_device);
+		xrt_pose Txr_world_device;
+		math_pose_transform(&sample.Txr_world_cam.value(), &Txr_cam_device, &Txr_world_device);
+		std::lock_guard<os::Mutex> lock(device->data_lock);
+		auto &left = device->reseed_left;
+		left[2] = left[1];
+		left[1] = left[0];
+		left[0] = {sample.timestamp_ns, Txr_world_device};
+		device->reseed_left_count = std::min<uint32_t>(device->reseed_left_count + 1, 3);
+		if (device->reseed_left_count == 3 && left[0].first - left[2].first <= 60 * U_TIME_1MS_IN_NS) {
+			reseed = true;
+			for (size_t a = 0; a < 3 && reseed; a++) {
+				for (size_t b = a + 1; b < 3 && reseed; b++) {
+					const float dt_s = static_cast<float>(std::llabs(left[a].first - left[b].first)) / 1e9f;
+					xrt_quat delta;
+					math_quat_unrotate(&left[a].second.orientation, &left[b].second.orientation, &delta);
+					const float ang = 2.0f * acosf(CLAMP(fabsf(delta.w), 0.0f, 1.0f));
+					reseed = m_vec3_len(left[a].second.position - left[b].second.position) <= 0.03f + 4.0f * dt_s &&
+					         ang <= DEG_TO_RAD(5.0f);
+				}
+			}
+		}
+		if (reseed) {
+			device->reseed_left_count = 0;
+		}
+	}
+
+	if (reseed || (this->tracker->prior_distrust_ns > 0 && count >= CT_PRIOR_DISTRUST_MIN_SOLVES &&
+	               sample.timestamp_ns - since_ns >= this->tracker->prior_distrust_ns)) {
 		// The prior is the device's fusion, or follows from it: start that over from the solves too.
 		if (debug_get_bool_option_constellation_tracker_fusion_reset()) {
 			device->sensor_fusion->requestReset();
@@ -1178,7 +2075,7 @@ Camera::tryDevicePose(Device *device,
 	// A degenerate pose had fewer LEDs than the device's model asks for, see its match parameters.
 	if (POSE_HAS_FLAGS(&score, POSE_MATCH_GOOD | POSE_MATCH_LED_IDS) &&
 	    !POSE_HAS_FLAGS(&score, POSE_MATCH_DEGENERATE) &&
-	    this->poseMatchesGravity(device, sample, Tcv_cam_device_candidate, source)) {
+	    this->poseMatchesGravity(device, sample, Tcv_cam_device_candidate, source, score.matched_blobs)) {
 		return this->pushPose(        //
 		    sample,                   //
 		    device_state,             //
@@ -1339,11 +2236,13 @@ Camera::tryDevicePoseHeldStill(Device *device,
 DEBUG_GET_ONCE_BOOL_OPTION(constellation_tracker_few_leds, "CONSTELLATION_TRACKER_FEW_LEDS", true)
 //! How far a projected LED's blob may be, and how closely the matches have to agree on the shift.
 #define CT_FEW_SEARCH_PX 10.0f
-#define CT_FEW_AGREE_PX 1.5f
+DEBUG_GET_ONCE_FLOAT_OPTION(constellation_tracker_few_agree_px, "CONSTELLATION_TRACKER_FEW_AGREE_PX", 1.5f)
+#define CT_FEW_AGREE_PX debug_get_float_option_constellation_tracker_few_agree_px()
 //! The next nearest blob has to be this much further than the nearest, or the match is ambiguous.
 #define CT_FEW_UNIQUE_PX 3.0f
 //! The solved position may be at most this far from the prior's, and has to fit its blobs this well.
-#define CT_FEW_MAX_MOVE_M 0.06f
+DEBUG_GET_ONCE_FLOAT_OPTION(constellation_tracker_few_max_move_m, "CONSTELLATION_TRACKER_FEW_MAX_MOVE_M", 0.06f)
+#define CT_FEW_MAX_MOVE_M debug_get_float_option_constellation_tracker_few_max_move_m()
 #define CT_FEW_MAX_RMS_PX 1.0f
 //! Pulls the position towards the prior's: with 2 LEDs the depth is weakly held. 1 cm costs about what 1 px does.
 #define CT_FEW_PRIOR_WEIGHT 0.25
@@ -1352,13 +2251,57 @@ DEBUG_GET_ONCE_BOOL_OPTION(constellation_tracker_few_leds, "CONSTELLATION_TRACKE
  * drifting prior, 12 % of them 10 cm or more off.
  */
 DEBUG_GET_ONCE_NUM_OPTION(constellation_tracker_few_leds_bridge_ms, "CONSTELLATION_TRACKER_FEW_LEDS_BRIDGE_MS", 500)
+/*!
+ * No slow search for a device solved this long ago: a fast solve is hoped for. In fast waves the fast paths could not follow,
+ * and at 150 ms a controller was found only every eighth frame, the fusion drifting 12-15 cm between solves that were right.
+ * Against Oculus, day and night, 100 ms took that off; below it the pose got worse.
+ */
+DEBUG_GET_ONCE_NUM_OPTION(constellation_tracker_slow_skip_ms, "CONSTELLATION_TRACKER_SLOW_SKIP_MS", 100)
+//! The slow search's wait for a device whose IMU is being calibrated (see its use).
+static constexpr int64_t kSlowSkipCalibratingMs = 150;
 DEBUG_GET_ONCE_NUM_OPTION(constellation_tracker_few_leds_min, "CONSTELLATION_TRACKER_FEW_LEDS_MIN", 3)
+//! A pose from three LEDs is at most this far (m) from one of five or more LEDs in the last kFewLedsStrongNs. 0: not checked.
+//! 0.20: at 0.10 a hand moving fast had right poses turned away (Oculus captures: night left jumps 5 -> 2, day right 1 -> 0).
+DEBUG_GET_ONCE_FLOAT_OPTION(constellation_tracker_few_leds_strong_m, "CONSTELLATION_TRACKER_FEW_LEDS_STRONG_M", 0.20f)
+static constexpr int64_t kFewLedsStrongNs = 100 * U_TIME_1MS_IN_NS;
+//! A pose from three LEDs fits its blobs at least this well (rms, pixels), see where it is checked. 0: as any other.
+DEBUG_GET_ONCE_FLOAT_OPTION(constellation_tracker_few_leds_3_max_rms_px, "CONSTELLATION_TRACKER_FEW_LEDS_3_MAX_RMS_PX", 0.0f)
+/*
+ * A few-LED pose (solved within CT_FEW_MAX_MOVE_M of the prior) may fit its blobs up to this (rms, pixels) instead of
+ * CONSTELLATION_TRACKER_GRAVITY_PRIOR_MAX_RMS_PX while the device turns at least ..._TURNING rad/s, and not after its
+ * gyro clipped (the prior's orientation is then off, see ImuTilt::clipped). 0: as the others.
+ */
+// 0.8 turning 0.3: by day the right controller's hard stretch (2-3 LEDs at 0.56-0.74 px, 1 cm from Oculus) is tracked:
+// day right 95.7 -> 96.3 % (Oculus 96.2), night left 95.4 -> 95.5 and right 97.3 -> 97.6, the night left never 10 cm
+// off (0.15 -> 0 %); resting shake unchanged. Cost: P90 +0.25 mm night left, +0.7 mm day right (the newly tracked
+// stretch). For every pose and at rest too, the shake rose 0.3 mm by day; also after a clip, a 0.67 s hold.
+DEBUG_GET_ONCE_FLOAT_OPTION(constellation_tracker_few_leds_max_rms_px, "CONSTELLATION_TRACKER_FEW_LEDS_MAX_RMS_PX", 0.8f)
+DEBUG_GET_ONCE_FLOAT_OPTION(constellation_tracker_few_leds_max_rms_turning, "CONSTELLATION_TRACKER_FEW_LEDS_MAX_RMS_TURNING", 0.3f)
 /*!
  * Also with up to this many LEDs, once the full solves from the prior failed: a Touch seen nearly edge-on shows 4-5
  * LEDs in a short row, which the shift match then finds where the full refinement did not. pushPose refines the pose
  * found with the IMU's tilt weighed in.
  */
 DEBUG_GET_ONCE_NUM_OPTION(constellation_tracker_few_leds_max, "CONSTELLATION_TRACKER_FEW_LEDS_MAX", 6)
+//! See the brute force identification in Camera::tryDevicePoseFewLeds.
+/*
+ * On by default: a left controller 3.4 m from the sensors, seen mostly with 3-4 LEDs, was held still 10.3 s of 149 s
+ * (longest 3.3 s) and slid up to 54 cm when found again; with it 7.3 s (2.3 s), 38 cm. Against what Oculus tracked, day
+ * and night, nothing worse: night left P90 14.96 -> 13.76 mm, no jumps. controllers.tracking "0.1.4" sets 0.
+ */
+DEBUG_GET_ONCE_BOOL_OPTION(constellation_tracker_few_brute, "CONSTELLATION_TRACKER_FEW_BRUTE", true)
+DEBUG_GET_ONCE_FLOAT_OPTION(constellation_tracker_few_brute_max_move_m, "CONSTELLATION_TRACKER_FEW_BRUTE_MAX_MOVE_M", 0.10f)
+DEBUG_GET_ONCE_FLOAT_OPTION(constellation_tracker_few_brute_max_rms_px, "CONSTELLATION_TRACKER_FEW_BRUTE_MAX_RMS_PX", 0.8f)
+DEBUG_GET_ONCE_FLOAT_OPTION(constellation_tracker_few_brute_second_min_px, "CONSTELLATION_TRACKER_FEW_BRUTE_SECOND_MIN_PX", 1.5f)
+DEBUG_GET_ONCE_FLOAT_OPTION(constellation_tracker_few_brute_second_ratio, "CONSTELLATION_TRACKER_FEW_BRUTE_SECOND_RATIO", 3.0f)
+#define CT_FEW_BRUTE_MAX_MOVE_M debug_get_float_option_constellation_tracker_few_brute_max_move_m()
+#define CT_FEW_BRUTE_MAX_RMS_PX ((double)debug_get_float_option_constellation_tracker_few_brute_max_rms_px())
+#define CT_FEW_BRUTE_SECOND_MIN_PX ((double)debug_get_float_option_constellation_tracker_few_brute_second_min_px())
+#define CT_FEW_BRUTE_SECOND_RATIO ((double)debug_get_float_option_constellation_tracker_few_brute_second_ratio())
+DEBUG_GET_ONCE_NUM_OPTION(constellation_tracker_few_brute_fresh_ms, "CONSTELLATION_TRACKER_FEW_BRUTE_FRESH_MS", 0)
+#define CT_FEW_BRUTE_FRESH_NS (debug_get_num_option_constellation_tracker_few_brute_fresh_ms() * (int64_t)U_TIME_1MS_IN_NS)
+#define CT_FEW_BRUTE_MARGIN_PX 12.0f
+#define CT_FEW_BRUTE_APART_M 0.02f
 /*!
  * The fast paths' refinement weighs the IMU's tilt in, see pose_optimize.cpp. Held upright, a pose from the wrong LEDs
  * no longer tilts away but fits its blobs worse: such a pose has to fit within this RMS, in pixels.
@@ -1384,24 +2327,222 @@ Camera::tryDevicePoseFewLeds(Device *device,
                              DeviceState &device_state,
                              const std::optional<xrt_space_relation> &Tcv_cam_device_prior)
 {
-	if (!debug_get_bool_option_constellation_tracker_few_leds() || !device_state.prior_position_tracked) {
-		return false; // Only a fresh prior's orientation is good enough to keep.
+	ConstellationTracker *few_tracker = this->tracker;
+	auto give_up = [&](const char *why, int a, int b) {
+		CT_TRACE(few_tracker, "Few LEDs for device %d at %" PRIi64 ": %s (%d, %d)", device->id, sample.timestamp_ns, why, a, b);
+		return false;
+	};
+	auto brute_with = [&](const xrt_pose &bprior, const pose_metrics_blob_match_info &binfo, const char *why, int a,
+	                      int b) -> bool {
+		if (!debug_get_bool_option_constellation_tracker_few_brute() || binfo.num_visible_leds < 3) {
+			return give_up(why, a, b);
+		}
+		const t_constellation_tracker_led_model &lm = device->params.led_model;
+		float minx = 1e9f, miny = 1e9f, maxx = -1e9f, maxy = -1e9f;
+		for (int i = 0; i < binfo.num_visible_leds; i++) {
+			const xrt_vec2 &q = binfo.visible_leds[i].pos_px_undistorted;
+			minx = std::min(minx, q.x); maxx = std::max(maxx, q.x);
+			miny = std::min(miny, q.y); maxy = std::max(maxy, q.y);
+		}
+		const float margin = CT_FEW_BRUTE_MARGIN_PX;
+		const float cx = (minx + maxx) * 0.5f, cy = (miny + maxy) * 0.5f;
+		std::array<std::pair<float, uint32_t>, 32> cand{};
+		int nc = 0;
+		for (uint32_t bi = 0; bi < sample.blob_count && nc < 32; bi++) {
+			const t_blob &blob = sample.blobs[bi];
+			if (blob.matched_device_id != XRT_CONSTELLATION_INVALID_DEVICE_ID && blob.matched_device_id != device->id) {
+				continue;
+			}
+			const xrt_vec2 &c = blob.center_undistorted;
+			if (c.x < minx - margin || c.x > maxx + margin || c.y < miny - margin || c.y > maxy + margin) {
+				continue;
+			}
+			cand[nc++] = {(c.x - cx) * (c.x - cx) + (c.y - cy) * (c.y - cy), bi};
+		}
+		if (nc < 3) {
+			return give_up(why, a, b);
+		}
+		std::sort(cand.begin(), cand.begin() + nc);
+		nc = std::min(nc, 4);
+		const int nv = std::min(binfo.num_visible_leds, 24);
+		std::array<xrt_vec3, 24> X{};
+		std::array<int, 24> led_index{};
+		for (int i = 0; i < nv; i++) {
+			led_index[i] = static_cast<int>(binfo.visible_leds[i].led - lm.leds);
+			math_quat_rotate_vec3(&bprior.orientation, &lm.leds[led_index[i]].position, &X[i]);
+		}
+		const xrt_vec3 tp = bprior.position;
+		const double w = 1e-4;
+		struct Best
+		{
+			double rms = 1e9;
+			xrt_vec3 pos{};
+			int leds[3]{};
+			uint32_t blobs[3]{};
+		};
+		Best best, second;
+		const double fx = this->model.calib_pinhole.fx, fy = this->model.calib_pinhole.fy;
+
+		for (int b0 = 0; b0 < nc; b0++) {
+			for (int b1 = b0 + 1; b1 < nc; b1++) {
+				for (int b2 = b1 + 1; b2 < nc; b2++) {
+					const uint32_t bl[3] = {cand[b0].second, cand[b1].second, cand[b2].second};
+					double hx[3], hy[3];
+					for (int k = 0; k < 3; k++) {
+						hx[k] = sample.blobs[bl[k]].center_homogenized.x;
+						hy[k] = sample.blobs[bl[k]].center_homogenized.y;
+					}
+					for (int l0 = 0; l0 < nv; l0++) {
+						for (int l1 = 0; l1 < nv; l1++) {
+							if (l1 == l0) {
+								continue;
+							}
+							for (int l2 = 0; l2 < nv; l2++) {
+								if (l2 == l0 || l2 == l1) {
+									continue;
+								}
+								const int ls[3] = {l0, l1, l2};
+								double ata[3][3] = {{w, 0, 0}, {0, w, 0}, {0, 0, w}};
+								double atb[3] = {w * tp.x, w * tp.y, w * tp.z};
+								for (int k = 0; k < 3; k++) {
+									const xrt_vec3 &M = X[ls[k]];
+									const double rows[2][4] = {{1, 0, -hx[k], hx[k] * M.z - M.x},
+									                           {0, 1, -hy[k], hy[k] * M.z - M.y}};
+									for (const auto &r : rows) {
+										for (int u = 0; u < 3; u++) {
+											for (int v = 0; v < 3; v++) {
+												ata[u][v] += r[u] * r[v];
+											}
+											atb[u] += r[u] * r[3];
+										}
+									}
+								}
+								auto d3 = [](const double m[3][3]) {
+									return m[0][0] * (m[1][1] * m[2][2] - m[1][2] * m[2][1]) -
+									       m[0][1] * (m[1][0] * m[2][2] - m[1][2] * m[2][0]) +
+									       m[0][2] * (m[1][0] * m[2][1] - m[1][1] * m[2][0]);
+								};
+								const double det = d3(ata);
+								if (fabs(det) < 1e-12) {
+									continue;
+								}
+								double t[3];
+								for (int c = 0; c < 3; c++) {
+									double m[3][3];
+									for (int u = 0; u < 3; u++) {
+										for (int v = 0; v < 3; v++) {
+											m[u][v] = v == c ? atb[u] : ata[u][v];
+										}
+									}
+									t[c] = d3(m) / det;
+								}
+								const xrt_vec3 pos = {(float)t[0], (float)t[1], (float)t[2]};
+								if (pos.z <= 0.1f || m_vec3_len(pos - tp) > CT_FEW_BRUTE_MAX_MOVE_M) {
+									continue;
+								}
+								double sq = 0;
+								for (int k = 0; k < 3; k++) {
+									const xrt_vec3 P = X[ls[k]] + pos;
+									const double ex = (P.x / P.z - hx[k]) * fx, ey = (P.y / P.z - hy[k]) * fy;
+									sq += ex * ex + ey * ey;
+								}
+								const double rms = sqrt(sq / 3.0);
+								if (rms < best.rms) {
+									if (m_vec3_len(pos - best.pos) > CT_FEW_BRUTE_APART_M) {
+										second = best;
+									}
+									best.rms = rms;
+									best.pos = pos;
+									for (int k = 0; k < 3; k++) {
+										best.leds[k] = led_index[ls[k]];
+										best.blobs[k] = bl[k];
+									}
+								} else if (rms < second.rms && m_vec3_len(pos - best.pos) > CT_FEW_BRUTE_APART_M) {
+									second.rms = rms;
+									second.pos = pos;
+								}
+							}
+						}
+					}
+				}
+			}
+		}
+		if (best.rms > CT_FEW_BRUTE_MAX_RMS_PX) {
+			return give_up("brute: no fit", (int)(best.rms * 100), nc);
+		}
+		xrt_vec3 chosen = best.pos;
+		if (second.rms < std::max(CT_FEW_BRUTE_SECOND_MIN_PX, CT_FEW_BRUTE_SECOND_RATIO * best.rms)) {
+			return give_up("brute: ambiguous (centi-px best, second)", (int)(best.rms * 100), (int)(second.rms * 100));
+		}
+		xrt_pose solved = bprior;
+		solved.position = chosen;
+		pose_metrics score;
+		pose_metrics_evaluate_pose(&score, &solved, sample.blobs, sample.blob_count, &device->params.led_model,
+		                           device->id, &this->model, NULL);
+		if (!this->pushPose(sample, device_state, device, score, solved, std::nullopt, SolveSource::FastFewLeds)) {
+			return give_up("brute: pushPose refused", (int)(best.rms * 100), (int)(second.rms * 100));
+		}
+		CT_TRACE(few_tracker, "Few LEDs for device %d at %" PRIi64 ": brute found (%d, %d)", device->id,
+		         sample.timestamp_ns, (int)(best.rms * 100), (int)(second.rms * 100));
+		return true;
+	};
+	if (!debug_get_bool_option_constellation_tracker_few_leds()) {
+		return false;
+	}
+	if (!device_state.prior_position_tracked) {
+		/*
+		 * Past the prior's freshness the shift match is not tried (it followed a drifting prior), but the IMU-driven
+		 * filter still predicts the controller for the rest of the second, as the Oculus runtime keeps tracking a
+		 * controller for 1 s from its last pose: the strict every-way identification is tried from that.
+		 */
+		xrt_space_relation ekf_relation;
+		const int64_t last_full = device->last_full_solve_ns.load();
+		if (!debug_get_bool_option_constellation_tracker_few_brute() || device->params.head ||
+		    !debug_get_bool_option_constellation_tracker_ekf_prior() || !sample.Txr_world_cam.has_value() ||
+		    CT_FEW_BRUTE_FRESH_NS <= 0 || last_full == 0 || sample.timestamp_ns - last_full > CT_FEW_BRUTE_FRESH_NS ||
+		    !device->touch_ekf.relationAt(sample.timestamp_ns, CT_FEW_BRUTE_FRESH_NS, ekf_relation)) {
+			return give_up("prior not tracked", 0, 0); // Only a fresh prior's orientation is good enough to keep.
+		}
+		xrt_pose Tcv_world_cam, Tcv_cam_world;
+		math_pose_convert_from_opencv(&sample.Txr_world_cam.value(), &Tcv_world_cam);
+		math_pose_invert(&Tcv_world_cam, &Tcv_cam_world);
+		xrt_space_relation Tcv_world_device = ekf_relation;
+		math_space_relation_convert_from_opencv(&ekf_relation, &Tcv_world_device);
+		xrt_pose late_prior;
+		math_pose_transform(&Tcv_cam_world, &Tcv_world_device.pose, &late_prior);
+		if (late_prior.position.z <= 0.1f) {
+			return give_up("late prior behind the camera", 0, 0);
+		}
+		pose_metrics_blob_match_info late_info;
+		pose_metrics_match_pose_to_blobs(&late_prior, sample.blobs, sample.blob_count, &device->params.led_model,
+		                                 device->id, &this->model, &late_info);
+		return brute_with(late_prior, late_info, "prior not tracked, late", 0, 0);
 	}
 	const int64_t last_full_ns = device->last_full_solve_ns.load();
 	if (last_full_ns == 0 ||
 	    sample.timestamp_ns - last_full_ns >
 	        debug_get_num_option_constellation_tracker_few_leds_bridge_ms() * (int64_t)U_TIME_1MS_IN_NS) {
-		return false;
+		return give_up("no full solve within the bridge", (int)((sample.timestamp_ns - last_full_ns) / U_TIME_1MS_IN_NS), 0);
 	}
 
 	const xrt_pose &prior = Tcv_cam_device_prior->pose;
 	if (prior.position.z <= 0.1f) {
-		return false;
+		return give_up("prior behind the camera", 0, 0);
 	}
 
 	pose_metrics_blob_match_info info;
 	pose_metrics_match_pose_to_blobs(&prior, sample.blobs, sample.blob_count, &device->params.led_model, device->id,
 	                                 &this->model, &info);
+	auto try_brute = [&](const char *why, int a, int b) -> bool { return brute_with(prior, info, why, a, b); };
+
+	/*
+	 * Which of the visible LEDs 3 blobs near the controller are, tried every way: with the prior's orientation (its
+	 * IMU's) each assignment gives a position; the one that fits clearly better than every other one far from it is
+	 * taken. Far from the sensors (3.4 m) a Touch's LEDs project 3-4 px apart, so each LED's nearest blob is rarely
+	 * clear and a prior a few degrees off moves them by more than the shift match allows: a left controller seen with
+	 * 3-4 LEDs was lost 23 times in 150 s and slid up to 36 cm when found again. As the Oculus runtime, which tracks
+	 * from 3 matched LEDs. CONSTELLATION_TRACKER_FEW_BRUTE=0: not tried.
+	 */
 
 	// Each visible LED's nearest blob that no other device has, if it is clearly the nearest.
 	struct Pair
@@ -1442,7 +2583,7 @@ Camera::tryDevicePoseFewLeds(Device *device,
 		              sample.blobs[best_blob].center_undistorted.y - p.y};
 	}
 	if (n < 2) {
-		return false;
+		return try_brute("fewer than 2 unique pairs", n, info.num_visible_leds);
 	}
 
 	// The shift most of them agree on: the prior's position is a few pixels off, its orientation is not.
@@ -1464,7 +2605,7 @@ Camera::tryDevicePoseFewLeds(Device *device,
 	// With more a full pose is better found by the other paths, which ran first.
 	if (best_support < debug_get_num_option_constellation_tracker_few_leds_min() ||
 	    best_support > debug_get_num_option_constellation_tracker_few_leds_max()) {
-		return false;
+		return try_brute("support out of range", best_support, n);
 	}
 
 	/*
@@ -1505,7 +2646,7 @@ Camera::tryDevicePoseFewLeds(Device *device,
 	};
 	const double det = det3(ata);
 	if (fabs(det) < 1e-12) {
-		return false;
+		return give_up("singular", m, 0);
 	}
 	double t[3];
 	for (int c = 0; c < 3; c++) {
@@ -1521,7 +2662,7 @@ Camera::tryDevicePoseFewLeds(Device *device,
 	xrt_pose solved = prior;
 	solved.position = {static_cast<float>(t[0]), static_cast<float>(t[1]), static_cast<float>(t[2])};
 	if (m_vec3_len(solved.position - tp) > CT_FEW_MAX_MOVE_M || solved.position.z <= 0.1f) {
-		return false;
+		return give_up("moved too far from the prior (mm)", (int)(m_vec3_len(solved.position - tp) * 1000), m);
 	}
 
 	// How well it fits the blobs it was solved from, in pixels.
@@ -1536,13 +2677,17 @@ Camera::tryDevicePoseFewLeds(Device *device,
 		sq += ex * ex + ey * ey;
 	}
 	if (sqrt(sq / m) > CT_FEW_MAX_RMS_PX) {
-		return false;
+		return give_up("fits badly (centi-px)", (int)(sqrt(sq / m) * 100), m);
 	}
 
 	pose_metrics score;
 	pose_metrics_evaluate_pose(&score, &solved, sample.blobs, sample.blob_count, &device->params.led_model,
 	                           device->id, &this->model, NULL);
-	return this->pushPose(sample, device_state, device, score, solved, std::nullopt, SolveSource::FastFewLeds);
+	const bool pushed = this->pushPose(sample, device_state, device, score, solved, std::nullopt, SolveSource::FastFewLeds);
+	if (!pushed) {
+		return give_up("pushPose refused", m, 0);
+	}
+	return true;
 }
 
 bool
@@ -1653,7 +2798,7 @@ Camera::tryDeviceBlobRecovery(Device *device,
 
 	if (((kAlwaysTrustRansac && score.matched_blobs > 4) || POSE_HAS_FLAGS(&score, POSE_MATCH_GOOD)) &&
 	    !POSE_HAS_FLAGS(&score, POSE_MATCH_DEGENERATE) &&
-	    this->poseMatchesGravity(device, sample, Tcv_cam_device, SolveSource::FastBlobRecovery)) {
+	    this->poseMatchesGravity(device, sample, Tcv_cam_device, SolveSource::FastBlobRecovery, score.matched_blobs)) {
 		CT_DEBUG(tracker, "Camera %p RANSAC-PnP recovered pose was good enough for device %d from %u blobs",
 		         (void *)this, device->id, sample.blob_count);
 
@@ -1774,10 +2919,19 @@ Camera::processSampleSlow(CameraSample &sample)
 					time_duration_ns time_since_solve_ns =
 					    sample.timestamp_ns - last_known_pose.timestamp_ns;
 
-					if (time_since_solve_ns < (U_TIME_1MS_IN_NS * 150LL)) {
-						// If the device has been seen in the last 150ms, don't try to brute
-						// force search it, hope that it will be seen by a fast solve in that
-						// time period.
+					/*
+					 * While its IMU is calibrated, as before 0.1.5 (150 ms): a controller with its IMU turned and
+					 * biased (10 degrees, 1.5 m/s², a replay) then fitted 7.1 degrees with 4.6 left; at 100 ms its
+					 * pairs disagreed by 19 degrees and the round failed.
+					 */
+					const int64_t skip_ms =
+					    device->imu_calibration.active.load()
+					        ? std::max<int64_t>(debug_get_num_option_constellation_tracker_slow_skip_ms(),
+					                            kSlowSkipCalibratingMs)
+					        : debug_get_num_option_constellation_tracker_slow_skip_ms();
+					if (time_since_solve_ns < (U_TIME_1MS_IN_NS * skip_ms)) {
+						// If the device has been seen just now, don't try to brute force search it,
+						// hope that it will be seen by a fast solve in that time period.
 						continue;
 					} else if ((time_since_solve_ns < (U_TIME_1MS_IN_NS * 1000LL) ||
 					            this->shallow_searches_failed.load() < 10) &&
@@ -1886,7 +3040,7 @@ Camera::processSampleSlow(CameraSample &sample)
 			    rot_error_thresh,                                  //
 			    &camera_gravity,                                   //
 			    &device_gravity,                                   //
-			    tracker->gravity_tolerance_rad,                    //
+			    this->gravityTolerance(device),                    //
 			    &score);                                           //
 			if (found_pose) {
 				const SolveSource source = (search_flags & CS_FLAG_DEEP_SEARCH) != 0
@@ -1985,6 +3139,12 @@ Camera::processSampleFast(CameraSample &sample)
 		if (device->params.tracking_source != nullptr) {
 			t_constellation_tracker_tracking_source_get_tracked_pose(
 			    device->params.tracking_source, sample.timestamp_ns, &device_predicted_relation);
+		}
+		if (!device->params.head && debug_get_bool_option_constellation_tracker_ekf_prior()) {
+			xrt_space_relation ekf_relation;
+			if (device->touch_ekf.relationAt(sample.timestamp_ns, tracker->prior_fresh_ns, ekf_relation)) {
+				device_predicted_relation = ekf_relation;
+			}
 		}
 
 		bool prior_pose_valid =
@@ -2496,17 +3656,53 @@ Camera::pushPose(CameraSample &camera_sample,
 	const float rms_px = score.matched_blobs > 0 ? sqrtf(score.reprojection_error / score.matched_blobs) : 0.0f;
 	const float max_rms_px = debug_get_float_option_constellation_tracker_slow_max_rms_px();
 	// Held to the IMU's tilt, wrong LEDs fit worse instead of tilting, see pose_optimize.cpp.
-	const float gravity_max_rms_px = debug_get_float_option_constellation_tracker_gravity_prior_max_rms_px();
+	float gravity_max_rms_px = debug_get_float_option_constellation_tracker_gravity_prior_max_rms_px();
+	// A few-LED pose while turning, see CONSTELLATION_TRACKER_FEW_LEDS_MAX_RMS_PX.
+	const float few_max_rms_px = debug_get_float_option_constellation_tracker_few_leds_max_rms_px();
+	if (source == SolveSource::FastFewLeds && few_max_rms_px > 0.0f && !device->imu_tilt.clipped() &&
+	    device->imu_tilt.lastGyro() >= debug_get_float_option_constellation_tracker_few_leds_max_rms_turning()) {
+		gravity_max_rms_px = few_max_rms_px;
+	}
 	const bool gravity_held =
 	    gravity_offered &&
 	    score.matched_blobs <= (uint32_t)debug_get_num_option_constellation_tracker_gravity_prior_max_leds();
-	const bool fits =
-	    slow_search ? ((max_rms_px <= 0.0f || rms_px <= max_rms_px) &&
+	/*
+	 * Three LEDs barely fix the distance: they stay near the prior, and as they fit worse they are where it drifted to
+	 * (against Oculus, with the sensor seeing 3.47 m, three-LED poses at 0.35 px put a Touch at 3.21 m, the four-LED ones
+	 * between them at 3.48). Turned away above 0.30 px, the single-threaded replays were better, the live-like ones
+	 * worse (the left controller at night jumped where it had not): off unless set.
+	 */
+	const float three_leds_max_rms_px = debug_get_float_option_constellation_tracker_few_leds_3_max_rms_px();
+	bool three_leds_loose =
+	    score.matched_blobs <= 3 && three_leds_max_rms_px > 0.0f && rms_px > three_leds_max_rms_px;
+	/*
+	 * Nor where a pose from five LEDs or more, just before, says it is not: in a recording three LEDs at 0.33 px put a Touch
+	 * 42 cm nearer than five had 19 ms before, and the fused pose followed it 55 cm off.
+	 */
+	const float strong_m = debug_get_float_option_constellation_tracker_few_leds_strong_m();
+	if (!three_leds_loose && score.matched_blobs <= 3 && strong_m > 0.0f && camera_sample.Txr_world_cam.has_value()) {
+		const int64_t strong_ns = device->last_strong_solve_ns.load();
+		if (strong_ns != 0 && camera_sample.timestamp_ns - strong_ns <= kFewLedsStrongNs &&
+		    camera_sample.timestamp_ns >= strong_ns) {
+			xrt_pose Txr_cam_device;
+			math_pose_convert_from_opencv(&Tcv_cam_device, &Txr_cam_device);
+			xrt_pose Txr_world_device;
+			math_pose_transform(&camera_sample.Txr_world_cam.value(), &Txr_cam_device, &Txr_world_device);
+			xrt_vec3 strong_position;
+			{
+				std::lock_guard<os::Mutex> lock(device->data_lock);
+				strong_position = device->last_strong_position;
+			}
+			three_leds_loose = m_vec3_len(m_vec3_sub(Txr_world_device.position, strong_position)) > strong_m;
+		}
+	}
+	const bool fits = !three_leds_loose &&
+	    (slow_search ? ((max_rms_px <= 0.0f || rms_px <= max_rms_px) &&
 	                   score.matched_blobs >= debug_get_num_option_constellation_tracker_slow_min_leds())
 	                : score.matched_blobs >= (source == SolveSource::FastFewLeds
 	                                              ? 2
 	                                              : debug_get_num_option_constellation_tracker_fast_min_leds()) &&
-	                      (!gravity_held || gravity_max_rms_px <= 0.0f || rms_px <= gravity_max_rms_px);
+	                      (!gravity_held || gravity_max_rms_px <= 0.0f || rms_px <= gravity_max_rms_px));
 	if (!fits) {
 		device->rms_rejections_total.fetch_add(1);
 	}
@@ -2537,15 +3733,28 @@ Camera::pushPose(CameraSample &camera_sample,
 		left_out = watch_mosaic && tracker->rigWatchLeavesOut(watch_mosaic->index, this->index);
 	}
 
+	// Only counted, see the advice to calibrate; what the checks below decide does not depend on it.
+	if (fits && !left_out) {
+		this->countImuAdvice(device, camera_sample, Tcv_cam_device, score.matched_blobs);
+		// Before the gravity check decides: a turned IMU's solves are the very ones it turns away.
+		if (debug_get_bool_option_constellation_tracker_imu_align()) {
+			this->collectImuAlign(device, camera_sample, Tcv_cam_device, score.matched_blobs);
+		}
+	}
+
 	// The refinement may have slipped to other LEDs, check the pose as it now is.
 	uint32_t rejected = 0;
 	if (!fits) {
 		rejected = CT_SOLVE_REJECTED_FIT;
 	} else if (left_out) {
 		rejected = CT_SOLVE_REJECTED_RIG;
-	} else if (!this->poseMatchesGravity(device, camera_sample, Tcv_cam_device, source)) {
+	} else if (!this->poseMatchesGravity(device, camera_sample, Tcv_cam_device, source, score.matched_blobs)) {
 		rejected = CT_SOLVE_REJECTED_GRAVITY;
-	} else if (!this->poseMatchesPrior(device, camera_sample, device_state, Tcv_cam_device, source)) {
+	} else if (!this->poseMatchesPrior(device, camera_sample, device_state, Tcv_cam_device, source,
+	                                   score.matched_blobs,
+	                                   score.matched_blobs > 0
+	                                       ? sqrtf(score.reprojection_error / static_cast<float>(score.matched_blobs))
+	                                       : 0.0f)) {
 		rejected = CT_SOLVE_REJECTED_PRIOR;
 	}
 	if (rejected != 0) {
@@ -2641,6 +3850,65 @@ Camera::pushPose(CameraSample &camera_sample,
 	std::optional<xrt_pose> Txr_world_device = Txr_world_cam;
 	if (Txr_world_cam.has_value()) {
 		math_pose_transform(&Txr_world_cam.value(), &Txr_cam_device, &Txr_world_device.value());
+	}
+
+	// The IMU's down after its gyro clipped, set again from a solve that leaves no doubt, taken while turning slowly.
+	if (Txr_world_device.has_value() &&
+	    debug_get_float_option_constellation_tracker_gravity_clip_tolerance_deg() > 0.0f &&
+	    device->imu_tilt.clipped() &&
+	    score.matched_blobs >=
+	        static_cast<uint32_t>(debug_get_num_option_constellation_tracker_gravity_reanchor_leds()) &&
+	    score.reprojection_error <= 0.25f * 0.25f * static_cast<float>(score.matched_blobs) &&
+	    device->imu_tilt.lastGyro() < 1.0f) {
+		xrt_quat inverse;
+		math_quat_invert(&Txr_world_device->orientation, &inverse);
+		const xrt_vec3 world_up = {0.0f, 1.0f, 0.0f};
+		xrt_vec3 up_device;
+		math_quat_rotate_vec3(&inverse, &world_up, &up_device);
+		device->imu_tilt.reanchor(camera_sample.timestamp_ns, up_device);
+		CT_INFO(this->tracker, "Device %d: IMU down set again from a %u-LED solve after its gyro clipped.", device->id,
+		        score.matched_blobs);
+	}
+
+	// A Touch's own filter takes every accepted solve, the fewer its LEDs the less sure (see t_touch_ekf.hpp).
+	if (!device->params.head && debug_get_bool_option_constellation_tracker_ekf_prior() && Txr_world_device.has_value()) {
+		const double few = std::max(1.0, 6.0 / std::max(1.0, static_cast<double>(score.matched_blobs)));
+		device->touch_ekf.setNoise(debug_get_float_option_constellation_tracker_ekf_accel_noise(),
+		                           debug_get_float_option_constellation_tracker_ekf_gyro_noise());
+		const double cov_scale = debug_get_float_option_constellation_tracker_ekf_cov_scale();
+		using Mat6 = Eigen::Matrix<double, 6, 6>;
+		const Eigen::Map<const Mat6> C(covariance);
+		const bool cov_ok = cov_scale > 0.0 && C.allFinite() && C(0, 0) < 1e5 && C.block<3, 3>(0, 0).trace() < 0.25;
+		if (cov_ok) {
+			// OpenCV camera frame to OpenXR (F = diag(1, -1, -1)); the position block into the world.
+			const Eigen::Matrix3d F = Eigen::Vector3d(1.0, -1.0, -1.0).asDiagonal();
+			const xrt_quat &wq = Txr_world_cam.value().orientation;
+			const Eigen::Matrix3d Rwc = Eigen::Quaterniond(wq.w, wq.x, wq.y, wq.z).toRotationMatrix();
+			Mat6 A = Mat6::Zero();
+			A.block<3, 3>(0, 0) = Rwc * F;
+			A.block<3, 3>(3, 3) = F;
+			Mat6 Rm = (cov_scale * cov_scale) * (A * C * A.transpose());
+			Rm.diagonal().head<3>().array() += 0.0005 * 0.0005;
+			Rm.diagonal().tail<3>().array() += DEG_TO_RAD(0.05) * DEG_TO_RAD(0.05);
+			Rm = 0.5 * (Rm + Rm.transpose());
+			device->touch_ekf.update(camera_sample.timestamp_ns, Txr_world_device.value(), Rm);
+		} else {
+			device->touch_ekf.update(camera_sample.timestamp_ns, Txr_world_device.value(),
+			                         debug_get_float_option_constellation_tracker_ekf_sigma_pos_mm() / 1000.0 * few,
+			                         DEG_TO_RAD(debug_get_float_option_constellation_tracker_ekf_sigma_rot_deg()) * few);
+		}
+		static thread_local int64_t stats_ns[XRT_CONSTELLATION_MAX_DEVICES] = {};
+		if (device->id < XRT_CONSTELLATION_MAX_DEVICES &&
+		    camera_sample.timestamp_ns - stats_ns[device->id] > static_cast<int64_t>(5) * U_TIME_1S_IN_NS) {
+			stats_ns[device->id] = camera_sample.timestamp_ns;
+			uint32_t sp[4];
+			uint32_t sr[4];
+			device->touch_ekf.takeStats(sp, sr);
+			CT_INFO(this->tracker,
+			        "Device %d: filter prediction vs solves: position <1 cm %u, <3 %u, <10 %u, more %u; rotation <2 deg "
+			        "%u, <5 %u, <15 %u, more %u; resets %" PRIu64,
+			        device->id, sp[0], sp[1], sp[2], sp[3], sr[0], sr[1], sr[2], sr[3], device->touch_ekf.resets());
+		}
 	}
 
 	// Compute the metrics
@@ -2742,6 +4010,10 @@ Camera::pushPose(CameraSample &camera_sample,
 
 		device->locked_data.last_known_pose =
 		    DeviceLastPose(Txr_world_device.value(), Tcv_cam_device, camera_sample.timestamp_ns);
+		if (score.matched_blobs >= 5 && camera_sample.timestamp_ns > device->last_strong_solve_ns.load()) {
+			device->last_strong_position = Txr_world_device.value().position;
+			device->last_strong_solve_ns.store(camera_sample.timestamp_ns);
+		}
 	}
 
 	if (Txr_world_device.has_value()) {
@@ -3172,11 +4444,33 @@ Device::pushImuSample(const xrt_imu_sample &sample)
 		this->tracker->data_recorder->recordImuSample(this->id, sample);
 	}
 
-	this->tracker->rig_calibration->pushImuSample(this->id, sample);
+	/*
+	 * RiftLinux, issue #5: a controller's learned IMU alignment, once in use (a clear fault only), for everything that
+	 * reads its IMU: the gravity check, the fusion, the room's level. The recording keeps what came.
+	 */
+	const bool align = debug_get_bool_option_constellation_tracker_imu_align() && !this->params.head;
+	const xrt_imu_sample aligned = align ? this->imuAlignSample(sample) : sample;
+	const xrt_imu_sample &fused =
+	    debug_get_bool_option_constellation_tracker_imu_align_gate_only() || this->imu_align.gate_only.load() ? sample
+	                                                                                                           : aligned;
 
-	this->sensor_fusion->pushImuSample(sample);
+	this->tracker->rig_calibration->pushImuSample(this->id, fused);
 
-	this->imu_tilt.push(sample);
+	this->sensor_fusion->pushImuSample(fused);
+
+	this->imu_tilt.push(aligned);
+
+	if (!this->params.head && debug_get_bool_option_constellation_tracker_ekf_prior()) {
+		const xrt_vec3 accel = {static_cast<float>(aligned.accel_m_s2.x), static_cast<float>(aligned.accel_m_s2.y),
+		                        static_cast<float>(aligned.accel_m_s2.z)};
+		const xrt_vec3 gyro = {static_cast<float>(aligned.gyro_rad_secs.x), static_cast<float>(aligned.gyro_rad_secs.y),
+		                       static_cast<float>(aligned.gyro_rad_secs.z)};
+		this->touch_ekf.propagate(aligned.timestamp_ns, accel, gyro);
+	}
+
+	if (this->imu_calibration.active.load()) {
+		this->collectImuCalibrationRest(sample);
+	}
 }
 
 std::optional<xrt_vec3>
@@ -3209,6 +4503,8 @@ static constexpr timepoint_ns kTiltGapNs = 250 * U_TIME_1MS_IN_NS;
 static constexpr timepoint_ns kTiltSettleNs = 500 * U_TIME_1MS_IN_NS;
 //! How long the device must have rested before its IMU stopped for the estimate to stay good.
 static constexpr timepoint_ns kTiltIdleRestNs = 500 * U_TIME_1MS_IN_NS;
+//! A CV1 Touch's gyro reads up to 2000 degrees/s (35.0 rad/s seen); this near it, it may have clipped.
+static constexpr float kTiltGyroClipRadS = 34.0f;
 
 void
 ImuTilt::resetLocked()
@@ -3262,11 +4558,17 @@ ImuTilt::push(const xrt_imu_sample &sample)
 		}
 	}
 
+	this->last_gyro_len = gyro_len;
+	if (fabsf(gyro.x) >= kTiltGyroClipRadS || fabsf(gyro.y) >= kTiltGyroClipRadS || fabsf(gyro.z) >= kTiltGyroClipRadS) {
+		this->gyro_clipped = true;
+	}
+
 	if (!this->have_up) {
 		// Start from the accelerometer while it reads gravity alone, near enough.
 		if (gyro_len < 5.0f * kTiltRestingGyro && fabsf(accel_len - this->rest_accel_len) < kTiltAccelBand) {
 			this->up = m_vec3_mul_scalar(accel, 1.0f / accel_len);
 			this->have_up = true;
+			this->gyro_clipped = false;
 			this->start_ns = sample.timestamp_ns;
 			this->last_ns = sample.timestamp_ns;
 			this->last_moving_ns = sample.timestamp_ns;
@@ -3306,6 +4608,1314 @@ ImuTilt::push(const xrt_imu_sample &sample)
 	}
 
 	this->recordLocked(sample.timestamp_ns);
+}
+
+bool
+ImuTilt::clipped() const
+{
+	std::unique_lock<os::Mutex> lock(this->lock);
+	return this->have_up && this->gyro_clipped;
+}
+
+float
+ImuTilt::lastGyro() const
+{
+	std::unique_lock<os::Mutex> lock(this->lock);
+	return this->last_gyro_len;
+}
+
+void
+ImuTilt::reanchor(timepoint_ns when_ns, const xrt_vec3 &up_device)
+{
+	std::unique_lock<os::Mutex> lock(this->lock);
+	if (!this->have_up) {
+		return;
+	}
+	const xrt_vec3 up_unit = m_vec3_normalize(up_device);
+	this->up = up_unit;
+	for (size_t i = 0; i < this->history_count; i++) {
+		Entry &entry = this->history[(this->history_head + kHistorySize - 1 - i) % kHistorySize];
+		if (entry.timestamp_ns < when_ns) {
+			break;
+		}
+		entry.up = up_unit;
+	}
+	this->gyro_clipped = false;
+}
+
+void
+Device::collectImuCalibrationRest(const xrt_imu_sample &sample)
+{
+	const xrt_vec3 accel = {static_cast<float>(sample.accel_m_s2.x), static_cast<float>(sample.accel_m_s2.y),
+	                        static_cast<float>(sample.accel_m_s2.z)};
+	const xrt_vec3 gyro = {static_cast<float>(sample.gyro_rad_secs.x), static_cast<float>(sample.gyro_rad_secs.y),
+	                       static_cast<float>(sample.gyro_rad_secs.z)};
+	auto &cal = this->imu_calibration;
+	std::unique_lock<os::Mutex> lock(cal.lock);
+	cal.last_imu_ns = sample.timestamp_ns;
+	// Timed on the samples' clock, which a replay's is too: only time with nothing new measured counts.
+	if (cal.last_progress_ns == 0) {
+		cal.last_progress_ns = sample.timestamp_ns;
+	}
+	const int64_t timeout_s = debug_get_num_option_constellation_tracker_imu_calibration_timeout_s();
+	if (cal.status.state == T_CONSTELLATION_IMU_CALIBRATION_COLLECTING &&
+	    sample.timestamp_ns - cal.last_progress_ns > timeout_s * U_TIME_1S_IN_NS) {
+		cal.status.state = T_CONSTELLATION_IMU_CALIBRATION_FAILED;
+		cal.status.reason = T_CONSTELLATION_IMU_CALIBRATION_REASON_NO_PROGRESS;
+		cal.active.store(false);
+		return;
+	}
+	// "Come closer": not seen lately, not close.
+	if (cal.step < 0 && cal.close_last_ns != 0 && sample.timestamp_ns - cal.close_last_ns > kImuCalibrationCloseAgeNs &&
+	    cal.close_share > 0.0f) {
+		cal.close_share = 0.0f;
+		this->refreshImuCalibrationStatus();
+	}
+	// The trigger held: still enough for a hand counts.
+	const bool held = cal.held.load();
+	const bool hand = held || cal.steps_complete.load();
+	const float gyro_limit = hand ? kImuCalibrationHeldGyro : kTiltRestingGyro;
+	const float std_limit = hand ? kImuCalibrationHeldStd : kImuCalibrationWindowStd;
+	if (m_vec3_len(gyro) >= gyro_limit || m_vec3_len(accel) < kTiltMinAccel ||
+	    sample.timestamp_ns < cal.collect_from_ns) {
+		cal.window_count = 0;
+		cal.window_sum = XRT_VEC3_ZERO;
+		cal.window_sum_sq = XRT_VEC3_ZERO;
+		cal.status.resting = false;
+		cal.status.orientation_now = -1;
+		return;
+	}
+	cal.window_sum = cal.window_sum + accel;
+	cal.window_sum_sq = cal.window_sum_sq + xrt_vec3{accel.x * accel.x, accel.y * accel.y, accel.z * accel.z};
+	if (++cal.window_count < kImuCalibrationWindow) {
+		return;
+	}
+	const float n = static_cast<float>(cal.window_count);
+	const xrt_vec3 mean = m_vec3_mul_scalar(cal.window_sum, 1.0f / n);
+	const xrt_vec3 var = m_vec3_mul_scalar(cal.window_sum_sq, 1.0f / n) -
+	                     xrt_vec3{mean.x * mean.x, mean.y * mean.y, mean.z * mean.z};
+	const float limit = std_limit * std_limit;
+	cal.window_count = 0;
+	cal.window_sum = XRT_VEC3_ZERO;
+	cal.window_sum_sq = XRT_VEC3_ZERO;
+	if (var.x > limit || var.y > limit || var.z > limit) {
+		cal.status.resting = false;
+		cal.status.orientation_now = -1;
+		return;
+	}
+	cal.last_rest = mean;
+	cal.last_rest_ns = sample.timestamp_ns;
+	const size_t bin = imu_calibration_bin(m_vec3_normalize(mean));
+	cal.status.resting = true;
+	cal.status.orientation_now = static_cast<int>(bin);
+	if (cal.rest_bins[bin] < kImuCalibrationBinCap) {
+		if (cal.rest_bins[bin] < kImuCalibrationPerBin) {
+			cal.last_progress_ns = sample.timestamp_ns;
+		}
+		cal.rest_bins[bin]++;
+		cal.rest_accel.push_back(mean);
+		cal.rest_hand += hand ? 1 : 0;
+	}
+	if (held && cal.step_result == 0 && cal.step >= 0 && !cal.wait_release && !cal.steps_complete.load() &&
+	    cal.status.state == T_CONSTELLATION_IMU_CALIBRATION_COLLECTING) {
+		cal.step_rests++;
+		cal.step_up_sum = cal.step_up_sum + m_vec3_normalize(mean);
+		cal.last_progress_ns = sample.timestamp_ns;
+		this->imuCalibrationStepCheck();
+	}
+	// Held as asked with too few LEDs: its resting readings still count, the next orientation may do better.
+	if (static_cast<int>(bin) == cal.status.next_orientation && cal.bins[bin] < kImuCalibrationPerBin &&
+	    ++cal.waited_windows[bin] >= kImuCalibrationGiveUpWindows) {
+		cal.given_up[bin] = true;
+	}
+	this->refreshImuCalibrationStatus();
+}
+
+
+/*
+ *
+ * A controller's IMU alignment, learned in the background (RiftLinux, GitHub issue #5).
+ *
+ * The Oculus runtime asks no one to calibrate a controller: its filter keeps estimating each controller's
+ * accelerometer and gyro offsets while it tracks, and when a solve and the filter disagree by much it goes with the
+ * solve (its logs, the maintainer's Windows sessions). Here a solve that disagrees with the IMU on which way
+ * is down is turned away before anything else sees it, so a controller whose IMU sits turned against its LEDs, or whose
+ * accelerometer reads off, loses most of its solves for good (issue #5: 8-13 degrees, all the time).
+ *
+ * Learned here instead, the two parts apart, as physics tells them apart:
+ * - the turn from the gyro: what it measures over a fraction of a second against the turn one sensor's solves show over
+ *   the same time (a turned IMU turns its gyro's axes; a biased accelerometer does nothing to them);
+ * - the accelerometer's bias from pairs of what it reads while held still and which way is up by the solve then, kept
+ *   by orientation, fitted with the gyro's turn held (from the downs alone, with few orientations, a bias and a turn
+ *   look alike, and a wrong turn would go to the gyro too: it wandered between the two on the replays).
+ * Used only when it is clearly a fault: a median disagreement of 6 degrees or more (where the gravity check starts to
+ * refuse many good solves; healthy controllers 1-4.7), the fit taking most of it away, the headset seen by the same
+ * sensors agreeing with its own IMU (so a moved sensor is not taken for a fault), two fits 5 s apart agreeing; dropped
+ * below 4. In use for everything that reads the controller's IMU (the gravity check, the fusion, the room's level); a
+ * healthy controller's tracking is as it was. A stored correction for a healthy controller made its tracking worse on the
+ * Oculus captures
+ * (the maintainer's left Touch, night and day), which is why nothing is applied below the threshold.
+ *
+ */
+
+static constexpr uint32_t kAlignMinLeds = 8;
+/*!
+ * A hand held still enough: turning at most this fast, the readings' spread small (below). Measured on recordings: at
+ * 0.5 rad/s a hand in play still pushes what the accelerometer reads (good controllers 4.4-6.2 degrees off their
+ * solves); at 0.3 they read 1.8-2.6 (5.2 where the room's level is off), a turned one the same as before (8.4).
+ */
+static constexpr float kAlignHeldGyro = 0.3f;
+static constexpr float kAlignHeldStd = 0.12f;
+static constexpr timepoint_ns kAlignRestAgeNs = 150 * U_TIME_1MS_IN_NS;
+static constexpr timepoint_ns kAlignEveryNs = 100 * U_TIME_1MS_IN_NS;
+//! A solve this far from the IMU's raw down is no pair: a wrong solve (flipped, mirrored), or no seat fault.
+static constexpr float kAlignWrongRad = DEG_TO_RAD(30.0f);
+static constexpr timepoint_ns kAlignFitEveryNs = static_cast<timepoint_ns>(2) * U_TIME_1S_IN_NS;
+static constexpr uint32_t kAlignMinPairs = 60;
+static constexpr uint32_t kAlignBinPairs = 10;
+static constexpr uint32_t kAlignMinBins = 2;
+/*!
+ * A fault from a median disagreement of 6 degrees: the gravity check refuses beyond 8, so from about there a large share
+ * of good solves is lost. Measured on recordings: good controllers read 1.8-2.6, up to 5.2 where the room's level is
+ * off (alike through every sensor); the faults to catch 7-8.4 (turned 10 degrees, accelerometer 1.5 m/s2 off) and 8-13
+ * (GitHub issue #5). No longer used below 4 (no flip-flop near the line).
+ *
+ * Held in two ways only (two orientations), a fit spreads more (good controllers up to 6.2): a fault there from 8, the
+ * gravity check's own limit, which is where it starves a controller of its solves (a turned one held two ways read
+ * 11.4 and lost four in five of its solves). Three ways or more: from 6.
+ */
+DEBUG_GET_ONCE_FLOAT_OPTION(constellation_tracker_imu_align_fault_deg, "CONSTELLATION_TRACKER_IMU_ALIGN_FAULT_DEG", 3.0f)
+DEBUG_GET_ONCE_FLOAT_OPTION(constellation_tracker_imu_align_fault_two_deg, "CONSTELLATION_TRACKER_IMU_ALIGN_FAULT_TWO_DEG", 3.0f)
+DEBUG_GET_ONCE_FLOAT_OPTION(constellation_tracker_imu_align_unused_deg, "CONSTELLATION_TRACKER_IMU_ALIGN_UNUSED_DEG", 2.0f)
+#define kAlignFaultRad DEG_TO_RAD(debug_get_float_option_constellation_tracker_imu_align_fault_deg())
+#define kAlignFaultTwoRad DEG_TO_RAD(debug_get_float_option_constellation_tracker_imu_align_fault_two_deg())
+#define kAlignUnusedRad DEG_TO_RAD(debug_get_float_option_constellation_tracker_imu_align_unused_deg())
+static constexpr float kAlignLeftRad = DEG_TO_RAD(2.5f);
+static constexpr float kAlignAgreeRad = DEG_TO_RAD(1.5f);
+static constexpr float kAlignAgreeBias = 0.3f;
+//! A fit replaces what is in use only when it leaves this much less disagreement on the same pairs.
+static constexpr float kAlignBetterRad = DEG_TO_RAD(0.5f);
+static constexpr timepoint_ns kAlignConfirmNs = static_cast<timepoint_ns>(5) * U_TIME_1S_IN_NS;
+/*!
+ * A sensor counts for a controller's pairs when the headset's own solves there agree with its IMU as the advice to
+ * calibrate requires (never wrong on 20 recordings): fewer than 3 in 10 more than 5 degrees off. The headset's own
+ * seat and the room's level leave 2-4 degrees on a good sensor (1.7 and 1.4 measured), so a median of 3 shut every one out.
+ */
+static constexpr float kAlignRefOffRad = DEG_TO_RAD(5.0f);
+static constexpr uint32_t kAlignRefOffOf10 = 3;
+static constexpr uint32_t kAlignRefMin = 10;
+static constexpr float kAlignMaxRad = DEG_TO_RAD(25.0f);
+static constexpr float kAlignMaxBias = 2.5f;
+//! Robust weighting: residuals beyond this count less (Huber).
+static constexpr float kAlignHuberRad = DEG_TO_RAD(3.0f);
+static constexpr timepoint_ns kAlignLogEveryNs = static_cast<timepoint_ns>(10) * U_TIME_1S_IN_NS;
+/*!
+ * The provisional alignment (Device::ImuAlign::provisional): from the resting pairs of the last kProvWindowNs, looked at
+ * every kProvEveryNs; used once kProvMinPairs of them put the solves' down a median of kProvFaultRad or more off the
+ * IMU's (the gravity check's own limit: it is refusing this controller's solves) and the turn of the down explains them
+ * to within kProvLeftRad. Changed when a fit moves more than kProvChangeRad.
+ */
+static constexpr timepoint_ns kProvWindowNs = static_cast<timepoint_ns>(30) * U_TIME_1S_IN_NS;
+static constexpr timepoint_ns kProvEveryNs = 500 * U_TIME_1MS_IN_NS;
+static constexpr uint32_t kProvMinPairs = 12;
+DEBUG_GET_ONCE_FLOAT_OPTION(constellation_tracker_imu_align_prov_deg, "CONSTELLATION_TRACKER_IMU_ALIGN_PROV_DEG", 3.0f)
+#define kProvFaultRad DEG_TO_RAD(debug_get_float_option_constellation_tracker_imu_align_prov_deg())
+/*!
+ * The fusion takes an alignment only from these (the levels issue #5's faults were caught at, 6 from three or more
+ * orientations, 8 from two, 8 for the provisional one); below, from kAlignFaultRad and kProvFaultRad, it centres the
+ * gravity check only (Device::ImuAlign::gate_only): a healthy controller 3-5 degrees off had its good solves refused
+ * after every gap (7.2 s of 149 held, 3.1 s of it in view), the fusion as before.
+ */
+static constexpr float kAlignFusionRad = DEG_TO_RAD(6.0f);
+static constexpr float kAlignFusionTwoRad = DEG_TO_RAD(8.0f);
+static constexpr float kProvFusionRad = DEG_TO_RAD(8.0f);
+static constexpr float kProvLeftRad = DEG_TO_RAD(3.0f);
+static constexpr float kProvChangeRad = DEG_TO_RAD(1.0f);
+//! The tilt-against-solve pairs: from the last this long, while the gyro turns slower than this.
+static constexpr timepoint_ns kQuickWindowNs = static_cast<timepoint_ns>(10) * U_TIME_1S_IN_NS;
+static constexpr float kQuickGyro = 0.5f;
+//! ... from solves of this many LEDs or more (2-3 m away most show 6-7); the rest need kAlignMinLeds.
+static constexpr uint32_t kQuickMinLeds = 6;
+//! Two orientations count as two ways of holding it when their downs are this far apart.
+static constexpr float kProvApartRad = DEG_TO_RAD(20.0f);
+//! A turn pair: one sensor's solves this far apart, turned at least this much in between.
+static constexpr timepoint_ns kTurnMinNs = 80 * U_TIME_1MS_IN_NS;
+static constexpr timepoint_ns kTurnMaxNs = 500 * U_TIME_1MS_IN_NS;
+static constexpr float kTurnMinRad = DEG_TO_RAD(5.0f);
+/*!
+ * The gyro's turn trusted with this many pairs, known this well about every axis (its standard error: one turn axis
+ * alone leaves the turn about it unknown) and the pairs' differences left this small (median; the solves' own noise
+ * leaves 2-3 degrees). Measured on recordings: 10 degrees within 0.3 after 60 pairs. Known to 1.5 degrees is as close as
+ * a good controller's own seat; a controller the fault keeps out of most solves gets no closer in a session (9.0 of 10
+ * within 1.1).
+ */
+static constexpr uint32_t kTurnMinPairs = 30;
+static constexpr float kTurnStdErrRad = DEG_TO_RAD(1.5f);
+static constexpr float kTurnResidualRad = DEG_TO_RAD(4.0f);
+
+static float
+align_angle(const xrt_vec3 &a, const xrt_vec3 &b)
+{
+	return acosf(CLAMP(m_vec3_dot(m_vec3_normalize(a), m_vec3_normalize(b)), -1.0f, 1.0f));
+}
+
+static xrt_vec3
+align_up(const xrt_quat &rot, const xrt_vec3 &bias, const xrt_vec3 &accel)
+{
+	xrt_vec3 up = m_vec3_normalize(accel - bias);
+	math_quat_rotate_vec3(&rot, &up, &up);
+	return up;
+}
+
+static float
+align_rot_angle(const xrt_quat &q)
+{
+	return 2.0f * acosf(CLAMP(fabsf(q.w), 0.0f, 1.0f));
+}
+
+//! 6x6 solve by Gaussian elimination with pivoting; false when singular.
+static bool
+align_solve6(double A[6][6], double b[6], double out[6])
+{
+	for (int i = 0; i < 6; i++) {
+		int pivot = i;
+		for (int r = i + 1; r < 6; r++) {
+			if (fabs(A[r][i]) > fabs(A[pivot][i])) {
+				pivot = r;
+			}
+		}
+		if (fabs(A[pivot][i]) < 1e-12) {
+			return false;
+		}
+		for (int c = 0; c < 6; c++) {
+			std::swap(A[i][c], A[pivot][c]);
+		}
+		std::swap(b[i], b[pivot]);
+		for (int r = i + 1; r < 6; r++) {
+			const double f = A[r][i] / A[i][i];
+			for (int c = i; c < 6; c++) {
+				A[r][c] -= f * A[i][c];
+			}
+			b[r] -= f * b[i];
+		}
+	}
+	for (int i = 5; i >= 0; i--) {
+		double v = b[i];
+		for (int c = i + 1; c < 6; c++) {
+			v -= A[i][c] * out[c];
+		}
+		out[i] = v / A[i][i];
+	}
+	return true;
+}
+
+//! A rotation's vector (axis times angle, radians).
+static xrt_vec3
+align_rotvec(const xrt_quat &q_in)
+{
+	xrt_quat q = q_in;
+	if (q.w < 0.0f) {
+		q = {-q.x, -q.y, -q.z, -q.w};
+	}
+	const float angle = 2.0f * acosf(CLAMP(q.w, -1.0f, 1.0f));
+	const float s = sqrtf(std::max(0.0f, 1.0f - q.w * q.w));
+	if (s < 1e-6f) {
+		return xrt_vec3{2.0f * q.x, 2.0f * q.y, 2.0f * q.z};
+	}
+	return m_vec3_mul_scalar(xrt_vec3{q.x, q.y, q.z}, angle / s);
+}
+
+//! The gyro's turn from @p from_ns to @p to_ns (its frame, body increments in order); false when not all there.
+static bool
+align_gyro_turn(const Device::ImuAlign &al, timepoint_ns from_ns, timepoint_ns to_ns, xrt_quat &out)
+{
+	const uint32_t n = std::min<uint32_t>(al.gyro_count, Device::ImuAlign::kGyroKept);
+	if (n < 2) {
+		return false;
+	}
+	const uint32_t first = al.gyro_count - n;
+	if (al.gyro[first % Device::ImuAlign::kGyroKept].t > from_ns ||
+	    al.gyro[(al.gyro_count - 1) % Device::ImuAlign::kGyroKept].t < to_ns) {
+		return false;
+	}
+	xrt_quat q = {0.0f, 0.0f, 0.0f, 1.0f};
+	timepoint_ns prev = from_ns;
+	for (uint32_t k = first; k < al.gyro_count; k++) {
+		const Device::ImuAlign::GyroSample &g = al.gyro[k % Device::ImuAlign::kGyroKept];
+		if (g.t <= from_ns) {
+			continue;
+		}
+		const timepoint_ns end = std::min(g.t, to_ns);
+		const timepoint_ns dt_ns = end - prev;
+		if (dt_ns > 20 * U_TIME_1MS_IN_NS) {
+			return false; // a gap
+		}
+		const float dt = static_cast<float>(time_ns_to_s(dt_ns));
+		const float len = m_vec3_len(g.w);
+		if (len > 1e-6f && dt > 0.0f) {
+			xrt_vec3 axis = m_vec3_mul_scalar(g.w, 1.0f / len);
+			xrt_quat dq;
+			math_quat_from_angle_vector(len * dt, &axis, &dq);
+			math_quat_rotate(&q, &dq, &q);
+		}
+		prev = end;
+		if (g.t >= to_ns) {
+			break;
+		}
+	}
+	math_quat_normalize(&q);
+	out = q;
+	return true;
+}
+
+//! The smallest eigenvalue of a symmetric 3x3 matrix (closed form, Smith 1961).
+static double
+align_smallest_eigenvalue(const double M[3][3])
+{
+	const double p1 = M[0][1] * M[0][1] + M[0][2] * M[0][2] + M[1][2] * M[1][2];
+	const double q = (M[0][0] + M[1][1] + M[2][2]) / 3.0;
+	if (p1 <= 1e-30) {
+		return std::min({M[0][0], M[1][1], M[2][2]});
+	}
+	const double p2 = (M[0][0] - q) * (M[0][0] - q) + (M[1][1] - q) * (M[1][1] - q) + (M[2][2] - q) * (M[2][2] - q) +
+	                  2.0 * p1;
+	const double p = sqrt(p2 / 6.0);
+	double B[3][3];
+	for (int r = 0; r < 3; r++) {
+		for (int c = 0; c < 3; c++) {
+			B[r][c] = (M[r][c] - (r == c ? q : 0.0)) / p;
+		}
+	}
+	const double det = B[0][0] * (B[1][1] * B[2][2] - B[1][2] * B[2][1]) -
+	                   B[0][1] * (B[1][0] * B[2][2] - B[1][2] * B[2][0]) +
+	                   B[0][2] * (B[1][0] * B[2][1] - B[1][1] * B[2][0]);
+	const double r = det / 2.0;
+	const double phi = r <= -1.0 ? M_PI / 3.0 : r >= 1.0 ? 0.0 : acos(r) / 3.0;
+	return q + 2.0 * p * cos(phi + 2.0 * M_PI / 3.0);
+}
+
+/*!
+ * The turn of the IMU against the LEDs from the gyro's turns: Horn's fit, Huber-weighted on the difference of each pair
+ * (rotation vectors), always given in @p out_turn; true when it is trusted: enough pairs, known well about every axis
+ * (standard error from the pairs' spread and how much each axis was turned about) and the pairs agreeing.
+ */
+static bool
+align_turn_fit(const Device::ImuAlign &al, xrt_quat &out_turn, float &out_residual, float &out_std_err, uint32_t &out_pairs)
+{
+	const uint32_t n = std::min<uint32_t>(al.turn_count, Device::ImuAlign::kTurnKept);
+	out_pairs = n;
+	out_turn = {0.0f, 0.0f, 0.0f, 1.0f};
+	out_residual = 0.0f;
+	out_std_err = 0.0f;
+	if (n < kTurnMinPairs) {
+		return false;
+	}
+	std::vector<float> weight(n, 1.0f);
+	std::vector<float> residual(n, 0.0f);
+	std::vector<std::pair<xrt_vec3, xrt_vec3>> pairs(n);
+	xrt_quat turn = {0.0f, 0.0f, 0.0f, 1.0f};
+	for (int it = 0; it < 6; it++) {
+		for (uint32_t i = 0; i < n; i++) {
+			pairs[i] = {m_vec3_mul_scalar(al.turn_imu[i], weight[i]), al.turn_dev[i]};
+		}
+		turn = imu_calibration_fit(pairs);
+		for (uint32_t i = 0; i < n; i++) {
+			xrt_vec3 t;
+			math_quat_rotate_vec3(&turn, &al.turn_imu[i], &t);
+			residual[i] = m_vec3_len(t - al.turn_dev[i]);
+			weight[i] = residual[i] <= kAlignHuberRad ? 1.0f : kAlignHuberRad / residual[i];
+		}
+	}
+	// How well the turn is known about each axis: the pairs' spread (per axis, from the median of their lengths)
+	// against what was turned about it (sum of w (|x|² I - x xᵀ)); its weakest axis counts.
+	double M[3][3] = {};
+	for (uint32_t i = 0; i < n; i++) {
+		xrt_vec3 x;
+		math_quat_rotate_vec3(&turn, &al.turn_imu[i], &x);
+		const double v[3] = {x.x, x.y, x.z};
+		const double len_sq = v[0] * v[0] + v[1] * v[1] + v[2] * v[2];
+		for (int r = 0; r < 3; r++) {
+			for (int c = 0; c < 3; c++) {
+				M[r][c] += weight[i] * ((r == c ? len_sq : 0.0) - v[r] * v[c]);
+			}
+		}
+	}
+	std::vector<float> sorted = residual;
+	std::nth_element(sorted.begin(), sorted.begin() + n / 2, sorted.end());
+	const float median = sorted[n / 2];
+	const double sigma = median / 1.54; // per axis, from the median length of a 3D spread
+	const double weakest = align_smallest_eigenvalue(M);
+	out_turn = turn;
+	out_residual = median;
+	out_std_err = weakest > 1e-12 ? static_cast<float>(sigma / sqrt(weakest)) : static_cast<float>(M_PI);
+	return median <= kTurnResidualRad && out_std_err <= kTurnStdErrRad;
+}
+
+/*!
+ * The turn and bias that best take each pair's resting reading to the solve's up (Gauss-Newton, Huber, each
+ * orientation bin weighted alike, a weak pull of both towards none), and the median disagreement before and after
+ * (median of the bins' medians). False when it cannot be fitted.
+ */
+static bool
+align_fit(const Device::ImuAlign &al,
+          const bool slot_ok[Device::ImuAlign::kSlots],
+          const xrt_quat *fixed_rot,
+          xrt_quat &out_rot,
+          xrt_vec3 &out_bias,
+          float &out_before,
+          float &out_after)
+{
+	// Pull towards none, against the pairs' own spread (~1.7 degrees): a 20 degree turn or a 1.5 m/s2 bias costs
+	// what one bin's residual of that spread does.
+	const double kPullRot = 0.03 * 0.03 / (0.35 * 0.35);
+	const double kPullBias = 0.03 * 0.03 / (1.5 * 1.5);
+	// The turn from the gyro when there is one: only the bias fitted here (the two are not told apart from downs
+	// alone with few orientations, and a wrong turn would go to the gyro too). Without it, no turn at all.
+	xrt_quat rot = fixed_rot != nullptr ? *fixed_rot : xrt_quat{0.0f, 0.0f, 0.0f, 1.0f};
+	xrt_vec3 bias = {0.0f, 0.0f, 0.0f};
+	for (int iteration = 0; iteration < 8; iteration++) {
+		double H[6][6] = {};
+		double g[6] = {};
+		for (size_t bin = 0; bin < Device::ImuAlign::kBins; bin++) {
+			const uint32_t n = std::min<uint32_t>(al.count[bin], Device::ImuAlign::kPerBin);
+			uint32_t n_ok = 0;
+			for (uint32_t i = 0; i < n; i++) {
+				n_ok += slot_ok[al.pairs[bin][i].slot] ? 1 : 0;
+			}
+			if (n_ok < kAlignBinPairs) {
+				continue;
+			}
+			const double w_bin = 1.0 / n_ok;
+			for (uint32_t i = 0; i < n; i++) {
+				const Device::ImuAlign::Pair &pair = al.pairs[bin][i];
+				if (!slot_ok[pair.slot]) {
+					continue;
+				}
+				const xrt_vec3 v = pair.accel - bias;
+				const float len = m_vec3_len(v);
+				if (len < 1.0f) {
+					continue;
+				}
+				const xrt_vec3 u = m_vec3_mul_scalar(v, 1.0f / len);
+				xrt_vec3 p;
+				math_quat_rotate_vec3(&rot, &u, &p);
+				const xrt_vec3 r = pair.up - p;
+				const float e = m_vec3_len(r);
+				const double w = w_bin * (e <= kAlignHuberRad ? 1.0 : kAlignHuberRad / e);
+				// d(residual)/d(turn) = [p]x, d(residual)/d(bias) = R (I - u u^T) / len.
+				double J[3][6] = {};
+				J[0][0] = 0.0;  J[0][1] = -p.z; J[0][2] = p.y;
+				J[1][0] = p.z;  J[1][1] = 0.0;  J[1][2] = -p.x;
+				J[2][0] = -p.y; J[2][1] = p.x;  J[2][2] = 0.0;
+				const float uu[3] = {u.x, u.y, u.z};
+				for (int c = 0; c < 3; c++) {
+					xrt_vec3 col = {(c == 0 ? 1.0f : 0.0f) - uu[0] * uu[c], (c == 1 ? 1.0f : 0.0f) - uu[1] * uu[c],
+					                (c == 2 ? 1.0f : 0.0f) - uu[2] * uu[c]};
+					col = m_vec3_mul_scalar(col, 1.0f / len);
+					math_quat_rotate_vec3(&rot, &col, &col);
+					J[0][3 + c] = col.x;
+					J[1][3 + c] = col.y;
+					J[2][3 + c] = col.z;
+				}
+				const double rr[3] = {r.x, r.y, r.z};
+				for (int a = 0; a < 6; a++) {
+					for (int k = 0; k < 3; k++) {
+						g[a] += w * J[k][a] * rr[k];
+						for (int b2 = 0; b2 < 6; b2++) {
+							H[a][b2] += w * J[k][a] * J[k][b2];
+						}
+					}
+				}
+			}
+		}
+		// The pull towards none, on the totals.
+		const float angle = align_rot_angle(rot);
+		xrt_vec3 rotvec = {0.0f, 0.0f, 0.0f};
+		if (angle > 1e-6f) {
+			const float s = sinf(angle / 2.0f) * (rot.w < 0.0f ? -1.0f : 1.0f);
+			rotvec = m_vec3_mul_scalar(xrt_vec3{rot.x, rot.y, rot.z}, angle / s);
+		}
+		const double totals[6] = {rotvec.x, rotvec.y, rotvec.z, bias.x, bias.y, bias.z};
+		for (int a = 0; a < 6; a++) {
+			const double pull = a < 3 ? kPullRot : kPullBias;
+			H[a][a] += pull;
+			g[a] += pull * totals[a];
+		}
+		// The turn held where it is (from the gyro, or none).
+		for (int a = 0; a < 3; a++) {
+			H[a][a] += 1e9;
+		}
+		// Minimising |r + J d|^2 + pull |x + d|^2: d = -(J^T J + pull)^-1 (J^T r + pull x).
+		double delta[6];
+		if (!align_solve6(H, g, delta)) {
+			return false;
+		}
+		for (double &d : delta) {
+			d = -d;
+		}
+		const xrt_vec3 dtheta = {static_cast<float>(delta[0]), static_cast<float>(delta[1]), static_cast<float>(delta[2])};
+		const float dangle = m_vec3_len(dtheta);
+		if (dangle > 1e-9f) {
+			xrt_vec3 axis = m_vec3_mul_scalar(dtheta, 1.0f / dangle);
+			xrt_quat dq;
+			math_quat_from_angle_vector(dangle, &axis, &dq);
+			math_quat_rotate(&dq, &rot, &rot);
+			math_quat_normalize(&rot);
+		}
+		bias = bias + xrt_vec3{static_cast<float>(delta[3]), static_cast<float>(delta[4]), static_cast<float>(delta[5])};
+	}
+
+	// The medians of the bins' medians, before (none) and after.
+	std::vector<float> before_bins;
+	std::vector<float> after_bins;
+	for (size_t bin = 0; bin < Device::ImuAlign::kBins; bin++) {
+		const uint32_t n = std::min<uint32_t>(al.count[bin], Device::ImuAlign::kPerBin);
+		if (n < kAlignBinPairs) {
+			continue;
+		}
+		std::vector<float> before;
+		std::vector<float> after;
+		for (uint32_t i = 0; i < n; i++) {
+			const Device::ImuAlign::Pair &pair = al.pairs[bin][i];
+			if (!slot_ok[pair.slot]) {
+				continue;
+			}
+			before.push_back(align_angle(pair.accel, pair.up));
+			after.push_back(align_angle(align_up(rot, bias, pair.accel), pair.up));
+		}
+		if (before.size() < kAlignBinPairs) {
+			continue;
+		}
+		std::nth_element(before.begin(), before.begin() + before.size() / 2, before.end());
+		std::nth_element(after.begin(), after.begin() + after.size() / 2, after.end());
+		before_bins.push_back(before[before.size() / 2]);
+		after_bins.push_back(after[after.size() / 2]);
+	}
+	if (before_bins.empty()) {
+		return false;
+	}
+	std::sort(before_bins.begin(), before_bins.end());
+	std::sort(after_bins.begin(), after_bins.end());
+	out_before = before_bins[before_bins.size() / 2];
+	out_after = after_bins[after_bins.size() / 2];
+	out_rot = rot;
+	out_bias = bias;
+	return true;
+}
+
+//! The median of the orientations' median disagreement with @p rot and @p bias applied (as align_fit's after).
+static float
+align_residual(const Device::ImuAlign &al, const bool slot_ok[Device::ImuAlign::kSlots], const xrt_quat &rot, const xrt_vec3 &bias)
+{
+	std::vector<float> bins;
+	for (size_t bin = 0; bin < Device::ImuAlign::kBins; bin++) {
+		const uint32_t n = std::min<uint32_t>(al.count[bin], Device::ImuAlign::kPerBin);
+		std::vector<float> e;
+		for (uint32_t i = 0; i < n; i++) {
+			const Device::ImuAlign::Pair &pair = al.pairs[bin][i];
+			if (slot_ok[pair.slot]) {
+				e.push_back(align_angle(align_up(rot, bias, pair.accel), pair.up));
+			}
+		}
+		if (e.size() < kAlignBinPairs) {
+			continue;
+		}
+		std::nth_element(e.begin(), e.begin() + e.size() / 2, e.end());
+		bins.push_back(e[e.size() / 2]);
+	}
+	if (bins.empty()) {
+		return static_cast<float>(M_PI);
+	}
+	std::sort(bins.begin(), bins.end());
+	return bins[bins.size() / 2];
+}
+
+/*!
+ * Which sensors see the headset agree with its own IMU (fewer than 3 in 10 of its solves over 5 degrees off, 10 or more
+ * of them): a sensor that sees the headset off too is not singling out a controller (moved, misplaced). The caller holds
+ * the controller's lock; the headset's is taken here. Optionally the counts as text, for the log.
+ */
+static bool
+align_slots_ok(const std::vector<std::unique_ptr<Device>> &devices, bool slot_ok[Device::ImuAlign::kSlots], char *text, size_t text_size)
+{
+	bool any = false;
+	size_t len = 0;
+	if (text != nullptr && text_size > 0) {
+		text[0] = '\0';
+	}
+	for (const std::unique_ptr<Device> &d : devices) {
+		if (!d->params.head) {
+			continue;
+		}
+		std::unique_lock<os::Mutex> ref_lock(d->imu_align.lock);
+		for (size_t s = 0; s < Device::ImuAlign::kSlots; s++) {
+			const uint32_t n = std::min<uint32_t>(d->imu_align.ref_count[s], Device::ImuAlign::kRefKept);
+			if (n == 0) {
+				continue;
+			}
+			uint32_t off = 0;
+			for (uint32_t i = 0; i < n; i++) {
+				off += d->imu_align.ref_err[s][i] > kAlignRefOffRad ? 1 : 0;
+			}
+			slot_ok[s] = n >= kAlignRefMin && off * 10 < n * kAlignRefOffOf10;
+			any = any || slot_ok[s];
+			if (text != nullptr && len < text_size - 24) {
+				len += snprintf(text + len, text_size - len, " %zu: %u of %u off;", s, off, n);
+			}
+		}
+	}
+	return any;
+}
+
+//! The rotation taking direction @p a onto direction @p b by the shortest way.
+static xrt_quat
+align_shortest(const xrt_vec3 &a_in, const xrt_vec3 &b_in)
+{
+	const xrt_vec3 a = m_vec3_normalize(a_in);
+	const xrt_vec3 b = m_vec3_normalize(b_in);
+	xrt_vec3 axis;
+	math_vec3_cross(&a, &b, &axis);
+	const float s = m_vec3_len(axis);
+	const float angle = atan2f(s, m_vec3_dot(a, b));
+	xrt_quat q = {0.0f, 0.0f, 0.0f, 1.0f};
+	if (s > 1e-6f) {
+		axis = m_vec3_mul_scalar(axis, 1.0f / s);
+		math_quat_from_angle_vector(angle, &axis, &q);
+	}
+	return q;
+}
+
+/*!
+ * The provisional alignment from the resting pairs of the last kProvWindowNs (sensors in @p slot_ok): the turn of the
+ * down that takes the readings onto the solves' (held one way: the shortest; two ways or more, far enough apart: fitted
+ * over the orientations, each counting alike), the median disagreement before and after. False with too few pairs.
+ */
+static bool
+align_provisional(const Device::ImuAlign &al,
+                  const bool slot_ok[Device::ImuAlign::kSlots],
+                  timepoint_ns now_ns,
+                  xrt_quat &out_rot,
+                  float &out_before,
+                  float &out_after,
+                  uint32_t &out_pairs,
+                  uint32_t &out_bins)
+{
+	struct Use
+	{
+		xrt_vec3 a;
+		xrt_vec3 u;
+	};
+	std::vector<Use> used;
+	std::vector<std::pair<xrt_vec3, xrt_vec3>> bin_means;
+	xrt_vec3 sum_a = XRT_VEC3_ZERO;
+	xrt_vec3 sum_u = XRT_VEC3_ZERO;
+	// The tilt-against-solve pairs by the orientation they were in, added to the resting ones.
+	xrt_vec3 quick_a[Device::ImuAlign::kBins] = {};
+	xrt_vec3 quick_u[Device::ImuAlign::kBins] = {};
+	uint32_t quick_n[Device::ImuAlign::kBins] = {};
+	const uint32_t qn = std::min<uint32_t>(al.quick_count, Device::ImuAlign::kQuickKept);
+	for (uint32_t i = 0; i < qn; i++) {
+		const Device::ImuAlign::QuickPair &q = al.quick[i];
+		if (!slot_ok[q.slot] || now_ns - q.t > kQuickWindowNs || q.t > now_ns) {
+			continue;
+		}
+		const size_t b = imu_calibration_bin(q.imu_up);
+		used.push_back({q.imu_up, q.up});
+		quick_a[b] = quick_a[b] + q.imu_up;
+		quick_u[b] = quick_u[b] + q.up;
+		quick_n[b]++;
+	}
+	for (size_t bin = 0; bin < Device::ImuAlign::kBins; bin++) {
+		const uint32_t n = std::min<uint32_t>(al.count[bin], Device::ImuAlign::kPerBin);
+		xrt_vec3 ba = quick_a[bin];
+		xrt_vec3 bu = quick_u[bin];
+		uint32_t bn = quick_n[bin];
+		for (uint32_t i = 0; i < n; i++) {
+			const Device::ImuAlign::Pair &pair = al.pairs[bin][i];
+			if (!slot_ok[pair.slot] || now_ns - pair.t > kProvWindowNs || pair.t > now_ns) {
+				continue;
+			}
+			const xrt_vec3 a = m_vec3_normalize(pair.accel);
+			used.push_back({a, pair.up});
+			ba = ba + a;
+			bu = bu + pair.up;
+			bn++;
+		}
+		if (bn > 0) {
+			bin_means.emplace_back(m_vec3_normalize(ba), m_vec3_normalize(bu));
+			sum_a = sum_a + m_vec3_normalize(ba);
+			sum_u = sum_u + m_vec3_normalize(bu);
+		}
+	}
+	out_pairs = static_cast<uint32_t>(used.size());
+	out_bins = static_cast<uint32_t>(bin_means.size());
+	if (used.size() < kProvMinPairs) {
+		return false;
+	}
+	// Held more than one way, far enough apart: the turn is known about every axis.
+	bool apart = false;
+	for (size_t i = 0; i < bin_means.size() && !apart; i++) {
+		for (size_t j = i + 1; j < bin_means.size() && !apart; j++) {
+			apart = align_angle(bin_means[i].second, bin_means[j].second) >= kProvApartRad;
+		}
+	}
+	xrt_quat rot = apart ? imu_calibration_fit(bin_means) : align_shortest(sum_a, sum_u);
+	std::vector<float> before;
+	std::vector<float> after;
+	before.reserve(used.size());
+	after.reserve(used.size());
+	for (const Use &use : used) {
+		xrt_vec3 r;
+		math_quat_rotate_vec3(&rot, &use.a, &r);
+		before.push_back(align_angle(use.a, use.u));
+		after.push_back(align_angle(r, use.u));
+	}
+	std::nth_element(before.begin(), before.begin() + before.size() / 2, before.end());
+	std::nth_element(after.begin(), after.begin() + after.size() / 2, after.end());
+	out_before = before[before.size() / 2];
+	out_after = after[after.size() / 2];
+	out_rot = rot;
+	return true;
+}
+
+xrt_imu_sample
+Device::imuAlignSample(const xrt_imu_sample &sample)
+{
+	const xrt_vec3 accel = {static_cast<float>(sample.accel_m_s2.x), static_cast<float>(sample.accel_m_s2.y),
+	                        static_cast<float>(sample.accel_m_s2.z)};
+	const xrt_vec3 gyro = {static_cast<float>(sample.gyro_rad_secs.x), static_cast<float>(sample.gyro_rad_secs.y),
+	                       static_cast<float>(sample.gyro_rad_secs.z)};
+	if (FILE *dump = align_dump_file()) {
+		std::lock_guard<std::mutex> dump_lock(g_align_dump_lock);
+		fprintf(dump, "G %d %" PRId64 " %.6f %.6f %.6f %.5f %.5f %.5f\n", this->id,
+		        static_cast<int64_t>(sample.timestamp_ns), gyro.x, gyro.y, gyro.z, accel.x, accel.y, accel.z);
+	}
+	auto &al = this->imu_align;
+	std::unique_lock<os::Mutex> lock(al.lock);
+
+	// The raw gyro, for the turn from its rotations.
+	al.gyro[al.gyro_count % Device::ImuAlign::kGyroKept] = {sample.timestamp_ns, gyro};
+	al.gyro_count++;
+
+	// The still window, a hand's limits: a controller held still in play.
+	if (m_vec3_len(gyro) >= kAlignHeldGyro || m_vec3_len(accel) < kTiltMinAccel) {
+		al.window_count = 0;
+		al.window_sum = XRT_VEC3_ZERO;
+		al.window_sum_sq = XRT_VEC3_ZERO;
+	} else {
+		al.window_sum = al.window_sum + accel;
+		al.window_sum_sq = al.window_sum_sq + xrt_vec3{accel.x * accel.x, accel.y * accel.y, accel.z * accel.z};
+		if (++al.window_count >= kImuCalibrationWindow) {
+			const float n = static_cast<float>(al.window_count);
+			const xrt_vec3 mean = m_vec3_mul_scalar(al.window_sum, 1.0f / n);
+			const xrt_vec3 var = m_vec3_mul_scalar(al.window_sum_sq, 1.0f / n) -
+			                     xrt_vec3{mean.x * mean.x, mean.y * mean.y, mean.z * mean.z};
+			const float limit = kAlignHeldStd * kAlignHeldStd;
+			if (var.x <= limit && var.y <= limit && var.z <= limit) {
+				al.last_rest = mean;
+				al.last_rest_ns = sample.timestamp_ns;
+			}
+			al.window_count = 0;
+			al.window_sum = XRT_VEC3_ZERO;
+			al.window_sum_sq = XRT_VEC3_ZERO;
+		}
+	}
+
+	if (!al.applied.load()) {
+		if (!al.provisional.load()) {
+			return sample;
+		}
+		// Provisional: the accelerometer's down only, the gyro as it is.
+		xrt_vec3 a = accel;
+		math_quat_rotate_vec3(&al.prov_rot, &a, &a);
+		xrt_imu_sample out = sample;
+		out.accel_m_s2 = {a.x, a.y, a.z};
+		return out;
+	}
+	xrt_vec3 a = accel - al.bias;
+	xrt_vec3 w = gyro;
+	math_quat_rotate_vec3(&al.rot, &a, &a);
+	math_quat_rotate_vec3(&al.rot, &w, &w);
+	xrt_imu_sample out = sample;
+	out.accel_m_s2 = {a.x, a.y, a.z};
+	out.gyro_rad_secs = {w.x, w.y, w.z};
+	return out;
+}
+
+void
+Camera::collectImuAlign(Device *device, const CameraSample &sample, const xrt_pose &Tcv_cam_device, uint32_t matched_blobs)
+{
+	if (matched_blobs < kQuickMinLeds || device->imu_calibration.active.load()) {
+		return;
+	}
+	const bool strong = matched_blobs >= kAlignMinLeds;
+	std::shared_ptr<CameraMosaic> camera_mosaic = this->mosaic.lock();
+	if (!camera_mosaic) {
+		return;
+	}
+	const size_t slot = camera_mosaic->index * 4 + this->index;
+	if (slot >= Device::ImuAlign::kSlots) {
+		return;
+	}
+	xrt_vec3 camera_gravity;
+	xrt_vec3 device_gravity;
+	if (!this->gravityForSample(device, sample, camera_gravity, device_gravity)) {
+		return;
+	}
+	// The headset: only what each sensor makes of it against its own IMU, the controllers' reference.
+	if (device->params.head) {
+		if (!strong) {
+			return;
+		}
+		const float error_rad = pose_metrics_gravity_error_rad(&Tcv_cam_device, &camera_gravity, &device_gravity);
+		auto &ref = device->imu_align;
+		std::unique_lock<os::Mutex> lock(ref.lock);
+		if (sample.timestamp_ns - ref.ref_last_ns[slot] >= kAlignEveryNs) {
+			ref.ref_last_ns[slot] = sample.timestamp_ns;
+			ref.ref_err[slot][ref.ref_count[slot] % Device::ImuAlign::kRefKept] = error_rad;
+			ref.ref_count[slot]++;
+		}
+		return;
+	}
+	// The solve's down in the device frame (OpenCV), as up in OpenXR coordinates.
+	xrt_quat inverse = Tcv_cam_device.orientation;
+	math_quat_invert(&inverse, &inverse);
+	xrt_vec3 down_cv;
+	math_quat_rotate_vec3(&inverse, &camera_gravity, &down_cv);
+	const xrt_vec3 up = m_vec3_normalize(xrt_vec3{-down_cv.x, down_cv.y, down_cv.z});
+	if (FILE *dump = align_dump_file()) {
+		const xrt_quat &q = Tcv_cam_device.orientation;
+		std::lock_guard<std::mutex> dump_lock(g_align_dump_lock);
+		const xrt_vec3 &pos = Tcv_cam_device.position;
+		fprintf(dump, "S %d %zu %" PRId64 " %.7f %.7f %.7f %.7f %u %.6f %.6f %.6f %.5f %.5f %.5f\n", device->id,
+		        slot, static_cast<int64_t>(sample.timestamp_ns), q.x, q.y, q.z, q.w, matched_blobs, up.x, up.y, up.z,
+		        pos.x, pos.y, pos.z);
+	}
+
+	auto &al = device->imu_align;
+	std::unique_lock<os::Mutex> lock(al.lock);
+
+	/*
+	 * A turn pair: this sensor's last solve and this one, far enough apart and turned enough, against the gyro's turn
+	 * over the same time. The sensor stands still, so the device's own turn is the one between the two solves.
+	 */
+	if (strong) {
+		Device::ImuAlign::LastSolve &last = al.last_solve[slot];
+		const timepoint_ns dt = sample.timestamp_ns - last.t;
+		if (last.t == 0 || dt > kTurnMaxNs || dt < 0) {
+			last = {sample.timestamp_ns, Tcv_cam_device.orientation};
+		} else if (dt >= kTurnMinNs) {
+			xrt_quat inverse_last = last.q;
+			math_quat_invert(&inverse_last, &inverse_last);
+			xrt_quat d_cv;
+			math_quat_rotate(&inverse_last, &Tcv_cam_device.orientation, &d_cv);
+			const xrt_vec3 rv_cv = align_rotvec(d_cv);
+			xrt_quat d_imu;
+			if (m_vec3_len(rv_cv) >= kTurnMinRad && align_gyro_turn(al, last.t, sample.timestamp_ns, d_imu)) {
+				// OpenCV's device frame to OpenXR's: a half turn about x.
+				const xrt_vec3 rv_dev = {rv_cv.x, -rv_cv.y, -rv_cv.z};
+				const size_t k = al.turn_count % Device::ImuAlign::kTurnKept;
+				al.turn_imu[k] = align_rotvec(d_imu);
+				al.turn_dev[k] = rv_dev;
+				al.turn_count++;
+			}
+			last = {sample.timestamp_ns, Tcv_cam_device.orientation};
+		}
+	}
+
+	// A tilt-against-solve pair, while it turns slowly and nothing is in use yet (the tilt is then the raw IMU's).
+	if (!al.applied.load() && !al.provisional.load() && al.gyro_count > 0 &&
+	    sample.timestamp_ns - al.quick_last_ns >= kAlignEveryNs) {
+		const Device::ImuAlign::GyroSample &g = al.gyro[(al.gyro_count - 1) % Device::ImuAlign::kGyroKept];
+		if (m_vec3_len(g.w) < kQuickGyro) {
+			const xrt_vec3 imu_up = m_vec3_normalize(xrt_vec3{-device_gravity.x, device_gravity.y, device_gravity.z});
+			al.quick[al.quick_count % Device::ImuAlign::kQuickKept] = {imu_up, up, static_cast<uint8_t>(slot),
+			                                                          sample.timestamp_ns};
+			al.quick_count++;
+			al.quick_last_ns = sample.timestamp_ns;
+		}
+	}
+
+	// The provisional alignment, until the full one is in use: a controller the gravity check keeps refusing gets
+	// its solves back within seconds, and with them what the full one learns from.
+	if (!al.applied.load() && sample.timestamp_ns - al.prov_tried_ns >= kProvEveryNs) {
+		al.prov_tried_ns = sample.timestamp_ns;
+		bool prov_slots[Device::ImuAlign::kSlots] = {};
+		xrt_quat prov;
+		float prov_before = 0.0f;
+		float prov_after = 0.0f;
+		uint32_t prov_pairs = 0;
+		uint32_t prov_bins = 0;
+		char prov_ref[160] = "";
+		const bool prov_sensors = align_slots_ok(this->tracker->devices, prov_slots, prov_ref, sizeof(prov_ref));
+		const bool prov_fitted = prov_sensors && align_provisional(al, prov_slots, sample.timestamp_ns, prov,
+		                                                           prov_before, prov_after, prov_pairs, prov_bins);
+		if (!al.provisional.load() && sample.timestamp_ns - al.prov_logged_ns >= kAlignLogEveryNs) {
+			// Why not yet, now and then.
+			al.prov_logged_ns = sample.timestamp_ns;
+			CT_INFO(this->tracker,
+			        "Device %d: provisional IMU alignment not yet: %u readings in %u orientations, solves %.1f degrees "
+			        "off its IMU's down, %.1f with it (sensors:%s%s).",
+			        device->id, prov_pairs, prov_bins, RAD_TO_DEG(prov_before), RAD_TO_DEG(prov_after), prov_ref,
+			        prov_sensors ? "" : " none agrees yet");
+		}
+		if (prov_fitted) {
+			// It explains them: what is left is at most kProvLeftRad, or half of what it was (a session whose good
+			// controllers read some degrees off through every sensor leaves more than a turn alone explains).
+			const bool fits = prov_after <= std::max(kProvLeftRad, 0.5f * prov_before) &&
+			                  align_rot_angle(prov) <= kAlignMaxRad;
+			if (!al.provisional.load()) {
+				if (prov_before >= kProvFaultRad && fits) {
+					al.prov_rot = prov;
+					al.prov_since_ns = sample.timestamp_ns;
+					if (!al.applied.load()) {
+						al.gate_only.store(prov_before < kProvFusionRad);
+					}
+					al.provisional.store(true);
+					CT_WARN(this->tracker,
+					        "Device %d: IMU alignment provisional: its down turned %.1f degrees (%u resting readings, %u "
+					        "orientations, solves %.1f degrees off its IMU's down, %.1f with it): the gravity check "
+					        "centred on it until the full alignment is known.",
+					        device->id, RAD_TO_DEG(align_rot_angle(prov)), prov_pairs, prov_bins,
+					        RAD_TO_DEG(prov_before), RAD_TO_DEG(prov_after));
+				}
+			} else if (prov_before < kAlignUnusedRad) {
+				al.provisional.store(false);
+				CT_WARN(this->tracker,
+				        "Device %d: provisional IMU alignment no longer needed (%.1f degrees off): not used.",
+				        device->id, RAD_TO_DEG(prov_before));
+			} else if (fits) {
+				xrt_quat inverse = al.prov_rot;
+				math_quat_invert(&inverse, &inverse);
+				xrt_quat change;
+				math_quat_rotate(&prov, &inverse, &change);
+				if (align_rot_angle(change) > kProvChangeRad) {
+					al.prov_rot = prov;
+					CT_INFO(this->tracker,
+					        "Device %d: provisional IMU alignment now %.1f degrees (%u readings, %u orientations, "
+					        "%.1f degrees off, %.1f with it).",
+					        device->id, RAD_TO_DEG(align_rot_angle(prov)), prov_pairs, prov_bins,
+					        RAD_TO_DEG(prov_before), RAD_TO_DEG(prov_after));
+				}
+			}
+		}
+	}
+
+	if (!strong || al.last_rest_ns == 0 || sample.timestamp_ns - al.last_rest_ns > kAlignRestAgeNs ||
+	    al.last_rest_ns - sample.timestamp_ns > kAlignRestAgeNs) {
+		return;
+	}
+	if (align_angle(al.last_rest, up) > kAlignWrongRad) {
+		return;
+	}
+	const size_t bin = imu_calibration_bin(m_vec3_normalize(al.last_rest));
+	if (sample.timestamp_ns - al.last_pair_ns[bin] < kAlignEveryNs) {
+		return;
+	}
+	al.last_pair_ns[bin] = sample.timestamp_ns;
+	al.first_ns = al.first_ns == 0 ? sample.timestamp_ns : al.first_ns;
+	al.pairs[bin][al.count[bin] % Device::ImuAlign::kPerBin] = {al.last_rest, up, static_cast<uint8_t>(slot),
+	                                                             sample.timestamp_ns};
+	al.count[bin]++;
+
+	if (sample.timestamp_ns - al.fit_tried_ns < kAlignFitEveryNs) {
+		return;
+	}
+	uint32_t pairs = 0;
+	uint32_t bins = 0;
+	for (size_t b = 0; b < Device::ImuAlign::kBins; b++) {
+		const uint32_t n = std::min<uint32_t>(al.count[b], Device::ImuAlign::kPerBin);
+		pairs += n;
+		bins += n >= kAlignBinPairs ? 1 : 0;
+	}
+	if (pairs < kAlignMinPairs || bins < kAlignMinBins) {
+		return;
+	}
+	al.fit_tried_ns = sample.timestamp_ns;
+
+	/*
+	 * Not the controller when the sensor that saw it sees the headset off its own IMU too (moved, misplaced): the
+	 * pairs from sensors where the headset agrees with its IMU, the others left out. The headset's lock while its
+	 * counts are read; the devices' lock is the caller's.
+	 */
+	bool slot_ok[Device::ImuAlign::kSlots] = {};
+	char ref_text[160] = "";
+	const bool sensors_ok = align_slots_ok(this->tracker->devices, slot_ok, ref_text, sizeof(ref_text));
+
+	if (!sensors_ok) {
+		if (sample.timestamp_ns - al.logged_ns >= kAlignLogEveryNs) {
+			al.logged_ns = sample.timestamp_ns;
+			CT_INFO(this->tracker,
+			        "Device %d: IMU alignment after %.0f s: %u pairs in %u orientations; no sensor has seen the "
+			        "headset agree with its IMU yet (sensor: headset solves over 5 degrees off;%s), nothing fitted.",
+			        device->id, time_ns_to_s(sample.timestamp_ns - al.first_ns), pairs, bins, ref_text);
+		}
+		return;
+	}
+	xrt_quat rot;
+	xrt_vec3 bias;
+	float before = 0.0f;
+	float after = 0.0f;
+	xrt_quat turn = {0.0f, 0.0f, 0.0f, 1.0f};
+	float turn_residual = 0.0f;
+	float turn_std_err = 0.0f;
+	uint32_t turn_pairs = 0;
+	const bool have_turn = align_turn_fit(al, turn, turn_residual, turn_std_err, turn_pairs);
+	if (!align_fit(al, slot_ok, have_turn ? &turn : nullptr, rot, bias, before, after)) {
+		return;
+	}
+	/*
+	 * The accelerometer's bias only where the gyro's turn alone still leaves a fault: what is left within the usual
+	 * spread stays as on a good controller (a session whose good controllers read 4.5 degrees off through every sensor
+	 * had a turned one's fit take 0.8 m/s2 of it for a bias, refusing more of its solves than the untouched one's). Once
+	 * a bias is in use it goes when the turn alone leaves less than kAlignUnusedRad.
+	 */
+	if (have_turn) {
+		const bool bias_in_use = al.applied.load() && m_vec3_len(al.bias) > 0.0f;
+		const float turn_only = align_residual(al, slot_ok, turn, XRT_VEC3_ZERO);
+		if (turn_only < (bias_in_use ? kAlignUnusedRad : kAlignFaultRad)) {
+			rot = turn;
+			bias = XRT_VEC3_ZERO;
+			after = turn_only;
+		}
+	}
+	const float rot_rad = align_rot_angle(rot);
+	const float bias_len = m_vec3_len(bias);
+	// A fault only with the turn from the gyro: from downs alone a turn and a bias look alike in the few ways a hand
+	// holds a controller, and a turn put on the gyro that is not there would turn its rotations.
+	const float fault_rad = bins >= 3 ? kAlignFaultRad : kAlignFaultTwoRad;
+	const bool fault = have_turn && before >= fault_rad && after <= std::max(kAlignLeftRad, 0.5f * before) &&
+	                   rot_rad <= kAlignMaxRad && bias_len <= kAlignMaxBias;
+
+	// How it stands, in the log now and then.
+	if (sample.timestamp_ns - al.logged_ns >= kAlignLogEveryNs) {
+		al.logged_ns = sample.timestamp_ns;
+		CT_INFO(this->tracker,
+		        "Device %d: IMU alignment after %.0f s: %u pairs in %u orientations, %u gyro turns (turned %.1f "
+		        "degrees, within %.1f, residual %.1f: %s); fit turned %.1f degrees, bias %.3f m/s2; solves %.1f degrees "
+		        "off its IMU's down, %.1f with the fit; %s%s.",
+		        device->id, time_ns_to_s(sample.timestamp_ns - al.first_ns), pairs, bins, turn_pairs,
+		        RAD_TO_DEG(align_rot_angle(turn)), RAD_TO_DEG(turn_std_err), RAD_TO_DEG(turn_residual),
+		        have_turn ? "known" : "not yet", RAD_TO_DEG(rot_rad), bias_len, RAD_TO_DEG(before), RAD_TO_DEG(after),
+		        al.applied.load() ? "in use" : fault ? "a fault" : "no fault",
+		        al.have_candidate ? ", waiting to confirm" : "");
+	}
+
+	if (!al.applied.load() && !(fault && sensors_ok)) {
+		al.have_candidate = false;
+		return;
+	}
+	if (al.applied.load() && before < kAlignUnusedRad) {
+		// What it learned no longer holds (what it reads now is within the usual spread): back to none.
+		al.applied.store(false);
+		al.have_candidate = false;
+		CT_WARN(this->tracker, "Device %d: IMU alignment no longer needed (%.1f degrees off): not used.", device->id,
+		        RAD_TO_DEG(before));
+		return;
+	}
+	if (!fault) {
+		return;
+	}
+	// The same fit twice, apart in time, before it is used or changed.
+	xrt_quat diff;
+	xrt_quat candidate_inverse = al.candidate_rot;
+	math_quat_invert(&candidate_inverse, &candidate_inverse);
+	math_quat_rotate(&rot, &candidate_inverse, &diff);
+	const bool agrees = al.have_candidate && align_rot_angle(diff) <= kAlignAgreeRad &&
+	                    m_vec3_len(bias - al.candidate_bias) <= kAlignAgreeBias;
+	if (!agrees) {
+		al.have_candidate = true;
+		al.candidate_rot = rot;
+		al.candidate_bias = bias;
+		al.candidate_ns = sample.timestamp_ns;
+		return;
+	}
+	if (sample.timestamp_ns - al.candidate_ns < kAlignConfirmNs) {
+		return;
+	}
+	if (al.applied.load()) {
+		xrt_quat applied_inverse = al.rot;
+		math_quat_invert(&applied_inverse, &applied_inverse);
+		xrt_quat change;
+		math_quat_rotate(&rot, &applied_inverse, &change);
+		if (align_rot_angle(change) <= kAlignAgreeRad && m_vec3_len(bias - al.bias) <= kAlignAgreeBias) {
+			al.candidate_ns = sample.timestamp_ns;
+			return;
+		}
+		/*
+		 * Changed only for a fit that explains what the sensors see now clearly better than what is in use: a fit from
+		 * fewer orientations than the one in use was learned from pins the bias less (a kept value from three
+		 * orientations was replaced early in the next session by one from two, its bias 0.4 m/s2 off along what two
+		 * do not see, and came back when the third did).
+		 */
+		if (align_residual(al, slot_ok, al.rot, al.bias) <= after + kAlignBetterRad) {
+			al.candidate_ns = sample.timestamp_ns;
+			return;
+		}
+	}
+	al.rot = rot;
+	al.bias = bias;
+	al.gate_only.store(before < (bins >= 3 ? kAlignFusionRad : kAlignFusionTwoRad));
+	al.applied.store(true);
+	al.provisional.store(false);
+	al.candidate_ns = sample.timestamp_ns;
+	CT_WARN(this->tracker,
+	        "Device %d: IMU alignment learned after %.0f s: turned %.1f degrees, accelerometer bias %.3f m/s2 (%.3f "
+	        "%.3f %.3f); solves were %.1f degrees off its IMU's down, %.1f with it (%u pairs, %u orientations): used "
+	        "for its IMU (sample time %" PRId64 " ns) (q %.6f %.6f %.6f %.6f, b %.6f %.6f %.6f).",
+	        device->id, time_ns_to_s(sample.timestamp_ns - al.first_ns), RAD_TO_DEG(rot_rad), bias_len, bias.x, bias.y,
+	        bias.z, RAD_TO_DEG(before), RAD_TO_DEG(after), pairs, bins, static_cast<int64_t>(sample.timestamp_ns), rot.x,
+	        rot.y, rot.z, rot.w, bias.x, bias.y, bias.z);
+}
+
+void
+Device::refreshImuCalibrationStatus()
+{
+	auto &cal = this->imu_calibration;
+	// The six poses a person can be told first, then what lies between them. What up is in each: the status's table.
+	static constexpr std::array<int, T_CONSTELLATION_IMU_ORIENTATIONS> kOrder = {2, 5, 4, 0, 1, 3, 6, 10, 7, 11, 8, 12, 9, 13};
+	for (size_t i = 0; i < cal.bins.size(); i++) {
+		cal.status.orientation_fill[i] =
+		    std::min(1.0f, static_cast<float>(cal.bins[i]) / static_cast<float>(kImuCalibrationPerBin));
+	}
+	/*
+	 * The guided steps: the pose asked for, its progress for the circle, the poses done. Without the trigger (a device
+	 * lying still, a replay) the orientations below still fill and a round still fits; the status shows the steps.
+	 */
+	cal.status.held = cal.held.load();
+	if (cal.status.state == T_CONSTELLATION_IMU_CALIBRATION_COLLECTING && cal.step < 0) {
+		for (size_t i = 0; i < cal.bins.size(); i++) {
+			cal.status.orientation_fill[i] = 0.0f;
+		}
+		cal.status.next_orientation = -2;
+		cal.status.progress = cal.step_result == 1 ? 100 : static_cast<int>(cal.close_share * 100.0f + 0.5f);
+		cal.status.reason = cal.step_result == 2 ? T_CONSTELLATION_IMU_CALIBRATION_REASON_NOT_CLOSE_ENOUGH
+		                                         : T_CONSTELLATION_IMU_CALIBRATION_REASON_NONE;
+		return;
+	}
+	if (cal.status.state == T_CONSTELLATION_IMU_CALIBRATION_COLLECTING && cal.steps_complete.load()) {
+		// All poses done: the round is worked out (next_orientation -1), the controller kept in view meanwhile.
+		for (size_t i = 0; i < cal.bins.size(); i++) {
+			cal.status.orientation_fill[i] = 0.0f;
+		}
+		for (int i = 0; i < kImuCalibrationStepCount; i++) {
+			cal.status.orientation_fill[kImuCalibrationSteps[i]] = 1.0f;
+		}
+		cal.status.next_orientation = -1;
+		cal.status.progress = 100;
+		cal.status.reason = T_CONSTELLATION_IMU_CALIBRATION_REASON_NONE;
+		return;
+	}
+	if (cal.status.state == T_CONSTELLATION_IMU_CALIBRATION_COLLECTING && cal.step < kImuCalibrationStepCount) {
+		for (size_t i = 0; i < cal.bins.size(); i++) {
+			cal.status.orientation_fill[i] = 0.0f;
+		}
+		uint32_t done = 0;
+		for (int i = 0; i < kImuCalibrationStepCount; i++) {
+			if (cal.step_done[i]) {
+				cal.status.orientation_fill[kImuCalibrationSteps[i]] = 1.0f;
+				done++;
+			}
+		}
+		const float fill =
+		    cal.step_result != 0
+		        ? 1.0f
+		        : std::min(static_cast<float>(cal.step_pairs) / static_cast<float>(kImuCalibrationStepPairs),
+		                   static_cast<float>(cal.step_rests) / static_cast<float>(kImuCalibrationStepRests));
+		cal.status.progress = static_cast<int>(std::min(1.0f, fill) * 100.0f);
+		if (!cal.step_done[cal.step]) {
+			cal.status.orientation_fill[kImuCalibrationSteps[cal.step]] = std::min(fill, 0.99f);
+		}
+		cal.status.next_orientation = kImuCalibrationSteps[cal.step];
+		cal.status.reason = cal.step_result != 2 ? T_CONSTELLATION_IMU_CALIBRATION_REASON_NONE : cal.status.reason;
+		if (cal.status.round > 0) {
+			cal.status.overall_progress = std::min(
+			    99, (100 * (cal.status.round - 1) + static_cast<int>(100 * done / kImuCalibrationStepCount)) /
+			            kImuCalibrationRounds);
+		}
+		return;
+	}
+	cal.status.next_orientation = -1;
+	// Twice: with every orientation given up on but not filled, the ones given up on get another go.
+	for (int pass = 0; pass < 2 && cal.status.next_orientation < 0; pass++) {
+		for (const int orientation : kOrder) {
+			if (cal.bins[orientation] < kImuCalibrationPerBin && (pass == 1 || !cal.given_up[orientation])) {
+				cal.status.next_orientation = orientation;
+				break;
+			}
+		}
+		if (cal.status.next_orientation < 0 || pass == 1) {
+			break;
+		}
+	}
+	if (cal.status.round > 0) {
+		cal.status.overall_progress =
+		    std::min(99, (100 * (cal.status.round - 1) + cal.status.progress) / kImuCalibrationRounds);
+	}
+}
+
+void
+Device::imuCalibrationStepCheck()
+{
+	auto &cal = this->imu_calibration;
+	if (cal.step_result != 0 || cal.step < 0 || cal.step >= kImuCalibrationStepCount ||
+	    cal.step_pairs < kImuCalibrationStepPairs ||
+	    cal.step_rests < kImuCalibrationStepRests) {
+		this->refreshImuCalibrationStatus();
+		return;
+	}
+	const xrt_vec3 up = m_vec3_normalize(cal.step_up_sum);
+	const auto angle_deg = [](const xrt_vec3 &a, const xrt_vec3 &b) {
+		return static_cast<float>(RAD_TO_DEG(acosf(CLAMP(m_vec3_dot(a, b), -1.0f, 1.0f))));
+	};
+	const float off_deg = angle_deg(up, kImuCalibrationStepUp[cal.step]);
+	float nearest_deg = 180.0f;
+	for (int i = 0; i < kImuCalibrationStepCount; i++) {
+		if (cal.step_done[i] && i != cal.step) {
+			nearest_deg = std::min(nearest_deg, angle_deg(up, cal.step_up[i]));
+		}
+	}
+	if (off_deg > kImuCalibrationStepMaxDeg) {
+		cal.step_result = 2;
+		cal.status.reason = T_CONSTELLATION_IMU_CALIBRATION_REASON_STEP_NOT_AS_SHOWN;
+	} else if (nearest_deg < kImuCalibrationStepMinApartDeg) {
+		cal.step_result = 2;
+		cal.status.reason = T_CONSTELLATION_IMU_CALIBRATION_REASON_STEP_DONE_BEFORE;
+	} else {
+		cal.step_result = 1;
+		cal.step_done[cal.step] = true;
+		cal.step_up[cal.step] = up;
+		bool all = true;
+		for (int i = 0; i < kImuCalibrationStepCount; i++) {
+			all = all && cal.step_done[i];
+		}
+		cal.steps_complete.store(all);
+	}
+	CT_INFO(this->tracker, "Device %d: calibration pose %d %s: up (%.2f %.2f %.2f), %.0f degrees from the pose shown, %.0f from the nearest done before.",
+	        this->id, cal.step + 1, cal.step_result == 1 ? "done" : "turned away", up.x, up.y, up.z, off_deg,
+	        nearest_deg);
+	this->refreshImuCalibrationStatus();
+}
+
+void
+Device::imuCalibrationStepsRestart()
+{
+	auto &cal = this->imu_calibration;
+	cal.step = 0;
+	cal.step_pairs = 0;
+	cal.step_rests = 0;
+	cal.step_up_sum = XRT_VEC3_ZERO;
+	cal.step_result = 0;
+	cal.step_done.fill(false);
+	cal.steps_complete.store(false);
+	cal.wait_release = cal.held.load();
+}
+
+bool
+ImuTilt::restingAt(timepoint_ns when_ns, timepoint_ns rest_ns) const
+{
+	std::unique_lock<os::Mutex> lock(this->lock);
+	return this->have_up && this->last_moving_ns <= when_ns - rest_ns && this->last_ns >= when_ns - kTiltGapNs;
 }
 
 std::optional<xrt_vec3>
@@ -3366,6 +5976,11 @@ ConstellationTracker::ConstellationTracker(t_constellation_tracker_params *param
 	    static_cast<float>(DEG_TO_RAD(debug_get_float_option_constellation_tracker_prior_rot_tolerance_deg()));
 	const float prior_pos_m = debug_get_float_option_constellation_tracker_prior_pos_tolerance_m();
 	this->prior_tolerance_rot = {prior_rot_rad, prior_rot_rad, prior_rot_rad};
+	this->held_prior_rot_growth = debug_get_bool_option_constellation_tracker_held_prior_rot_growth();
+	for (size_t i = 0; i < kHeldRotSteps; i++) {
+		const float r = prior_rot_rad + static_cast<float>(DEG_TO_RAD(kHeldRotGrowthDeg[i]));
+		this->held_prior_tolerance_rot[i] = {r, r, r};
+	}
 	this->prior_tolerance_pos = {prior_pos_m, prior_pos_m, prior_pos_m};
 	if (prior_rot_rad > 0.0f && prior_pos_m > 0.0f) {
 		this->prior_fresh_ns = debug_get_num_option_constellation_tracker_prior_fresh_ms() * U_TIME_1MS_IN_NS;
@@ -5474,6 +8089,13 @@ ConstellationTracker::addDevice(t_constellation_tracker_device_params *params, t
 
 	t_constellation_device_id_t id = this->next_device_id++;
 
+	// A controller's LEDs needed for a search without a prior (see CONSTELLATION_TRACKER_TOUCH_MIN_LEDS_NO_PRIOR).
+	const int64_t touch_no_prior = debug_get_num_option_constellation_tracker_touch_min_leds_no_prior();
+	if (!params->head && touch_no_prior >= 4) {
+		params->led_model.match_parameters.min_leds_for_correspondence_search_without_prior =
+		    static_cast<uint32_t>(touch_no_prior);
+	}
+
 	this->devices.push_back(std::make_unique<Device>(this, params, device, id));
 
 	CT_DEBUG(this, "Added device with ID %d to constellation tracker", id);
@@ -5976,3 +8598,261 @@ t_constellation_tracker_get_solved_pose(struct t_constellation_tracker *raw_trac
 
 	return 0;
 }
+
+int
+t_constellation_tracker_calibrate_imu(struct t_constellation_tracker *raw_tracker,
+                                      t_constellation_device_id_t device_id,
+                                      bool start)
+{
+	ConstellationTracker *tracker = ConstellationTracker::Get(raw_tracker);
+
+	std::shared_lock lock(tracker->device_lock);
+	for (const auto &device : tracker->devices) {
+		if (device->id != device_id) {
+			continue;
+		}
+		auto &cal = device->imu_calibration;
+		std::unique_lock<os::Mutex> cal_lock(cal.lock);
+		cal.pairs.clear();
+		cal.bins.fill(0);
+		cal.rest_accel.clear();
+		cal.rest_bins.fill(0);
+		cal.rest_hand = 0;
+		cal.sets_without_round = 0;
+		cal.window_count = 0;
+		cal.window_sum = XRT_VEC3_ZERO;
+		cal.window_sum_sq = XRT_VEC3_ZERO;
+		const bool was_active = cal.active.load();
+		cal.status = {};
+		cal.status.correction = XRT_QUAT_IDENTITY;
+		cal.status.orientation_now = -1;
+		cal.status.next_orientation = -1;
+		cal.status.reason = !start && was_active ? T_CONSTELLATION_IMU_CALIBRATION_REASON_CANCELLED
+		                                         : T_CONSTELLATION_IMU_CALIBRATION_REASON_NONE;
+		cal.waited_windows.fill(0);
+		cal.given_up.fill(false);
+		// What was counted against the IMU as it was says nothing of it from here on.
+		for (auto &slot : device->imu_advice.bins) {
+			for (auto &bin : slot) {
+				bin.samples.store(0);
+				bin.off.store(0);
+				bin.hundredths.store(0);
+			}
+		}
+		device->imuCalibrationStepsRestart();
+		// A calibration starts at "come closer"; its later rounds at the first pose.
+		cal.step = -1;
+		cal.close_share = 0.0f;
+		cal.close_last_ns = 0;
+		cal.held.store(debug_get_bool_option_constellation_tracker_imu_calibration_held());
+		if (start) {
+			cal.status.state = T_CONSTELLATION_IMU_CALIBRATION_COLLECTING;
+			cal.status.round = 1;
+			cal.last_progress_ns = 0;
+			device->refreshImuCalibrationStatus();
+			cal.collect_from_ns = 0;
+			cal.fit_tried_ns = 0;
+			cal.last_rest_ns = 0;
+		}
+		cal.active.store(start);
+		CT_INFO(tracker, "Device %d: IMU calibration %s.", device_id, start ? "started" : "cancelled");
+		return 0;
+	}
+	return -1;
+}
+
+void
+t_constellation_tracker_imu_calibration_hold(struct t_constellation_tracker *raw_tracker,
+                                             t_constellation_device_id_t device_id,
+                                             bool held)
+{
+	ConstellationTracker *tracker = ConstellationTracker::Get(raw_tracker);
+	const bool always = debug_get_bool_option_constellation_tracker_imu_calibration_held();
+
+	std::shared_lock lock(tracker->device_lock);
+	for (const auto &device : tracker->devices) {
+		if (device->id != device_id) {
+			continue;
+		}
+		auto &cal = device->imu_calibration;
+		held = held || always;
+		if (cal.held.load() == held) {
+			return;
+		}
+		std::unique_lock<os::Mutex> cal_lock(cal.lock);
+		if (!held) {
+			cal.wait_release = false;
+			// Let go: after a pose done, on to the next one not done; after one turned away, the same again;
+			// after "come closer" done, the first pose.
+			if (cal.step_result == 1 && cal.step < 0) {
+				cal.step = 0;
+			} else if (cal.step_result == 1) {
+				int next = -1;
+				for (int i = 1; i <= kImuCalibrationStepCount && next < 0; i++) {
+					const int s = (cal.step + i) % kImuCalibrationStepCount;
+					next = cal.step_done[s] ? -1 : s;
+				}
+				cal.step = next >= 0 ? next : cal.step;
+			}
+			if (cal.step_result != 0) {
+				cal.step_pairs = 0;
+				cal.step_rests = 0;
+				cal.step_up_sum = XRT_VEC3_ZERO;
+				cal.step_result = 0;
+			}
+		} else {
+			// Taken hold of: nothing measured yet, but it is not idle.
+			cal.last_progress_ns = cal.last_imu_ns;
+			// "Come closer": the press goes on only when the sensors see it well enough.
+			if (cal.step < 0 && cal.step_result == 0) {
+				const bool seen = cal.close_last_ns != 0 && cal.last_imu_ns - cal.close_last_ns <= kImuCalibrationCloseAgeNs;
+				cal.step_result = seen && cal.close_share >= kImuCalibrationCloseShare ? 1 : 2;
+			}
+		}
+		cal.held.store(held);
+		if (cal.active.load()) {
+			device->refreshImuCalibrationStatus();
+		}
+		CT_DEBUG(tracker, "Device %d: calibration trigger %s.", device_id, held ? "held" : "let go");
+		return;
+	}
+}
+
+uint32_t
+t_constellation_tracker_imu_calibration_leds(struct t_constellation_tracker *raw_tracker,
+                                             t_constellation_device_id_t device_id)
+{
+	ConstellationTracker *tracker = ConstellationTracker::Get(raw_tracker);
+
+	std::shared_lock lock(tracker->device_lock);
+	for (const auto &device : tracker->devices) {
+		if (device->id != device_id) {
+			continue;
+		}
+		auto &cal = device->imu_calibration;
+		std::unique_lock<os::Mutex> cal_lock(cal.lock);
+		return cal.last_imu_ns - cal.last_leds_ns.load() <= kImuCalibrationLedsAgeNs ? cal.last_leds.load() : 0;
+	}
+	return 0;
+}
+
+int
+t_constellation_tracker_get_imu_align(struct t_constellation_tracker *raw_tracker,
+                                      t_constellation_device_id_t device_id,
+                                      struct xrt_quat *out_rot,
+                                      struct xrt_vec3 *out_bias,
+                                      bool *out_applied)
+{
+	ConstellationTracker *tracker = ConstellationTracker::Get(raw_tracker);
+
+	std::shared_lock lock(tracker->device_lock);
+	for (const auto &device : tracker->devices) {
+		if (device->id != device_id) {
+			continue;
+		}
+		auto &al = device->imu_align;
+		std::unique_lock<os::Mutex> al_lock(al.lock);
+		*out_rot = al.rot;
+		*out_bias = al.bias;
+		// A gate-only one is learned anew each session, never kept for the next.
+		*out_applied = al.applied.load() && !al.gate_only.load();
+		return 0;
+	}
+	return -1;
+}
+
+int
+t_constellation_tracker_set_imu_align(struct t_constellation_tracker *raw_tracker,
+                                      t_constellation_device_id_t device_id,
+                                      const struct xrt_quat *rot,
+                                      const struct xrt_vec3 *bias)
+{
+	ConstellationTracker *tracker = ConstellationTracker::Get(raw_tracker);
+
+	std::shared_lock lock(tracker->device_lock);
+	for (const auto &device : tracker->devices) {
+		if (device->id != device_id) {
+			continue;
+		}
+		auto &al = device->imu_align;
+		std::unique_lock<os::Mutex> al_lock(al.lock);
+		al.rot = *rot;
+		math_quat_normalize(&al.rot);
+		al.bias = *bias;
+		al.have_candidate = false;
+		al.gate_only.store(false);
+		al.applied.store(true);
+		CT_INFO(tracker, "Device %d: IMU alignment from an earlier session in use (turned %.1f degrees, bias %.3f m/s2), "
+		        "checked against the solves as they come.", device->id, RAD_TO_DEG(align_rot_angle(al.rot)),
+		        m_vec3_len(al.bias));
+		return 0;
+	}
+	return -1;
+}
+
+int
+t_constellation_tracker_imu_advice(struct t_constellation_tracker *raw_tracker,
+                                   t_constellation_device_id_t device_id,
+                                   t_constellation_device_id_t reference_id,
+                                   struct t_constellation_imu_advice *out_advice)
+{
+	ConstellationTracker *tracker = ConstellationTracker::Get(raw_tracker);
+
+	std::shared_lock lock(tracker->device_lock);
+	const Device *device = nullptr;
+	const Device *reference = nullptr;
+	for (const auto &candidate : tracker->devices) {
+		device = candidate->id == device_id ? candidate.get() : device;
+		reference = candidate->id == reference_id ? candidate.get() : reference;
+	}
+	if (device == nullptr || reference == nullptr) {
+		return -1;
+	}
+	*out_advice = imu_advice_from(*device, *reference);
+	return 0;
+}
+
+void
+t_constellation_tracker_imu_advice_log(struct t_constellation_tracker *raw_tracker,
+                                       t_constellation_device_id_t device_id)
+{
+	ConstellationTracker *tracker = ConstellationTracker::Get(raw_tracker);
+
+	std::shared_lock lock(tracker->device_lock);
+	for (const auto &device : tracker->devices) {
+		if (device->id != device_id) {
+			continue;
+		}
+		for (size_t slot = 0; slot < Device::ImuAdvice::kSlots; slot++) {
+			for (size_t bin = 0; bin < Device::ImuAdvice::kBins; bin++) {
+				const Device::ImuAdvice::Bin &b = device->imu_advice.bins[slot][bin];
+				const uint32_t samples = b.samples.load();
+				if (samples > 0) {
+					CT_INFO(tracker,
+					        "Device %d, sensor %zu, orientation %zu: %u at rest, %u off, mean %.1f degrees.",
+					        device->id, slot, bin, samples, b.off.load(),
+					        b.hundredths.load() / 100.0 / samples);
+				}
+			}
+		}
+	}
+}
+
+int
+t_constellation_tracker_imu_calibration(struct t_constellation_tracker *raw_tracker,
+                                        t_constellation_device_id_t device_id,
+                                        struct t_constellation_imu_calibration_status *out_status)
+{
+	ConstellationTracker *tracker = ConstellationTracker::Get(raw_tracker);
+
+	std::shared_lock lock(tracker->device_lock);
+	for (const auto &device : tracker->devices) {
+		if (device->id == device_id) {
+			std::unique_lock<os::Mutex> cal_lock(device->imu_calibration.lock);
+			*out_status = device->imu_calibration.status;
+			return 0;
+		}
+	}
+	return -1;
+}
+

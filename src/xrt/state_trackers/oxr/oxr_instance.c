@@ -49,6 +49,7 @@
 #include <math.h>
 
 DEBUG_GET_ONCE_BOOL_OPTION(debug_views, "OXR_DEBUG_VIEWS", false)
+DEBUG_GET_ONCE_BOOL_OPTION(chromium_fov_quirk, "RIFTLINUX_CHROMIUM_FOV_QUIRK", true)
 DEBUG_GET_ONCE_BOOL_OPTION(debug_spaces, "OXR_DEBUG_SPACES", false)
 DEBUG_GET_ONCE_BOOL_OPTION(debug_bindings, "OXR_DEBUG_BINDINGS", false)
 DEBUG_GET_ONCE_BOOL_OPTION(lifecycle_verbose, "OXR_LIFECYCLE_VERBOSE", false)
@@ -209,6 +210,13 @@ apply_quirks(struct oxr_logger *log, struct oxr_instance *inst, const XrInstance
 	inst->quirks.parallel_views = false;
 	inst->quirks.no_texture_source_alpha = false;
 	inst->quirks.no_usage_bit_validation_in_create_swapchain = false;
+	inst->quirks.negated_fov_means_flip = false;
+
+	// See the quirk; RIFTLINUX_CHROMIUM_FOV_QUIRK=0 takes Chromium's field of view as it comes.
+	if (strcmp("Chromium", create_info->applicationInfo.engineName) == 0 &&
+	    debug_get_bool_option_chromium_fov_quirk()) {
+		inst->quirks.negated_fov_means_flip = true;
+	}
 
 	if (starts_with("UnrealEngine", inst->appinfo.detected.engine.name) && //
 	    inst->appinfo.detected.engine.major == 4 &&                        //
@@ -426,7 +434,8 @@ oxr_instance_create(struct oxr_logger *log,
 	        "\tquirks.skip_end_session: %s\n"
 	        "\tquirks.parallel_views: %s\n"
 	        "\tquirks.no_texture_source_alpha: %s\n"
-	        "\tquirks.ignore_invalid_swapchain_usage_bits: %s\n",
+	        "\tquirks.ignore_invalid_swapchain_usage_bits: %s\n"
+	        "\tquirks.negated_fov_means_flip: %s\n",
 	        createInfo->applicationInfo.applicationName,                                //
 	        createInfo->applicationInfo.applicationVersion,                             //
 	        createInfo->applicationInfo.engineName,                                     //
@@ -445,7 +454,8 @@ oxr_instance_create(struct oxr_logger *log,
 	        inst->quirks.skip_end_session ? "true" : "false",                           //
 	        inst->quirks.parallel_views ? "true" : "false",                             //
 	        inst->quirks.no_texture_source_alpha ? "true" : "false",                    //
-	        inst->quirks.no_usage_bit_validation_in_create_swapchain ? "true" : "false" //
+	        inst->quirks.no_usage_bit_validation_in_create_swapchain ? "true" : "false", //
+	        inst->quirks.negated_fov_means_flip ? "true" : "false"                       //
 	);                                                                                  //
 
 #ifdef XRT_FEATURE_RENDERDOC

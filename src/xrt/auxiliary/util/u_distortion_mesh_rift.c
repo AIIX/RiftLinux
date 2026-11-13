@@ -170,6 +170,23 @@ compute_render_info(const struct u_rift_panel *panel, const struct u_rift_eye_pr
 	};
 }
 
+void
+u_rift_lens_center_px(const struct u_rift_panel *panel,
+                      const struct u_rift_eye_profile *profile,
+                      uint32_t view,
+                      int32_t *out_x,
+                      int32_t *out_y)
+{
+	/*
+	 * The lens centre in [-1, 1] of the eye's view, to the pixel it falls in, as u_compute_distortion_rift places it:
+	 * the first view's geometry, in a frame where the left view is mirrored onto the right.
+	 */
+	const struct u_rift_distortion_render_info info = compute_render_info(panel, profile, 0);
+	const float x = view == 0 ? -info.lens_center.x : info.lens_center.x;
+	*out_x = (int32_t)floorf((x + 1.0f) / 2.0f * (panel->size_px.x / 2.0f));
+	*out_y = (int32_t)floorf((info.lens_center.y + 1.0f) / 2.0f * panel->size_px.y);
+}
+
 /*!
  * Computes the tangent FOV for an eye from the given parameters.
  *

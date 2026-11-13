@@ -80,6 +80,12 @@ struct client_vk_compositor
 
 	struct vk_cmd_pool pool;
 
+	/*!
+	 * RiftLinux: vkTrimCommandPool (Vulkan 1.1, or VK_KHR_maintenance1), or NULL: the pool trimmed after a swapchain's
+	 * command buffers are freed, so applications that make many swapchains do not grow the pool.
+	 */
+	PFN_vkTrimCommandPool trim_pool;
+
 	bool renderdoc_enabled;
 	VkCommandBuffer dcb;
 };

@@ -26,7 +26,7 @@ extern "C" {
 //! Major version of the API.
 #define MND_API_VERSION_MAJOR 1
 //! Minor version of the API.
-#define MND_API_VERSION_MINOR 8
+#define MND_API_VERSION_MINOR 12
 //! Patch version of the API.
 #define MND_API_VERSION_PATCH 0
 
@@ -112,6 +112,60 @@ typedef struct mnd_root mnd_root_t;
 /*!
  * A pose composed of a position and orientation.
  */
+/*!
+ * RiftLinux, retired (@ref mnd_root_get_controller_calibration answers that there is none).
+ *
+ * An orientation is the direction that is up, in the frame of the controller's aim pose, in OpenXR axes (+X right, +Y
+ * its top, -Z where it points): 0 +X, 1 -X, 2 +Y, 3 -Y, 4 +Z, 5 -Z, then the diagonals, with k = 0.577: 6 (k,k,k),
+ * 7 (k,k,-k), 8 (k,-k,k), 9 (k,-k,-k), 10 (-k,k,k), 11 (-k,k,-k), 12 (-k,-k,k), 13 (-k,-k,-k). So: 5 pointing
+ * straight up (buttons facing you), 4 pointing straight down (likewise), 0 its buttons turned to the left, 1 to the
+ * right, 2 pointing at the sensors as usually held, 3 upside down (buttons facing the floor).
+ *
+ * First "come closer": @ref next_orientation -2, @ref progress how well the sensors see the controller (60 and up:
+ * close enough); the person holds the trigger to go on: @ref progress 100 (go on as the trigger is let go), or
+ * @ref reason 8 when pressed too soon (until let go). Nothing goes on by itself.
+ *
+ * The person takes each pose by holding the controller's trigger: it asks for 5, 4, 0, 1 in turn
+ * (@ref next_orientation). While the trigger is held, @ref progress fills (the circle); at 100 the pose is done when
+ * @ref reason is 0 (its @ref orientation_fill becomes 1), or turned away with reason 6 (not the pose shown: more than
+ * 100 degrees off, the opposite of it) or 7 (under 30 degrees from a pose done before). Letting go of the trigger goes
+ * on to the next pose, or asks for the same again. Four done make a round; a healthy controller needs one, a turned
+ * one two or three.
+ */
+typedef struct mnd_controller_calibration
+{
+	//! 0 none since the runtime started, 1 measuring, 2 done and kept, 3 failed or cancelled.
+	int32_t state;
+	//! The pose asked for now, as its trigger is held: how much of what it needs it has, 0-100.
+	int32_t progress;
+	//! Over all rounds, 0-100; does not start over.
+	int32_t overall_progress;
+	//! The round, 1 on.
+	int32_t round;
+	//! For state 3: 1 cancelled, 2 nothing new measured for a long time, 3 the solves disagree among themselves, 4 the
+	//! correction came out too large, 5 the accelerometer's bias came out too large; 0 otherwise. For state 1: 6 or 7
+	//! while a pose just held is shown as turned away, 8 while "come closer" was pressed too soon (until let go). For
+	//! state 3 also 9: the poses held, three sets over, gave readings too unsettled for a result.
+	int32_t reason;
+	//! How far the motion sensor is turned against the LEDs, degrees, and the accelerometer's bias, m/s², found so far.
+	float rotation_deg;
+	float bias_m_s2;
+	//! What the last fit left, degrees.
+	float residual_deg;
+	//! The four poses asked for: 1 when done this round; the one asked for now as far as it is; the others 0.
+	float orientation_fill[14];
+	//! The orientation it rests in now, from its own accelerometer, not its tracking; -1 when it does not rest.
+	int32_t orientation_now;
+	//! The pose asked for now, -2 for "come closer" first, -1 for none.
+	int32_t next_orientation;
+	//! The LEDs the sensors matched just now, 0 when not seen lately. A reading needs 8.
+	int32_t leds;
+	//! Still enough (for a hand, with the trigger held) for readings now.
+	bool resting;
+	//! Its tracking keeps disagreeing with its motion sensor: a calibration would help. Until one is done.
+	bool suggested;
+} mnd_controller_calibration_t;
+
 typedef struct mnd_pose
 {
 	struct
@@ -345,6 +399,76 @@ mnd_root_get_client_state(mnd_root_t *root, uint32_t client_id, uint32_t *out_fl
  */
 mnd_result_t
 mnd_root_set_client_primary(mnd_root_t *root, uint32_t client_id);
+
+/*!
+ * RiftLinux: a screenshot of what the headset shows, as one picture of the whole field of view (both eyes' views
+ * joined), with every layer composited the way the headset shows them (backdrop blur, HDR mapping, colour) but
+ * without the lens's correction. Written as an 8-bit sRGB PNG to @p png_path (written beside it as "<path>.part",
+ * then renamed). Blocks until the file is written, normally one frame and the encoding, at most about 3 s: call it
+ * from a thread of its own, not the one that renders frames. Black while the headset shows black.
+ *
+ * @param root     The libmonado state.
+ * @param png_path Absolute path of the PNG; its folder must exist.
+ * @param flags    0 (reserved).
+ *
+ * @return MND_SUCCESS when the file is written, MND_ERROR_INVALID_VALUE for a path that is not absolute or too long or
+ *         flags that are not 0, MND_ERROR_OPERATION_FAILED when no frame came in time or the file could not be written.
+ */
+mnd_result_t
+mnd_root_take_screenshot(mnd_root_t *root, const char *png_path, uint32_t flags);
+
+/*!
+ * RiftLinux: the lens test's pattern, drawn by the runtime in panel pixels around each eye's lens centre after the
+ * lens correction, so that its one-pixel lines land on panel pixels (a picture drawn by the application is resampled
+ * twice on its way to the panel): a green cross of four lines a bar, one pixel wide with one-pixel black gaps, 81 by 81
+ * pixels; everything else shows what the application draws. Off again when the client that turned it on disconnects.
+ * Rift CV1 only.
+ *
+ * @param root The libmonado state.
+ * @param on   Whether to draw it.
+ *
+ * @return MND_SUCCESS, or MND_ERROR_OPERATION_FAILED when the headset gives no lens centres (not a Rift CV1).
+ */
+mnd_result_t
+mnd_root_set_lens_pattern(mnd_root_t *root, bool on);
+
+/*
+ * RiftLinux: retired. There is no controller calibration by hand any more: a Touch controller whose motion sensor is
+ * turned or biased against its LEDs is learned and corrected while it is used (settings.json controllers.imu_align).
+ * These four stay for programs built against them.
+ */
+
+/*!
+ * RiftLinux, retired: no calibration starts.
+ *
+ * @return MND_ERROR_INVALID_VALUE for a @p hand other than 0, 1 or 2, else MND_ERROR_OPERATION_FAILED.
+ */
+mnd_result_t
+mnd_root_calibrate_controller(mnd_root_t *root, uint32_t hand, bool start);
+
+/*!
+ * RiftLinux, retired: there is no calibration to report.
+ *
+ * @return MND_ERROR_INVALID_VALUE for a @p hand other than 0 or 1, else MND_ERROR_OPERATION_FAILED.
+ */
+mnd_result_t
+mnd_root_get_controller_calibration(mnd_root_t *root, uint32_t hand, mnd_controller_calibration_t *out_status);
+
+/*!
+ * RiftLinux, retired: nothing is kept to forget.
+ *
+ * @return MND_ERROR_INVALID_VALUE for a @p hand other than 0 or 1, else MND_ERROR_OPERATION_FAILED.
+ */
+mnd_result_t
+mnd_root_forget_controller_calibration(mnd_root_t *root, uint32_t hand);
+
+/*!
+ * RiftLinux, retired: does nothing.
+ *
+ * @return MND_SUCCESS.
+ */
+mnd_result_t
+mnd_root_set_controller_calibration_quiet(mnd_root_t *root, bool quiet);
 
 /*!
  * Set the client at the given index as "focused".

@@ -198,6 +198,194 @@ t_constellation_tracker_set_device_worn(struct t_constellation_tracker *tracker,
                                         t_constellation_device_id_t device,
                                         bool worn);
 
+/*!
+ * Whether a controller's solves steadily disagree with its IMU on which way is down (RiftLinux): only counted, nothing
+ * in tracking reads it. See t_constellation_tracker_imu_advice.
+ */
+struct t_constellation_imu_advice
+{
+	//! A calibration would help: it disagrees in enough orientations, seen so by every sensor, the headset not.
+	bool advised;
+	//! Orientations it steadily disagrees in.
+	uint32_t steady_orientations;
+	//! Sensors that saw enough of it at rest, all disagreeing with its IMU.
+	uint32_t sensors;
+	//! Readings counted, and those off by more than the limit, from those sensors.
+	uint32_t samples;
+	uint32_t off;
+};
+
+//! How many LEDs the sensors matched for a device just now, 0 when it has not been seen lately: for guiding a user.
+uint32_t
+t_constellation_tracker_imu_calibration_leds(struct t_constellation_tracker *tracker,
+                                             t_constellation_device_id_t device);
+
+/*!
+ * Reads the counts behind a calibration's advice: resting, from many LEDs, a few a second at most.
+ *
+ * @param device    The controller.
+ * @param reference The headset: a sensor that also sees it off from the IMU's down is misplaced, the controller is fine.
+ *
+ * @return 0, or -1 for no such devices.
+ */
+int
+t_constellation_tracker_imu_advice(struct t_constellation_tracker *tracker,
+                                   t_constellation_device_id_t device,
+                                   t_constellation_device_id_t reference,
+                                   struct t_constellation_imu_advice *out_advice);
+
+//! The counts behind t_constellation_tracker_imu_advice, in the log at info level.
+void
+t_constellation_tracker_imu_advice_log(struct t_constellation_tracker *tracker, t_constellation_device_id_t device);
+
+/*!
+ * A controller's IMU alignment learned in the background (RiftLinux): how its IMU sits against its LEDs and its
+ * accelerometer's bias, used for the gravity check once it is clearly a fault (CONSTELLATION_TRACKER_IMU_ALIGN).
+ *
+ * @param out_rot     The turn taking the IMU's readings into the device's frame.
+ * @param out_bias    The accelerometer's bias, m/s2, in the IMU's frame (taken off before the turn).
+ * @param out_applied Whether it is in use.
+ *
+ * @return 0, or -1 for no such device.
+ */
+int
+t_constellation_tracker_get_imu_align(struct t_constellation_tracker *tracker,
+                                      t_constellation_device_id_t device,
+                                      struct xrt_quat *out_rot,
+                                      struct xrt_vec3 *out_bias,
+                                      bool *out_applied);
+
+/*!
+ * An alignment learned in an earlier session, in use from now on until the solves say otherwise (then dropped), as the
+ * Oculus runtime starts from what it kept and checks it.
+ *
+ * @return 0, or -1 for no such device.
+ */
+int
+t_constellation_tracker_set_imu_align(struct t_constellation_tracker *tracker,
+                                      t_constellation_device_id_t device,
+                                      const struct xrt_quat *rot,
+                                      const struct xrt_vec3 *bias);
+
+/*!
+ * A controller's IMU seat calibration (RiftLinux), see t_constellation_tracker_calibrate_imu.
+ */
+enum t_constellation_imu_calibration_state
+{
+	T_CONSTELLATION_IMU_CALIBRATION_IDLE = 0,
+	//! Collecting: the device is to be turned slowly through many orientations in view of the sensors.
+	T_CONSTELLATION_IMU_CALIBRATION_COLLECTING = 1,
+	//! Done: @ref t_constellation_imu_calibration_status::correction is the result, for the driver to keep.
+	T_CONSTELLATION_IMU_CALIBRATION_DONE = 2,
+	//! Failed (not enough orientations in time, or the solves disagreed among themselves): nothing to keep.
+	T_CONSTELLATION_IMU_CALIBRATION_FAILED = 3,
+};
+
+//! Why a calibration ended without a result.
+enum t_constellation_imu_calibration_reason
+{
+	T_CONSTELLATION_IMU_CALIBRATION_REASON_NONE = 0,
+	T_CONSTELLATION_IMU_CALIBRATION_REASON_CANCELLED = 1,
+	//! Nothing new measured for a long time.
+	T_CONSTELLATION_IMU_CALIBRATION_REASON_NO_PROGRESS = 2,
+	//! The solves' down directions do not agree among themselves.
+	T_CONSTELLATION_IMU_CALIBRATION_REASON_SOLVES_DISAGREE = 3,
+	//! The correction came out too large to be how the IMU sits.
+	T_CONSTELLATION_IMU_CALIBRATION_REASON_TOO_LARGE = 4,
+	//! The accelerometer's bias came out too large to trust.
+	T_CONSTELLATION_IMU_CALIBRATION_REASON_BIAS_TOO_LARGE = 5,
+	/*!
+	 * While it goes on (not an end): the pose just held with the trigger was turned away, as not the one shown (6: the
+	 * opposite of it, near enough) or as nearly one already done (7). Cleared when the trigger is let go; the same pose is asked for again.
+	 */
+	T_CONSTELLATION_IMU_CALIBRATION_REASON_STEP_NOT_AS_SHOWN = 6,
+	T_CONSTELLATION_IMU_CALIBRATION_REASON_STEP_DONE_BEFORE = 7,
+	//! While it goes on: the trigger was pressed to go on from "come closer" before the sensors saw it well enough.
+	T_CONSTELLATION_IMU_CALIBRATION_REASON_NOT_CLOSE_ENOUGH = 8,
+	//! The poses held, several times over, gave readings too unsettled for a result.
+	T_CONSTELLATION_IMU_CALIBRATION_REASON_UNSETTLED = 9,
+};
+
+/*!
+ * The orientations a calibration asks for. Each is the direction that is up, in the device's frame in OpenXR
+ * coordinates: 0 +X, 1 -X, 2 +Y, 3 -Y, 4 +Z, 5 -Z, then the diagonals, with k = 0.577: 6 (k,k,k), 7 (k,k,-k), 8 (k,-k,k),
+ * 9 (k,-k,-k), 10 (-k,k,k), 11 (-k,k,-k), 12 (-k,-k,k), 13 (-k,-k,-k).
+ */
+#define T_CONSTELLATION_IMU_ORIENTATIONS 14
+/*!
+ * The guided steps: first "come closer" (next_orientation -2, progress how well the sensors see it, the trigger goes
+ * on once they see it well enough), then orientations 5, 4, 0, 1 in this order, each taken with the trigger.
+ */
+
+struct t_constellation_imu_calibration_status
+{
+	enum t_constellation_imu_calibration_state state;
+	//! The round (1 on), each a fit of what the previous ones left.
+	int round;
+	/*!
+	 * The pose asked for now (@ref next_orientation), held with the trigger: how much of what it needs it has, 0-100;
+	 * 100 with no @ref reason when it is done, when it was turned away with one (6, 7).
+	 */
+	int progress;
+	/*!
+	 * The rotation the device's IMU samples are to be turned by (OpenXR coordinates in the device's frame), found so
+	 * far: relative to the samples as they came when the calibration started, the rounds composed.
+	 */
+	struct xrt_quat correction;
+	float correction_deg;
+	/*!
+	 * The accelerometer's bias (OpenXR coordinates in the device's frame, m/s²), found so far, on the same samples:
+	 * an accelerometer sample becomes correction * (sample - accel_bias), a gyro sample correction * sample.
+	 */
+	struct xrt_vec3 accel_bias;
+	//! How far the solves' down directions are from the corrected IMU's after the last fit, 90th percentile, degrees.
+	float residual_p90_deg;
+	//! Counts up whenever @ref correction changes, so that the driver applies each once.
+	uint32_t generation;
+	//! Why it ended, when it ended without a result.
+	enum t_constellation_imu_calibration_reason reason;
+	//! Over all rounds, 0-100; unlike @ref progress it does not start over.
+	int overall_progress;
+	//! The poses asked for: 1 when done this round, the one asked for now by its progress, the rest 0.
+	float orientation_fill[T_CONSTELLATION_IMU_ORIENTATIONS];
+	//! The orientation it rests in now, -1 when it does not rest.
+	int orientation_now;
+	//! The orientation to ask for next, -1 when it needs none.
+	int next_orientation;
+	//! Whether the device rests (with the trigger held: still enough for a hand).
+	bool resting;
+	//! Whether the trigger is held (t_constellation_tracker_imu_calibration_hold).
+	bool held;
+};
+
+/*!
+ * Starts (@p start) or cancels the IMU calibration of @p device: its accelerometer's bias, from the resting samples
+ * having one length in every orientation (no sensor needed), and where its IMU sits against its LEDs, from the down
+ * direction its solves show against its IMU's while it rests, over many orientations. While collecting,
+ * the device's solves are checked against its IMU's down with a wide tolerance. The driver turns the device's IMU
+ * samples by each round's correction as it comes (t_constellation_tracker_imu_calibration), and keeps the final one.
+ */
+int
+t_constellation_tracker_calibrate_imu(struct t_constellation_tracker *tracker,
+                                      t_constellation_device_id_t device,
+                                      bool start);
+
+/*!
+ * The person holds the pose shown (@p held, the trigger): while held, the device's readings count towards that pose,
+ * still enough for a hand; once it has enough it is done or turned away (the status says), and letting go goes on to
+ * the next pose or asks for the same again.
+ */
+void
+t_constellation_tracker_imu_calibration_hold(struct t_constellation_tracker *tracker,
+                                             t_constellation_device_id_t device,
+                                             bool held);
+
+//! The state of @p device's IMU seat calibration; < 0 for no such device.
+int
+t_constellation_tracker_imu_calibration(struct t_constellation_tracker *tracker,
+                                        t_constellation_device_id_t device,
+                                        struct t_constellation_imu_calibration_status *out_status);
+
 #ifdef __cplusplus
 }
 #endif

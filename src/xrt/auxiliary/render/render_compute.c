@@ -17,6 +17,8 @@
 #include "render/render_output_settings.h"
 
 #include "util/u_debug.h"
+#include "util/u_logging.h"
+#include "util/u_notice.h"
 #include "os/os_time.h"
 
 #include <stdio.h>
@@ -552,6 +554,28 @@ fill_output_processing(struct render_compute_distortion_ubo_data *data,
 	memset(data->post1, 0, sizeof(data->post1));
 
 	auto_hdr_params_from(&s, auto_hdr_off || source_processed, data->post2);
+
+	// The lens test's pattern, around each eye's lens centre (u_notice.h).
+	static bool pattern_was = false;
+	int32_t centres[2][2];
+	const bool pattern = u_notice_lens_pattern() && u_notice_get_lens_centres(centres);
+	memset(data->pattern, 0, sizeof(data->pattern));
+	if (pattern) {
+		for (uint32_t view = 0; view < 2; view++) {
+			data->pattern[view][0] = centres[view][0];
+			data->pattern[view][1] = centres[view][1];
+			data->pattern[view][2] = 1;
+		}
+	}
+	if (pattern != pattern_was) {
+		pattern_was = pattern;
+		if (pattern) {
+			U_LOG_I("Lens pattern on: centre left %d,%d right %d,%d", centres[0][0], centres[0][1], centres[1][0],
+			        centres[1][1]);
+		} else {
+			U_LOG_I("Lens pattern off");
+		}
+	}
 }
 
 static void

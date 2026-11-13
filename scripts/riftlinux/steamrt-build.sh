@@ -32,8 +32,8 @@ fetch https://github.com/libjpeg-turbo/libjpeg-turbo/releases/download/3.2.0/lib
 # Wayland protocols 1.38 (the SDK has 1.20; Monado's Wayland direct mode needs drm-lease-v1, 1.22 or newer).
 fetch https://gitlab.freedesktop.org/wayland/wayland-protocols/-/releases/1.38/downloads/wayland-protocols-1.38.tar.xz wayland-protocols-1.38.tar.xz
 
-docker run --rm --user "$(id -u):$(id -g)" -e HOME=/tmp -v "$SRC:/src:ro" -v "$OUT:/out" "$IMAGE" sh -ec '
-J=$(nproc)
+docker run --rm $RIFTLINUX_DOCKER_ARGS -e J="${RIFTLINUX_BUILD_JOBS:-}" --user "$(id -u):$(id -g)" -e HOME=/tmp -v "$SRC:/src:ro" -v "$OUT:/out" "$IMAGE" sh -ec '
+J=${J:-$(nproc)}
 export CC=gcc-14 CXX=g++-14
 D=/out/deps
 COMMON="-G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX=$D -DCMAKE_PREFIX_PATH=$D
@@ -103,7 +103,7 @@ cmake -S /src -B /out/build -G Ninja -U "*WAYLAND_PROTOCOLS*" -U "JPEG_*" -U "*S
 	-DXRT_BUILD_DRIVER_SURVIVE=OFF -DXRT_BUILD_DRIVER_TWRAP=OFF -DXRT_BUILD_DRIVER_ULV2=OFF \
 	-DXRT_BUILD_DRIVER_ULV5=OFF -DXRT_BUILD_DRIVER_VF=OFF -DXRT_BUILD_DRIVER_VIVE=OFF \
 	-DXRT_BUILD_DRIVER_WMR=OFF -DXRT_BUILD_DRIVER_XREAL_AIR=OFF
-cmake --build /out/build -j$J --target driver_monado monado-service openxr_monado
+cmake --build /out/build -j$J --target driver_monado monado-service openxr_monado monado
 
 # The watchdog for Steam, which is 32-bit on Linux and loads it from bin/linux32/ while SteamVR is not running: one
 # file, the C++ library linked in (Steam brings its own, of an unknown version).
@@ -134,8 +134,19 @@ mkdir -p "$NAT"
 cp "$OUT/build/src/xrt/targets/service/monado-service" "$OUT/build/src/xrt/targets/openxr/libopenxr_monado.so" "$NAT/"
 strip "$NAT/monado-service"
 strip --strip-unneeded "$NAT/libopenxr_monado.so"
+# libmonado: for applications that show and switch the runtime's applications (list them, bring one to the front).
+cp "$OUT/build/src/xrt/targets/libmonado/libmonado.so.25.1.0" "$NAT/libmonado.so.25"
+strip --strip-unneeded "$NAT/libmonado.so.25"
+ln -sf libmonado.so.25 "$NAT/libmonado.so"
+cp "$SRC/src/xrt/targets/libmonado/monado.h" "$NAT/monado.h"
 printf '{\n  "file_format_version": "1.0.0",\n  "runtime": {"name": "RiftLinux", "library_path": "./libopenxr_monado.so"}\n}\n' \
 	> "$NAT/openxr_riftlinux.json"
+# The installed library by its full path, for applications whose sandbox refuses a library path with "./"
+# (Chromium's XR process): as installed, and as the host's /usr shows inside a Flatpak sandbox (--filesystem=host-os).
+printf '{\n  "file_format_version": "1.0.0",\n  "runtime": {"name": "RiftLinux", "library_path": "/usr/lib/riftlinux/native/libopenxr_monado.so"}\n}\n' \
+	> "$NAT/openxr_riftlinux_fullpath.json"
+printf '{\n  "file_format_version": "1.0.0",\n  "runtime": {"name": "RiftLinux", "library_path": "/run/host/usr/lib/riftlinux/native/libopenxr_monado.so"}\n}\n' \
+	> "$NAT/openxr_riftlinux_flatpak.json"
 cp "$OUT/deps/share/doc/libjpeg-turbo/LICENSE.md" "$NAT/libjpeg-turbo-LICENSE.md"
 echo "native runtime: $NAT"
 du -sh "$NAT"

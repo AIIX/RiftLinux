@@ -79,6 +79,11 @@ constexpr float kNoticeAheadM = 1.0f;
 constexpr float kNoticeBelowM = 0.18f;
 constexpr double kNoticeShowS = 6.0;
 constexpr double kNoticeFadeS = 0.3;
+//! The IPD notice: its width and place at 1 m (the view's lower right), and how long it stays after the last change.
+constexpr float kIpdWidthM = 0.2f;
+constexpr float kIpdRightM = 0.24f;
+constexpr float kIpdBelowM = 0.22f;
+constexpr double kIpdShowS = 3.0;
 
 double
 now_s()
@@ -185,6 +190,7 @@ struct rl_panel
 	std::atomic<bool> running{true};
 	std::atomic<bool> want_open{false};
 	std::atomic<bool> want_close{false}; // A test key's "Close the application" press.
+	std::atomic<bool> want_switch{false}; // A test key's "Switch application" press (taken while the panel is open).
 	bool open = false;
 	//! Opened by the test key: stays open whether or not the headset is worn (a desk check).
 	bool test_mode = false;
@@ -264,6 +270,17 @@ struct rl_panel
 	double notice_since = 0.0;
 	//! Up while what it says lasts (measuring), not for a fixed time.
 	bool notice_lasting = false;
+
+	/*
+	 * The IPD notice ("ipd" posts, tenths of a millimetre): drawn into an image of its own as the distance changes,
+	 * at the view's lower right, beside any notice, gone a few seconds after the last change.
+	 */
+	std::atomic<int> ipd_tenths{0};
+	std::atomic<bool> ipd_changed{false};
+	struct xrt_swapchain *xsc_ipd = nullptr;
+	int ipd_w = 0, ipd_h = 0;
+	uint32_t ipd_index = 0;
+	double ipd_drawn_at = -10.0, ipd_last_at = -10.0, ipd_shown_at = -1.0;
 
 	/*
 	 * Measuring the sensors again (the tab's button): the tracker puts the new measurement back where the room was
@@ -606,6 +623,7 @@ update_status(struct rl_panel *p, double t)
 	os_mutex_lock(&p->s->global_state.lock);
 	info.app_running = app_to_close_locked(p) >= 0;
 	os_mutex_unlock(&p->s->global_state.lock);
+	info.other_app = ipc_server_has_previous_client(p->s);
 	info.app_closing = p->closing.stage > 0;
 	if (p->was_measuring && !info.sensors_measuring) {
 		p->measuring_ended_s = t;
@@ -712,6 +730,25 @@ set_height(struct rl_panel *p, int cm, bool save)
 	}
 }
 
+//! The IPD set by hand, @p tenths of a millimetre, or 0: the headset's slider followed again.
+void
+set_ipd(struct rl_panel *p, int tenths, bool save)
+{
+	u_notice_set_manual_ipd(tenths > 0 ? tenths / 10.0f : 0.0f);
+	if (tenths > 0) {
+		p->state.ipd_tenths = tenths;
+	}
+	p->state.ipd_manual = tenths > 0;
+	if (save) {
+		rl::settings::set_number("headset", "ipd_mm", tenths > 0 ? tenths / 10.0 : 0.0);
+		if (tenths > 0) {
+			U_LOG_I("Rift panel: IPD set by hand to %d.%d mm", tenths / 10, tenths % 10);
+		} else {
+			U_LOG_I("Rift panel: IPD follows the headset's slider");
+		}
+	}
+}
+
 void
 set_volume(struct rl_panel *p, int percent)
 {
@@ -741,6 +778,7 @@ slide(struct rl_panel *p, int row, float frac, bool done)
 	case Ctl::Volume: set_volume(p, (int)std::lround(frac * 100.0f)); break;
 	case Ctl::Mic: set_mic(p, (int)std::lround(frac * 100.0f)); break;
 	case Ctl::Height: set_height(p, (int)std::lround(kHeightMinCm + frac * (kHeightMaxCm - kHeightMinCm)), done); break;
+	case Ctl::Ipd: set_ipd(p, ipd_tenths_at(frac), done); break;
 	case Ctl::Strength:
 		pic.strength = (int)std::lround(frac * 100.0f);
 		apply_picture(p);
@@ -890,6 +928,7 @@ act(struct rl_panel *p, const Hit &hit, int64_t at_ns)
 #endif
 			break;
 		case Ctl::Height: set_height(p, 0, true); break;
+		case Ctl::Ipd: set_ipd(p, 0, true); break;
 		case Ctl::Strength: slide(p, hit.row, 0.5f, true); break;
 		case Ctl::Colour: slide(p, hit.row, 0.5f, true); break;
 		case Ctl::RenderScale: slide(p, hit.row, (100.0f - kScaleMin) / (kScaleMax - kScaleMin), true); break;
@@ -924,6 +963,13 @@ act(struct rl_panel *p, const Hit &hit, int64_t at_ns)
 	case Ctl::PerfOn:
 		p->state.info.perf_on = !p->state.info.perf_on;
 		rl::settings::set_bool("tab", "performance", p->state.info.perf_on);
+		break;
+	case Ctl::SwitchApp:
+		// The application shown before comes to the front, and the panel closes (as the Dash does).
+		if (p->state.info.other_app && ipc_server_switch_to_previous_client(p->s)) {
+			U_LOG_I("Rift panel: switched to the application shown before");
+			p->want_open.store(false);
+		}
 		break;
 	case Ctl::CloseApp:
 		// Greyed (and no press) without an application, or while one is being closed.
@@ -1035,12 +1081,18 @@ quad(struct xrt_layer_data *q, int64_t at_ns, const struct xrt_pose &pose, float
 	q->quad.size = {w, h};
 }
 
+//! Drawn with the panel closed: a notice, or the IPD.
+bool
+shown_closed(const struct rl_panel *p)
+{
+	return p->xsc_notice != nullptr || p->ipd_shown_at >= 0.0;
+}
+
 void
 show(struct rl_panel *p, bool visible)
 {
 	// Closed with a notice up: still drawn, without the input.
-	xrt_syscomp_set_state(p->s->xsysc, &p->xcn->base, visible || p->xsc_notice != nullptr, visible,
-	                      os_monotonic_get_ns());
+	xrt_syscomp_set_state(p->s->xsysc, &p->xcn->base, visible || shown_closed(p), visible, os_monotonic_get_ns());
 	ipc_server_set_panel_focus(p->s, visible);
 	p->open = visible;
 	p->drag_row = -1;
@@ -1061,6 +1113,12 @@ notice_sink(void *ptr, enum u_notice_kind kind, const char *key, int number)
 	if (key == nullptr) {
 		return;
 	}
+	// The distance between the eyes, posted while it changes (up to 20 a second): drawn by this panel's thread.
+	if (kind == U_NOTICE_IPD) {
+		p->ipd_tenths.store(number);
+		p->ipd_changed.store(true);
+		return;
+	}
 	if (strcmp(key, "calibration-done") == 0) {
 		p->recal_measuring.store(false);
 		struct u_notice_recalibration change = {};
@@ -1068,11 +1126,11 @@ notice_sink(void *ptr, enum u_notice_kind kind, const char *key, int number)
 			p->recal_done.store(true);
 		}
 	}
-	static const char *const kKinds[] = {"sensors", "calibration", "tracking", "display", "system"};
+	static const char *const kKinds[] = {"sensors", "calibration", "tracking", "display", "system", "ipd"};
 	cJSON *root = rl::settings::load();
 	const int k = static_cast<int>(kind);
 	const bool on = rl::settings::boolean(root, "notices", "enabled", true) &&
-	                (k < 0 || k > U_NOTICE_SYSTEM || rl::settings::boolean(root, "notices", kKinds[k], true));
+	                (k < 0 || k > U_NOTICE_IPD || rl::settings::boolean(root, "notices", kKinds[k], true));
 	cJSON_Delete(root);
 	if (!on) {
 		return;
@@ -1166,6 +1224,67 @@ floor_tick(struct rl_panel *p)
 	p->keeper.head(rel.pose.position.y, t, p->floor_known ? std::optional<float>(p->floor_m) : std::nullopt);
 }
 
+//! The IPD notice drawn again as the distance changes (at most 20 times a second), and gone after the last change.
+void
+ipd_tick(struct rl_panel *p)
+{
+	const double t = now_s();
+	// The lens test's pattern shows the distance itself (its application's text): no notice meanwhile.
+	if (u_notice_lens_pattern()) {
+		p->ipd_changed.store(false);
+		p->ipd_last_at = -10.0;
+	}
+	if (p->ipd_changed.load() && t - p->ipd_drawn_at >= 0.05) {
+		p->ipd_changed.store(false);
+		p->ipd_drawn_at = t;
+		bool on = true;
+		if (p->ipd_shown_at < 0.0) {
+			// The switches, read as it comes up rather than at every change.
+			cJSON *root = rl::settings::load();
+			on = rl::settings::boolean(root, "notices", "enabled", true) && rl::settings::boolean(root, "notices", "ipd", true);
+			cJSON_Delete(root);
+		}
+		const int tenths = p->ipd_tenths.load();
+		const Image drawn = on ? render_ipd_panel(p->pieces, tenths) : Image{};
+		if (on && p->xsc_ipd == nullptr) {
+			// One size for every value: the widest number's.
+			const Image widest = render_ipd_panel(p->pieces, 888);
+			p->ipd_w = widest.w;
+			p->ipd_h = widest.h;
+			p->xsc_ipd = make_swapchain(p, p->ipd_w, p->ipd_h, false);
+		}
+		uint32_t index = 0;
+		if (on && p->xsc_ipd != nullptr && drawn.w <= p->ipd_w && drawn.h <= p->ipd_h &&
+		    xrt_swapchain_acquire_image(p->xsc_ipd, &index) == XRT_SUCCESS) {
+			Image img;
+			img.w = p->ipd_w;
+			img.h = p->ipd_h;
+			img.px.assign(static_cast<size_t>(img.w) * img.h * 4, 0);
+			draw(img, drawn, img.w - drawn.w, 0);
+			const bool ok = xrt_swapchain_wait_image(p->xsc_ipd, 100LL * U_TIME_1MS_IN_NS, index) == XRT_SUCCESS &&
+			                upload(p, p->xsc_ipd, index, img);
+			xrt_swapchain_release_image(p->xsc_ipd, index);
+			if (ok) {
+				p->ipd_index = index;
+				p->ipd_last_at = t;
+				if (p->ipd_shown_at < 0.0) {
+					p->ipd_shown_at = t;
+					if (!p->open) {
+						xrt_syscomp_set_state(p->s->xsysc, &p->xcn->base, true, false, os_monotonic_get_ns());
+					}
+					U_LOG_I("Rift panel: showing the IPD (%d.%d mm)", tenths / 10, tenths % 10);
+				}
+			}
+		}
+	}
+	if (p->ipd_shown_at >= 0.0 && t - p->ipd_last_at >= kIpdShowS) {
+		p->ipd_shown_at = -1.0;
+		if (!p->open && !shown_closed(p)) {
+			xrt_syscomp_set_state(p->s->xsysc, &p->xcn->base, false, false, os_monotonic_get_ns());
+		}
+	}
+}
+
 //! The next notice up when the last one is done; the client drawn for it while the panel is closed.
 void
 notice_tick(struct rl_panel *p)
@@ -1188,7 +1307,7 @@ notice_tick(struct rl_panel *p)
 	}
 	if (p->xsc_notice != nullptr && !p->notice_lasting && t - p->notice_since >= kNoticeShowS) {
 		xrt_swapchain_reference(&p->xsc_notice, nullptr);
-		if (!p->open) {
+		if (!p->open && !shown_closed(p)) {
 			xrt_syscomp_set_state(p->s->xsysc, &p->xcn->base, false, false, os_monotonic_get_ns());
 		}
 	}
@@ -1262,6 +1381,12 @@ frame(struct rl_panel *p)
 		p->state.mic_muted = p->pulse.mic_muted;
 	}
 #endif
+	// The IPD row: the distance in use as the headset's driver has it (not while its slider is held).
+	struct u_notice_ipd ipd = {};
+	if (u_notice_get_ipd(&ipd) && !(p->drag_row >= 0 && kRows[p->drag_row].ctl == Ctl::Ipd)) {
+		p->state.ipd_tenths = (int)std::lround(ipd.mm * 10.0f);
+		p->state.ipd_manual = ipd.source == U_NOTICE_IPD_MANUAL;
+	}
 	if (p->open) {
 		handle_input(p, display_ns);
 		redraw(p);
@@ -1318,6 +1443,18 @@ frame(struct rl_panel *p)
 		q.color_scale = {1.0f, 1.0f, 1.0f, alpha};
 		xrt_comp_layer_quad(xc, p->head, p->xsc_notice, &q);
 	}
+	if (p->xsc_ipd != nullptr && p->ipd_shown_at >= 0.0) {
+		// Following the view at its lower right, faded in and out.
+		const double t = now_s();
+		const double left = kIpdShowS - (t - p->ipd_last_at);
+		const float alpha = (float)std::clamp(std::min(t - p->ipd_shown_at, left) / kNoticeFadeS, 0.0, 1.0);
+		struct xrt_pose at = XRT_POSE_IDENTITY;
+		at.position = {kIpdRightM, -kIpdBelowM, -kNoticeAheadM};
+		quad(&q, display_ns, at, kIpdWidthM, kIpdWidthM * p->ipd_h / p->ipd_w, p->ipd_w, p->ipd_h, p->ipd_index);
+		q.flags = (enum xrt_layer_composition_flags)(q.flags | XRT_LAYER_COMPOSITION_VIEW_SPACE_BIT);
+		q.color_scale = {1.0f, 1.0f, 1.0f, alpha};
+		xrt_comp_layer_quad(xc, p->head, p->xsc_ipd, &q);
+	}
 	xrt_comp_layer_commit(xc, XRT_GRAPHICS_SYNC_HANDLE_INVALID);
 }
 
@@ -1338,6 +1475,7 @@ run(struct rl_panel *p)
 #endif
 		floor_tick(p);
 		notice_tick(p);
+		ipd_tick(p);
 		// Closing an application goes on with the panel closed (it closes itself on the press).
 		if (p->want_close.exchange(false)) {
 			close_app(p, now_s());
@@ -1359,8 +1497,19 @@ run(struct rl_panel *p)
 			if (p->state.info.worn == 0 && !p->test_mode) {
 				p->want_open.store(false);
 			}
+			// A test key's "Switch application": pressed as the pointer would press it.
+			if (p->want_switch.exchange(false)) {
+				for (int r = 0; r < kRowCount; r++) {
+					if (kRows[r].ctl == Ctl::SwitchApp) {
+						Hit hit;
+						hit.row = r;
+						hit.part = Hit::Control;
+						act(p, hit, os_monotonic_get_ns());
+					}
+				}
+			}
 			frame(p);
-		} else if (p->xsc_notice != nullptr) {
+		} else if (shown_closed(p)) {
 			frame(p);
 		} else {
 			os_nanosleep(U_TIME_1MS_IN_NS * 50);
@@ -1383,6 +1532,11 @@ rl_panel_settings_to_env(void)
 	const std::string headset = rl::settings::headset_to_env(root);
 	if (!headset.empty()) {
 		U_LOG_I("Headset settings: %s", headset.c_str());
+	}
+	// Before the compositor makes its Vulkan instance.
+	const std::string lsfg = rl::settings::lsfg_vk_to_env(root);
+	if (!lsfg.empty()) {
+		U_LOG_W("%s", lsfg.c_str());
 	}
 	const double scale = rl::settings::number(root, "display", "render_scale", 0.0);
 	if (scale >= 25.0 && scale <= 400.0 && getenv("XRT_COMPOSITOR_RENDER_SCALE") == nullptr) {
@@ -1465,14 +1619,16 @@ rl_panel_create(struct ipc_server *s)
 #endif
 	U_LOG_I("Rift panel: ready (pieces in %s), the right Oculus button opens it", dir.c_str());
 
-	// Test keys for desk checks without anyone pressing anything: open the panel, or press "Close the application",
-	// this many seconds after start.
+	// Test keys for desk checks without anyone pressing anything: open the panel, or press "Close the application"
+	// or "Switch application" (the panel open by then), this many seconds after start.
 	const char *test = getenv("RIFTLINUX_PANEL_TEST_OPEN_S");
 	const double test_s = test != nullptr ? atof(test) : -1.0;
 	const char *test_close = getenv("RIFTLINUX_PANEL_TEST_CLOSE_S");
 	const double test_close_s = test_close != nullptr ? atof(test_close) : -1.0;
+	const char *test_switch = getenv("RIFTLINUX_PANEL_TEST_SWITCH_S");
+	const double test_switch_s = test_switch != nullptr ? atof(test_switch) : -1.0;
 	p->test_mode = test_s >= 0.0;
-	p->thread = std::thread([p, test_s, test_close_s] {
+	p->thread = std::thread([p, test_s, test_close_s, test_switch_s] {
 		if (test_s >= 0.0) {
 			std::thread([p, test_s] {
 				std::this_thread::sleep_for(std::chrono::duration<double>(test_s));
@@ -1483,6 +1639,12 @@ rl_panel_create(struct ipc_server *s)
 			std::thread([p, test_close_s] {
 				std::this_thread::sleep_for(std::chrono::duration<double>(test_close_s));
 				p->want_close.store(true);
+			}).detach();
+		}
+		if (test_switch_s >= 0.0) {
+			std::thread([p, test_switch_s] {
+				std::this_thread::sleep_for(std::chrono::duration<double>(test_switch_s));
+				p->want_switch.store(true);
 			}).detach();
 		}
 		run(p);
@@ -1507,6 +1669,7 @@ rl_panel_destroy(struct rl_panel **panel_ptr)
 		p->thread.join();
 	}
 	xrt_swapchain_reference(&p->xsc_notice, nullptr);
+	xrt_swapchain_reference(&p->xsc_ipd, nullptr);
 	xrt_swapchain_reference(&p->xsc_panel, nullptr);
 	xrt_swapchain_reference(&p->xsc_dot, nullptr);
 	xrt_swapchain_reference(&p->xsc_beam, nullptr);

@@ -9,7 +9,10 @@
 #pragma once
 
 #include "util/u_json.h"
+#include "util/u_notice.h"
 
+#include <dirent.h>
+#include <strings.h>
 #include <sys/stat.h>
 #include <unistd.h>
 
@@ -18,6 +21,7 @@
 #include <cstring>
 #include <mutex>
 #include <string>
+#include <vector>
 
 namespace rl::settings {
 
@@ -236,6 +240,8 @@ set_bool(const char *section, const char *key, bool value)
  *    no monitor unplugged and plugged for the desktop), or switched off.
  *  - black_then_off_min (minutes, default 10): with "black", how long black before the display switches off after all;
  *    negative: never.
+ *  - ipd_mm (millimetres, 50-80; absent or 0: the headset's slider): the distance between the eyes set by hand, for a
+ *    headset whose slider's sensor does not report (u_notice_set_manual_ipd; the Rift tab changes it while running).
  * Returns what it set, for the log; empty when the section sets nothing.
  */
 inline std::string
@@ -281,6 +287,45 @@ headset_to_env(const cJSON *root)
 		put("RIFT_DISPLAY_BLACK_THEN_OFF_MIN", std::to_string(it->valuedouble < 0.0 ? -1 : clamped(it->valuedouble, 0, 10080)),
 		    "black_then_off_min");
 	}
+	it = item(root, "headset", "ipd_mm");
+	if (cJSON_IsNumber(it) && it->valuedouble > 0.0) {
+		const float mm = static_cast<float>(it->valuedouble < 50.0 ? 50.0 : it->valuedouble > 80.0 ? 80.0 : it->valuedouble);
+		u_notice_set_manual_ipd(mm);
+		char text[16];
+		snprintf(text, sizeof(text), "%.1f", mm);
+		set += (set.empty() ? "" : ", ") + std::string("ipd_mm ") + text;
+	}
+	// A controller's IMU alignment learned in the background (a turned or biased IMU): false leaves it out, as before.
+	it = item(root, "controllers", "imu_align");
+	if (cJSON_IsBool(it)) {
+		put("CONSTELLATION_TRACKER_IMU_ALIGN", cJSON_IsTrue(it) ? "1" : "0", "controllers.imu_align");
+	}
+	// The controllers' tracking as it was up to RiftLinux 0.1.4: a way back should the newer one not suit a setup.
+	it = item(root, "controllers", "tracking");
+	if (cJSON_IsString(it) && strcmp(it->valuestring, "0.1.4") == 0) {
+		put("CONSTELLATION_TRACKER_FEW_LEDS_3_MAX_RMS_PX", "0", "controllers.tracking");
+		put("CONSTELLATION_TRACKER_SLOW_SKIP_MS", "150", "controllers.tracking");
+		put("CONSTELLATION_TRACKER_SEARCH_RESUME", "0", "controllers.tracking");
+		put("CONSTELLATION_TRACKER_FEW_LEDS_STRONG_M", "0", "controllers.tracking");
+		put("RIFT_TOUCH_RETURN_UNTRACKED_M", "0", "controllers.tracking");
+		put("CONSTELLATION_TRACKER_EKF_PRIOR", "0", "controllers.tracking");
+		put("CONSTELLATION_TRACKER_GRAVITY_CLIP_TOLERANCE_DEG", "0", "controllers.tracking");
+		put("CONSTELLATION_TRACKER_RESEED_LEDS", "0", "controllers.tracking");
+		put("T_CONSTELLATION_SENSOR_FUSION_TOUCH_ACCEL_NOISE", "1", "controllers.tracking");
+		put("CONSTELLATION_TRACKER_FEW_LEDS_MAX_RMS_PX", "0", "controllers.tracking");
+		put("CONSTELLATION_TRACKER_FEW_BRUTE", "0", "controllers.tracking");
+		put("RIFT_TOUCH_SNAP_FOUND_M", "0", "controllers.tracking");
+		put("CONSTELLATION_TRACKER_IMU_ALIGN_FAULT_DEG", "6", "controllers.tracking");
+		put("CONSTELLATION_TRACKER_IMU_ALIGN_FAULT_TWO_DEG", "8", "controllers.tracking");
+		put("CONSTELLATION_TRACKER_IMU_ALIGN_UNUSED_DEG", "4", "controllers.tracking");
+		put("CONSTELLATION_TRACKER_IMU_ALIGN_PROV_DEG", "8", "controllers.tracking");
+		put("RIFT_TOUCH_COAST_MS", "300", "controllers.tracking");
+	}
+	// How long a Touch out of the sensors' view is carried on by its motion sensor before it is held.
+	it = item(root, "controllers", "coast_ms");
+	if (cJSON_IsNumber(it)) {
+		put("RIFT_TOUCH_COAST_MS", std::to_string(clamped(it->valuedouble, 150, 2000)), "controllers.coast_ms");
+	}
 	// The Touch controllers' sleep: minutes after the headset is taken off; negative, kept awake all session.
 	it = item(root, "controllers", "sleep_after_min");
 	if (cJSON_IsNumber(it)) {
@@ -288,6 +333,98 @@ headset_to_env(const cJSON *root)
 		    "controllers.sleep_after_min");
 	}
 	return set;
+}
+
+/*!
+ * The manifest an installed lsfg-vk (Lossless Scaling's frame generation for Linux) gives the Vulkan loader, in any
+ * folder the loader reads implicit layers from (the user's, the system's, and the host's as Steam's runtime container
+ * shows them); empty when there is none.
+ */
+inline std::string
+lsfg_vk_manifest()
+{
+	std::vector<std::string> dirs;
+	auto add_list = [&dirs](const char *list, const char *suffix) {
+		if (list == nullptr || list[0] == '\0') {
+			return;
+		}
+		std::string all = list;
+		size_t start = 0;
+		while (start <= all.size()) {
+			const size_t end = all.find(':', start);
+			const std::string one = all.substr(start, end == std::string::npos ? std::string::npos : end - start);
+			if (!one.empty()) {
+				dirs.push_back(one + suffix);
+			}
+			if (end == std::string::npos) {
+				break;
+			}
+			start = end + 1;
+		}
+	};
+	const char *layers = "/vulkan/implicit_layer.d";
+	add_list(getenv("VK_IMPLICIT_LAYER_PATH"), "");
+	add_list(getenv("VK_ADD_IMPLICIT_LAYER_PATH"), "");
+	const char *home = getenv("HOME");
+	const char *data_home = getenv("XDG_DATA_HOME");
+	if (data_home != nullptr && data_home[0] != '\0') {
+		dirs.push_back(std::string(data_home) + layers);
+	} else if (home != nullptr) {
+		dirs.push_back(std::string(home) + "/.local/share" + layers);
+	}
+	const char *config_home = getenv("XDG_CONFIG_HOME");
+	if (config_home != nullptr && config_home[0] != '\0') {
+		dirs.push_back(std::string(config_home) + layers);
+	} else if (home != nullptr) {
+		dirs.push_back(std::string(home) + "/.config" + layers);
+	}
+	const char *data_dirs = getenv("XDG_DATA_DIRS");
+	add_list(data_dirs != nullptr && data_dirs[0] != '\0' ? data_dirs : "/usr/local/share:/usr/share", layers);
+	add_list("/etc/xdg:/etc:/run/host/usr/local/share:/run/host/usr/share:/run/host/etc", layers);
+	for (const std::string &dir : dirs) {
+		DIR *d = opendir(dir.c_str());
+		if (d == nullptr) {
+			continue;
+		}
+		std::string found;
+		for (struct dirent *e = readdir(d); e != nullptr && found.empty(); e = readdir(d)) {
+			const size_t n = strlen(e->d_name);
+			if (n > 5 && strcasecmp(e->d_name + n - 5, ".json") == 0 && strcasestr(e->d_name, "lsfg") != nullptr) {
+				found = dir + "/" + e->d_name;
+			}
+		}
+		closedir(d);
+		if (!found.empty()) {
+			return found;
+		}
+	}
+	return {};
+}
+
+/*!
+ * lsfg-vk is an implicit Vulkan layer: once installed it loads into every Vulkan program that does not set
+ * DISABLE_LSFGVK. In SteamVR's server it crashed as RiftLinux's compositor made its Vulkan instance (a user's crash
+ * dump), and SteamVR then blocked the driver at every start. display.lsfg_vk (default false) keeps it out of SteamVR's
+ * server and RiftLinux's own runtime, set before either makes a Vulkan instance; true lets it load there as before.
+ * Games and other programs are not touched. Returns the line for the log; empty when lsfg-vk is not installed.
+ */
+inline std::string
+lsfg_vk_to_env(const cJSON *root)
+{
+	const bool allowed = boolean(root, "display", "lsfg_vk", false);
+	if (!allowed) {
+		setenv("DISABLE_LSFGVK", "1", 0);
+	}
+	const std::string manifest = lsfg_vk_manifest();
+	if (manifest.empty()) {
+		return {};
+	}
+	if (allowed) {
+		return "lsfg-vk (" + manifest +
+		       ") may load here (display.lsfg_vk true); it has crashed SteamVR's server with RiftLinux's display";
+	}
+	return "lsfg-vk (" + manifest + ") is kept out of this process: it has crashed SteamVR's server with RiftLinux's " +
+	       "display (display.lsfg_vk; games keep it)";
 }
 
 } // namespace rl::settings

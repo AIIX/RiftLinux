@@ -58,7 +58,7 @@ The packages are for x86-64 only (they are built in the x86-64 Steam Runtime SDK
 | Path | What |
 | --- | --- |
 | `/usr/lib/riftlinux/steamvr/rift-cv1/` | The SteamVR driver folder as built (manifest, `bin/linux64/`, `bin/linux32/`, `resources/`) plus a `VERSION` file. Without `riftlinux-setup` and `udev/`, which go below. `bin/linux32/driver_monado.so` is the part Steam's 32-bit client loads as it starts (SteamVR's watchdog drivers): it starts SteamVR when the headset is put on; Steam loads a new one only when Steam restarts |
-| `/usr/lib/riftlinux/native/` | The own runtime: `monado-service`, `libopenxr_monado.so`, `openxr_riftlinux.json` (the OpenXR manifest, for `XR_RUNTIME_JSON`) |
+| `/usr/lib/riftlinux/native/` | The own runtime: `monado-service`, `libopenxr_monado.so`, `libmonado.so` (with `monado.h`, for applications that list the runtime's applications and bring one to the front), `openxr_riftlinux.json` (the OpenXR manifest, for `XR_RUNTIME_JSON`) |
 | `/usr/bin/riftlinux-setup` | Python 3 tool: `register` (run by itself, see 3), `check`, `repair`, `direct-mode`, `pair`, `uninstall` |
 | `/usr/bin/riftlinux-runtime` | Starts the own runtime (refuses while SteamVR runs); `--stop`, `--status` |
 | `/usr/bin/riftlinux-run` | Runs an OpenXR application on the own runtime, starting it first and stopping it after if it was not running |

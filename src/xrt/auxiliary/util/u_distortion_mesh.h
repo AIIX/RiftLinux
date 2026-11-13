@@ -255,6 +255,17 @@ struct u_rift_eye_profile
 };
 
 /*!
+ * The panel pixel on an eye's lens centre (its optical axis), within the eye's view, as the distortion places it
+ * (RiftLinux: the lens test's pattern is drawn around it).
+ */
+void
+u_rift_lens_center_px(const struct u_rift_panel *panel,
+                      const struct u_rift_eye_profile *profile,
+                      uint32_t view,
+                      int32_t *out_x,
+                      int32_t *out_y);
+
+/*!
  * Oculus Rift distortion implementation.
  *
  * @param render_fov The field of view the view is rendered with, which the resulting UVs index into; NULL for the

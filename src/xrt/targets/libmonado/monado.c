@@ -25,6 +25,7 @@
 #include "ipc_client_generated.h"
 
 #include <limits.h>
+#include <string.h>
 #include <stdint.h>
 #include <assert.h>
 
@@ -381,6 +382,130 @@ mnd_root_set_client_primary(mnd_root_t *root, uint32_t client_id)
 	xrt_result_t r = ipc_call_system_set_primary_client(&root->ipc_c, client_id);
 	if (r != XRT_SUCCESS) {
 		PE("Failed to set primary to client id: %u.\n", client_id);
+		return MND_ERROR_OPERATION_FAILED;
+	}
+
+	return MND_SUCCESS;
+}
+
+mnd_result_t
+mnd_root_take_screenshot(mnd_root_t *root, const char *png_path, uint32_t flags)
+{
+	CHECK_NOT_NULL(root);
+	CHECK_NOT_NULL(png_path);
+
+	struct ipc_screenshot_request request = {0};
+	const size_t len = strlen(png_path);
+	if (flags != 0 || len == 0 || len >= sizeof(request.path) || png_path[0] != '/') {
+		PE("Invalid screenshot path or flags.\n");
+		return MND_ERROR_INVALID_VALUE;
+	}
+	memcpy(request.path, png_path, len + 1);
+	request.flags = flags;
+
+	xrt_result_t r = ipc_call_system_take_screenshot(&root->ipc_c, &request);
+	if (r == XRT_ERROR_INVALID_ARGUMENT) {
+		return MND_ERROR_INVALID_VALUE;
+	}
+	if (r != XRT_SUCCESS) {
+		PE("Screenshot failed (%d).\n", (int)r);
+		return MND_ERROR_OPERATION_FAILED;
+	}
+
+	return MND_SUCCESS;
+}
+
+mnd_result_t
+mnd_root_calibrate_controller(mnd_root_t *root, uint32_t hand, bool start)
+{
+	CHECK_NOT_NULL(root);
+
+	xrt_result_t r = ipc_call_system_calibrate_controller(&root->ipc_c, hand, start);
+	if (r == XRT_ERROR_INVALID_ARGUMENT) {
+		return MND_ERROR_INVALID_VALUE;
+	}
+	if (r != XRT_SUCCESS) {
+		PE("Controller calibration not %s (%d).\n", start ? "started" : "cancelled", (int)r);
+		return MND_ERROR_OPERATION_FAILED;
+	}
+
+	return MND_SUCCESS;
+}
+
+mnd_result_t
+mnd_root_get_controller_calibration(mnd_root_t *root, uint32_t hand, mnd_controller_calibration_t *out_status)
+{
+	CHECK_NOT_NULL(root);
+	CHECK_NOT_NULL(out_status);
+
+	struct ipc_controller_calibration status = {0};
+	xrt_result_t r = ipc_call_system_get_controller_calibration(&root->ipc_c, hand, &status);
+	if (r == XRT_ERROR_INVALID_ARGUMENT) {
+		return MND_ERROR_INVALID_VALUE;
+	}
+	if (r != XRT_SUCCESS) {
+		PE("Controller calibration state not read (%d).\n", (int)r);
+		return MND_ERROR_OPERATION_FAILED;
+	}
+	*out_status = (mnd_controller_calibration_t){
+	    .state = status.state,
+	    .progress = status.progress,
+	    .overall_progress = status.overall_progress,
+	    .round = status.round,
+	    .reason = status.reason,
+	    .rotation_deg = status.rotation_deg,
+	    .bias_m_s2 = status.bias_m_s2,
+	    .residual_deg = status.residual_deg,
+	    .orientation_now = status.orientation_now,
+	    .next_orientation = status.next_orientation,
+	    .leds = status.leds,
+	    .resting = status.resting,
+	    .suggested = status.suggested,
+	};
+	memcpy(out_status->orientation_fill, status.orientation_fill, sizeof(out_status->orientation_fill));
+
+	return MND_SUCCESS;
+}
+
+mnd_result_t
+mnd_root_forget_controller_calibration(mnd_root_t *root, uint32_t hand)
+{
+	CHECK_NOT_NULL(root);
+
+	xrt_result_t r = ipc_call_system_forget_controller_calibration(&root->ipc_c, hand);
+	if (r == XRT_ERROR_INVALID_ARGUMENT) {
+		return MND_ERROR_INVALID_VALUE;
+	}
+	if (r != XRT_SUCCESS) {
+		PE("Controller calibration not forgotten (%d).\n", (int)r);
+		return MND_ERROR_OPERATION_FAILED;
+	}
+
+	return MND_SUCCESS;
+}
+
+mnd_result_t
+mnd_root_set_controller_calibration_quiet(mnd_root_t *root, bool quiet)
+{
+	CHECK_NOT_NULL(root);
+
+	xrt_result_t r = ipc_call_system_set_controller_calibration_quiet(&root->ipc_c, quiet);
+	if (r != XRT_SUCCESS) {
+		PE("Controller calibration notices not changed (%d).\n", (int)r);
+		return MND_ERROR_OPERATION_FAILED;
+	}
+
+	return MND_SUCCESS;
+}
+
+mnd_result_t
+mnd_root_set_lens_pattern(mnd_root_t *root, bool on)
+{
+	CHECK_NOT_NULL(root);
+
+	xrt_result_t r = ipc_call_system_set_lens_pattern(&root->ipc_c, on);
+	if (r != XRT_SUCCESS) {
+		PE("Lens pattern not set (%d).\n", (int)r);
 		return MND_ERROR_OPERATION_FAILED;
 	}
 

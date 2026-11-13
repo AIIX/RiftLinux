@@ -27,6 +27,8 @@ enum u_notice_kind
 	U_NOTICE_DISPLAY = 3,
 	//! The system around the driver (RiftLinux: real-time priority refused, RealtimeKit missing).
 	U_NOTICE_SYSTEM = 4,
+	//! The distance between the eyes changed ("ipd", in tenths of a millimetre): the slider moved, or set by hand.
+	U_NOTICE_IPD = 5,
 };
 
 /*!
@@ -145,6 +147,70 @@ u_notice_set_display_black(bool black);
 //! Whether a compositor shows the headset black.
 bool
 u_notice_display_black(void);
+
+//! Where the distance between the eyes in use comes from.
+enum u_notice_ipd_source
+{
+	//! The headset's IPD slider.
+	U_NOTICE_IPD_SLIDER = 0,
+	//! Set by hand (RiftLinux: headset.ipd_mm, the Rift tab, riftlinux-setup ipd).
+	U_NOTICE_IPD_MANUAL = 1,
+};
+
+//! The distance between the eyes, as the headset's driver uses it (RiftLinux: the Rift tab shows it).
+struct u_notice_ipd
+{
+	//! In use now, millimetres.
+	float mm;
+	//! What the slider's sensor reads, millimetres, whether in use or not.
+	float slider_mm;
+	enum u_notice_ipd_source source;
+	//! The slider's sensor has reported a change since the headset started (one that never does may be broken).
+	bool slider_moved;
+};
+
+//! Set by the headset's driver whenever the distance in use or the slider's reading changes. Any thread.
+void
+u_notice_set_ipd(const struct u_notice_ipd *ipd);
+
+//! The distance between the eyes; false until a headset's driver set it.
+bool
+u_notice_get_ipd(struct u_notice_ipd *out_ipd);
+
+/*!
+ * The distance between the eyes set by hand, millimetres; 0 follows the headset's slider again. For a headset whose
+ * slider's sensor does not report. Any thread; the headset's driver takes it at its next report.
+ */
+void
+u_notice_set_manual_ipd(float mm);
+
+//! The distance set by hand (u_notice_set_manual_ipd), 0 when the slider is followed.
+float
+u_notice_get_manual_ipd(void);
+
+/*!
+ * The lens test's pattern (RiftLinux): a cross of one-pixel lines the compositor draws in panel pixels around each eye's
+ * lens centre, after the lens correction, while an application asks for it (libmonado). @p client names who asked (an
+ * IPC client's id), so that it goes off when that client goes. Any thread.
+ */
+void
+u_notice_set_lens_pattern(bool on, int64_t client);
+
+//! Turns the lens pattern off if @p client turned it on (that client is gone).
+void
+u_notice_drop_lens_pattern(int64_t client);
+
+//! Whether the lens pattern is to be drawn.
+bool
+u_notice_lens_pattern(void);
+
+//! Each eye's lens centre in panel pixels within the eye's view, set by the headset's driver.
+void
+u_notice_set_lens_centres(int32_t left_x, int32_t left_y, int32_t right_x, int32_t right_y);
+
+//! Each eye's lens centre (u_notice_set_lens_centres); false when no headset's driver set them.
+bool
+u_notice_get_lens_centres(int32_t out_centres[2][2]);
 
 #ifdef __cplusplus
 }

@@ -28,6 +28,46 @@
 		]
 	},
 
+	"system_take_screenshot": {
+		"in": [
+			{"name": "request", "type": "struct ipc_screenshot_request"}
+		]
+	},
+
+	"system_calibrate_controller": {
+		"in": [
+			{"name": "hand", "type": "uint32_t"},
+			{"name": "start", "type": "bool"}
+		]
+	},
+
+	"system_forget_controller_calibration": {
+		"in": [
+			{"name": "hand", "type": "uint32_t"}
+		]
+	},
+
+	"system_set_controller_calibration_quiet": {
+		"in": [
+			{"name": "quiet", "type": "bool"}
+		]
+	},
+
+	"system_get_controller_calibration": {
+		"in": [
+			{"name": "hand", "type": "uint32_t"}
+		],
+		"out": [
+			{"name": "status", "type": "struct ipc_controller_calibration"}
+		]
+	},
+
+	"system_set_lens_pattern": {
+		"in": [
+			{"name": "on", "type": "bool"}
+		]
+	},
+
 	"system_set_focused_client": {
 		"in": [
 			{"name": "id", "type": "uint32_t"}

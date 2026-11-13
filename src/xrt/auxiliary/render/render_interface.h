@@ -1582,6 +1582,9 @@ struct render_compute_distortion_ubo_data
 	//! The fast path's layer when HDR: render_compute::source_hdr and source_hdr_range; zero SDR.
 	float hdr_source[4];
 	float hdr_range[4];
+
+	//! The lens test's pattern (RiftLinux, u_notice_lens_pattern): per view x, y its lens centre's pixel, z 1 drawn.
+	int32_t pattern[XRT_MAX_VIEWS][4];
 };
 
 /*!

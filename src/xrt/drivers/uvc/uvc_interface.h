@@ -124,6 +124,13 @@ uvc_fs_create(libusb_context *usb_ctx,
 int
 uvc_fs_destroy(struct xrt_fs *stream);
 
+/*!
+ * Frees the stream's USB transfers (the stream stopped): for whoever holds the USB context and device handle, before it
+ * closes them, so nothing of libusb is left for uvc_fs_destroy.
+ */
+void
+uvc_fs_release_usb(struct xrt_fs *stream);
+
 void
 uvc_fs_set_source_timestamp_callback(struct xrt_fs *stream, get_frame_timestamp_t callback, void *user_data);
 

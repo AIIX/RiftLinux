@@ -30,9 +30,14 @@ defaults, and `riftlinux-setup fix` then checks the rest.
 | `riftlinux-setup autostart on\|off\|status` | Steam starts SteamVR when the Rift is put on or picked up (on by default) | At once |
 | `riftlinux-setup autostart trigger put-on\|pick-up\|default` | What starts it: putting the Rift on only, or also picking it up (handled and turned, not a knock); default: picking up too, unless movement is left out (`wear-sensor motion off`) | At once |
 | `riftlinux-setup autostart quit-unused on\|off` | A SteamVR started by picking the Rift up quits again when it is not put on (on by default) | Next start |
+| `riftlinux-setup controller-tracking current\|0.1.4\|status` | The controllers' tracking as it was up to RiftLinux 0.1.4, if the current one doesn't suit your setup | Next start |
+| `riftlinux-setup controller-coast <ms>\|status` | How long a controller the sensors no longer see keeps moving on its motion sensor before it stays where it is, 150 to 2000 ms (1000 by default, 300 before 0.1.5) | Next start |
 | `riftlinux-setup controller-sleep 3\|5\|7\|off\|status` | Minutes after the headset is taken off before the Touch controllers may go to sleep (5 by default; the settings file takes 1 to 60); off keeps them awake | Next start |
+| `riftlinux-setup controller-alignment status\|on\|off\|forget` | A controller whose motion sensor disagrees with its LEDs, learned and corrected by itself ([A controller that freezes or jumps](#a-controller-that-freezes-or-jumps-in-view)); `off` tracks it as before | Next start |
 | `riftlinux-setup standby worn\|pick-up\|status` | When SteamVR's standby ends: the headset worn (default), or also moved, by SteamVR's own rule | Next start |
 | `riftlinux-setup backdrop-blur on\|off\|status` | RiftLinux's own runtime: frosted glass (what is behind a layer blurred) for the layers an application asks it for; on by default, off: those layers without it. Nothing else uses it | Next runtime start |
+| `riftlinux-setup lsfg-vk off\|on\|status` | lsfg-vk (Lossless Scaling's frame generation for Linux), when installed, kept out of SteamVR's server, its helper and RiftLinux's own runtime (off, the default), where it crashed SteamVR as RiftLinux's display started; on: allowed there as before. Games keep it either way | Next start |
+| `riftlinux-setup ipd <mm>\|auto\|status` | The distance between your eyes set by hand (50 to 80 mm), for a headset whose IPD slider is not read; `auto` (the default) follows the slider | Next start (the Rift tab's IPD row: at once) |
 | `riftlinux-setup game-menu close\|keep\|status` | Steam's menu, which Steam opens as a game starts: closed once the game shows (default), or kept open | Next start |
 | `riftlinux-setup wear-sensor test` | Nothing: shows what the headset's wear sensor reads while you put it on and take it off | - |
 | `riftlinux-setup wear-sensor on\|off\|status` | Whether the wear sensor is used; off counts the headset as worn whenever it runs | Next start |
@@ -44,8 +49,8 @@ defaults, and `riftlinux-setup fix` then checks the rest.
 | `riftlinux-setup fix last-known` | A settings file that cannot be read: kept aside, and the last good one put back | Next start |
 | `riftlinux-setup record on\|off\|status` | Recording SteamVR sessions for a bug report ([Troubleshooting](troubleshooting.md#logs-and-reporting-a-problem)) | Next start |
 
-"Next start" is the next start of SteamVR; the `wear-sensor`, `display-off`, `not-worn` and `controller-sleep`
-settings also apply at the next start of RiftLinux's own runtime when you use it without SteamVR.
+"Next start" is the next start of SteamVR; the `wear-sensor`, `display-off`, `not-worn`, `controller-sleep` and
+`controller-alignment` settings also apply at the next start of RiftLinux's own runtime when you use it without SteamVR.
 
 Other commands, which change no setting: `riftlinux-setup check` (what is wrong and why; `--json` for a program to
 read), `repair` (what SteamVR updates or crashes undo), `fix` (the configuration RiftLinux is tested with, in one go;
@@ -133,6 +138,37 @@ riftlinux-setup controller-sleep off
 
 `riftlinux-setup controller-sleep 5` goes back to the default.
 
+## A controller out of the sensors' view
+
+When your hand goes behind your back, the sensors lose that controller. It keeps moving on its own motion sensor for up
+to a second, like with the Oculus software, as long as it stays near where the sensors last saw it. After that it stays
+where it is, still turning with your hand, until the sensors find it again. Then it's shown where it is, like with the
+Oculus software, instead of sliding over from where it was held. To change how long it keeps moving:
+
+```
+riftlinux-setup controller-coast 1000   # the default
+riftlinux-setup controller-coast 300    # as before 0.1.5
+```
+
+## A controller that freezes or jumps in view
+
+The tracker checks every position it finds for a controller against the controller's own motion sensor, and throws
+away anything that disagrees on which way is down. If that sensor sits slightly turned inside the controller, or its
+accelerometer reads a little off, the two disagree all the time, and the controller freezes or jumps even in full view
+of the sensors.
+
+RiftLinux learns this while you play, from how the sensors see the controller, and corrects it. There's nothing for you
+to do, just like with the Oculus software. A controller a few degrees off (3 or more, which some healthy ones read) only
+has that check allow for its own offset, and the rest of its tracking stays as it was; this is learned anew each
+session. One that clearly disagrees (6 degrees or more, as a faulty one does) is corrected throughout, and what is
+learned for it is kept for that controller and checked again at every start.
+
+```
+riftlinux-setup controller-alignment status   # what is in use, for which controller
+riftlinux-setup controller-alignment off      # every controller tracked as before (settings.json controllers.imu_align)
+riftlinux-setup controller-alignment forget   # with SteamVR and the runtime closed: drop what was kept
+```
+
 ## The wear sensor: face shields, pads and glasses
 
 The CV1 has a sensor between the lenses that sees whether the headset is on a face. RiftLinux switches the display off
@@ -196,6 +232,22 @@ riftlinux-setup not-worn off            # switched off at once, as RiftLinux 0.1
 `display-off never` keeps the picture on as long as SteamVR runs (the same burn-in risk as above); `not-worn black
 never` keeps it black instead of switching it off; `default` goes back to the defaults.
 
+## IPD: the distance between your eyes
+
+The picture follows the headset's IPD slider as you move it, in SteamVR and in RiftLinux's own runtime, and the headset
+shows the distance in its lower right corner as it changes. Set the slider where the picture looks sharpest.
+
+On some headsets the slider's sensor doesn't report: the lenses move, but the distance stays at 57.5 mm (the Oculus
+software on Windows shows the same number then). If that's yours, measure your IPD (with a ruler in front of a mirror,
+or a phone app), move the lenses to match, and set the distance by hand in the Rift tab's **IPD** row (drag the
+slider, and **Auto** follows the headset's slider again), or with:
+
+```
+riftlinux-setup ipd 63.5      # set by hand, in millimetres
+riftlinux-setup ipd auto      # follow the headset's slider again (the default)
+riftlinux-setup ipd test      # what the slider reads while you move it (SteamVR closed)
+```
+
 ## The settings file
 
 The commands above write these keys; you can also edit the file by hand while SteamVR is closed. A key that is not in
@@ -211,7 +263,8 @@ the file has its default.
     "standby": "worn"
   },
   "controllers": {
-    "sleep_after_min": 5
+    "sleep_after_min": 5,
+    "coast_ms": 1000
   },
   "headset": {
     "wear_sensor": true,
@@ -237,6 +290,9 @@ the file has its default.
 | `steamvr.close_menu_for_games` | `true` | Steam's menu, opened as a game starts, closes once the game shows; `false` keeps it |
 | `steamvr.standby` | `"worn"` | SteamVR's standby ends when the headset is worn; `"pick-up"`: also when it moves, by SteamVR's own rule |
 | `controllers.sleep_after_min` | `5` | Minutes (1 to 60) after the headset is taken off before the controllers may sleep; negative: kept awake while SteamVR runs |
+| `controllers.tracking` | `"current"` | `"0.1.4"`: the controllers' tracking as it was up to RiftLinux 0.1.4 |
+| `controllers.coast_ms` | `1000` | How long a controller the sensors no longer see keeps moving on its motion sensor before it stays where it is, 150 to 2000 ms (300 before 0.1.5) |
+| `controllers.imu_align` | `true` | A controller whose motion sensor disagrees with its LEDs is learned and corrected by itself (a few degrees off: only the check of which way is down allows for it, learned anew each session); `false`: tracked as before ([A controller that freezes or jumps](#a-controller-that-freezes-or-jumps-in-view)) |
 | `headset.wear_sensor` | `true` | `false`: the headset counts as worn whenever it runs |
 | `headset.worn_above`, `headset.unworn_below` | `30`, `15` | The wear sensor's levels: worn above the first, not worn below the second, unchanged in between |
 | `headset.worn_by_motion` | `true` | Moving as on a head counts as worn, whatever the wear sensor reads; `false`: the wear sensor alone |
@@ -244,7 +300,9 @@ the file has its default.
 | `headset.display_off_after_s` | `5` | Seconds not worn before the display goes black (or off); negative: never |
 | `headset.not_worn` | `"black"` | `"black"`: the display stays on showing black while the headset is not worn; `"off"`: it switches off |
 | `headset.black_then_off_min` | `10` | With `"black"`: minutes black before the display switches off; negative: never |
+| `headset.ipd_mm` | not set (the slider) | The distance between your eyes set by hand, 50 to 80 mm, for a headset whose IPD slider is not read; `0` or not set follows the slider (`riftlinux-setup ipd`) |
 | `display.direct_mode` | `true` | SteamVR's frames through RiftLinux's compositor; `false`: SteamVR's own (`riftlinux-setup direct-mode`) |
 | `display.backdrop_blur` | `true` | RiftLinux's own runtime: frosted glass for the layers an application asks it for; `false`: those layers without it (`riftlinux-setup backdrop-blur`) |
+| `display.lsfg_vk` | `false` | lsfg-vk (Lossless Scaling's frame generation) kept out of SteamVR's server and RiftLinux's own runtime; `true`: allowed there as before (`riftlinux-setup lsfg-vk`) |
 
 The picture, notice, tracking and recording keys are in the README's [settings table](../README.md#settings).

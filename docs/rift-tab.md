@@ -35,6 +35,8 @@ knob; the thumbstick does not change anything.
 - **Floor:** lay a controller on the floor, then press **Set floor**. The floor is kept when the sensors are measured
   again.
 - **Height:** raise or lower your view (-50 to +50 cm). **Reset** puts it back to 0.
+- **IPD:** the distance between your eyes in use. **Auto** (lit) follows the headset's IPD slider; dragging the slider
+  sets it by hand, for a headset whose slider is not read ([Settings](settings.md#ipd-the-distance-between-your-eyes)).
 
 **Oculus button:** a reminder of what the button does.
 
@@ -92,6 +94,7 @@ Short panels appear in front of you when something happens, and the ones about t
 | Sensor N moved / placed again | When a sensor was moved or knocked, until it is placed again |
 | No controllers found yet | A controller never reported: press a button on it, or check its battery |
 | Real-time priority refused / RealtimeKit is not installed | Steam was started from a remote login, or RealtimeKit is missing |
+| IPD 63.5 mm (lower right) | The distance between your eyes changes: the headset's slider moves, or it is set by hand |
 | The picture may tear | NVIDIA on Wayland with a VRR monitor (shown with drivers before 615; [Troubleshooting](troubleshooting.md)) |
 
 Each kind can be switched off in `~/.config/riftlinux/settings.json` (`notices.*`, see the README's

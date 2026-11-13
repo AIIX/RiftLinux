@@ -17,6 +17,15 @@ target_link_libraries(
 
 install(TARGETS monado-service RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
 
+# RiftLinux: the Rift panel's pieces and the notices it shows, where the runtime finds them next to itself
+# (<prefix>/share/riftlinux/notices): every install of the runtime has the panel, with or without the SteamVR driver.
+if(XRT_MODULE_COMPOSITOR_MAIN AND XRT_HAVE_VULKAN AND NOT ANDROID AND NOT WIN32)
+	set(RIFTLINUX_PANEL_PIECES "${PROJECT_SOURCE_DIR}/src/xrt/targets/steamvr_drv/resources/notices/")
+	install(DIRECTORY "${RIFTLINUX_PANEL_PIECES}" DESTINATION "${CMAKE_INSTALL_DATADIR}/riftlinux/notices")
+	# Run from the build tree: the same place relative to the binary (<dir>/../share/riftlinux/notices).
+	file(COPY "${RIFTLINUX_PANEL_PIECES}" DESTINATION "${CMAKE_CURRENT_BINARY_DIR}/../share/riftlinux/notices")
+endif()
+
 if(XRT_HAVE_SYSTEMD)
 	set(SERVICE_INPUT "${CMAKE_CURRENT_SOURCE_DIR}/monado.in.service")
 	set(SOCKET_INPUT "${CMAKE_CURRENT_SOURCE_DIR}/monado.in.socket")
