@@ -148,6 +148,8 @@ TAB_CARDS = [
         ("strength", "slider", "Strength", "Contrast and highlights; 50 % is the default."),
         ("colour", "slider", "Colour", "How rich colours are; 50 % is the default."),
         ("bright", "switch", "HDR Bright", "Brighter HDR, like a TV's bright mode."),
+        ("uniformity", "switch", "Panel uniformity", "Evens out the panels with the headset's factory "
+                                                      "calibration (downloaded once)."),
     ]),
     ("motion", "Motion", [
         ("smoothing", "switch", "Motion smoothing", "Smooth motion when a game can't keep 90 frames a second."),

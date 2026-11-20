@@ -777,6 +777,9 @@ check_system_hold(struct ipc_server *s)
 static int
 main_loop(struct ipc_server *s)
 {
+#ifdef RIFTLINUX_HAVE_PANEL
+	uint32_t ticks = 0;
+#endif
 	while (s->running) {
 		os_nanosleep(U_TIME_1S_IN_NS / 20);
 
@@ -785,10 +788,19 @@ main_loop(struct ipc_server *s)
 
 		check_head_detect(s);
 #ifdef RIFTLINUX_HAVE_PANEL
-		// The panel once the system is up (it may come up only with the first client).
-		if (s->panel == NULL && !s->panel_failed && s->xsysc != NULL) {
+		/*
+		 * The panel once the system is up (it may come up only with the first client): everything it needs there
+		 * first, so an early try does not count as a failure (it left sessions without the panel, and without the
+		 * settings it applies, until the next start).
+		 */
+		if (s->panel == NULL && !s->panel_failed && s->xsysc != NULL && s->xsysd != NULL &&
+		    s->xsysd->static_roles.head != NULL && s->xso != NULL) {
 			s->panel = rl_panel_create(s);
 			s->panel_failed = s->panel == NULL;
+		}
+		// The settings file's live keys (mura correction), with or without the panel.
+		if (ticks++ % 20 == 0) {
+			rl_panel_settings_watch();
 		}
 #endif
 		check_system_hold(s);

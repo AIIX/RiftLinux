@@ -2,8 +2,9 @@
 
 For distribution and repository maintainers (AUR, Fedora/COPR, openSUSE, Debian/Ubuntu PPAs, NixOS, Gentoo). The goal
 of the project is that installing this one package is all a user does: restart Steam once, plug in the Rift, put it on
-(SteamVR starts), and the headset, sensors and controllers work, as the Oculus software does on Windows. A package that follows this page
-gives that; one that leaves out a piece (most often the per-user registration) leaves users with a dark headset.
+(SteamVR starts), and the headset, sensors and controllers work, as the Oculus software does on Windows. A package
+that follows this page gives that; one that leaves out a piece (most often the per-user registration) leaves users
+with a dark headset.
 
 The reference packages are made by `scripts/riftlinux/make-packages.sh` (a `.deb`, an Arch package, an `.rpm` and a
 `.tar.gz` with `install.sh`). Copy their layout and hooks.
@@ -16,8 +17,8 @@ distributions'. A `driver_monado.so` built with the distribution's compiler and 
 container does not have or newer symbol versions than it offers, and SteamVR fails to load it (or runs it only outside
 the container, where games then show a grey screen).
 
-So build the SteamVR driver in the sniper SDK image, as `scripts/riftlinux/steamrt-build.sh` does (Docker or Podman,
-about 10 minutes the first time):
+So build the SteamVR driver in the sniper SDK image, as `scripts/riftlinux/steamrt-build.sh` does (Docker or
+Podman):
 
 ```bash
 scripts/riftlinux/steamrt-build.sh /path/to/out      # -> /path/to/out/package/rift-cv1-steamvr and rift-cv1-native
@@ -25,7 +26,9 @@ scripts/riftlinux/make-packages.sh /path/to/out /path/to/dest
 ```
 
 It builds only the Rift CV1 drivers (`XRT_BUILD_DRIVER_RIFT`, `_RIFT_SENSOR`, UVC; all others off), links Eigen, Ceres,
-hidapi and libjpeg-turbo statically and needs nothing at run time beyond what the Steam Runtime ships. Where a build
+hidapi and libjpeg-turbo statically and needs nothing at run time beyond what the Steam Runtime ships. It hardens the
+build as distributions do (`-fstack-protector-strong -fstack-clash-protection -D_FORTIFY_SOURCE=2`, `-z relro -z now`),
+which the SDK's compiler does not do by itself. Where a build
 service cannot run containers, package the release archive (a `-bin` package) instead of rebuilding.
 
 The same build makes RiftLinux's own OpenXR runtime (`monado-service` and `libopenxr_monado.so`, started with
@@ -51,7 +54,8 @@ without systemd. `riftlinux-setup check` lists any of these that are missing. Bu
 distribution's own toolchain instead is possible (the README's Build section), but the SteamVR driver must come from
 the Steam Runtime build.
 
-The packages are for x86-64 only (they are built in the x86-64 Steam Runtime SDK image); on other architectures they refuse to install, and `riftlinux-setup register` registers nothing.
+The packages are for x86-64 only (they are built in the x86-64 Steam Runtime SDK image); on other architectures they
+refuse to install, and `riftlinux-setup register` registers nothing.
 
 ## 2. What to install
 
@@ -59,7 +63,7 @@ The packages are for x86-64 only (they are built in the x86-64 Steam Runtime SDK
 | --- | --- |
 | `/usr/lib/riftlinux/steamvr/rift-cv1/` | The SteamVR driver folder as built (manifest, `bin/linux64/`, `bin/linux32/`, `resources/`) plus a `VERSION` file. Without `riftlinux-setup` and `udev/`, which go below. `bin/linux32/driver_monado.so` is the part Steam's 32-bit client loads as it starts (SteamVR's watchdog drivers): it starts SteamVR when the headset is put on; Steam loads a new one only when Steam restarts |
 | `/usr/lib/riftlinux/native/` | The own runtime: `monado-service`, `libopenxr_monado.so`, `libmonado.so` (with `monado.h`, for applications that list the runtime's applications and bring one to the front), `openxr_riftlinux.json` (the OpenXR manifest, for `XR_RUNTIME_JSON`) |
-| `/usr/bin/riftlinux-setup` | Python 3 tool: `register` (run by itself, see 3), `check`, `repair`, `direct-mode`, `pair`, `uninstall` |
+| `/usr/bin/riftlinux-setup` | Python 3 tool: `register` (run by itself, see 3), `check`, `repair`, `direct-mode`, `pair`, `uniformity`, `uninstall`. `uniformity` is the only part that uses the network: when the user switches panel uniformity on (command or Rift tab) and no calibration is there yet, it downloads the headset's factory measurement from Meta once, over HTTPS |
 | `/usr/bin/riftlinux-runtime` | Starts the own runtime (refuses while SteamVR runs); `--stop`, `--status` |
 | `/usr/bin/riftlinux-run` | Runs an OpenXR application on the own runtime, starting it first and stopping it after if it was not running |
 | `/usr/share/applications/riftlinux-runtime.desktop` | App menu entry "RiftLinux Runtime" (action "Stop"); "Open With" handler for programs, AppImages, scripts and launchers |
@@ -71,6 +75,7 @@ The packages are for x86-64 only (they are built in the x86-64 Steam Runtime SDK
 | `/usr/lib/riftlinux/after-install.sh` | Run as root after installing and after upgrades |
 | `/usr/lib/riftlinux/before-remove.sh` | Run as root before removing (not on upgrades) |
 | `/usr/share/doc/riftlinux/` | README, this file, copyright |
+| `/usr/share/licenses/riftlinux/` | The licence texts of RiftLinux (BSL-1.0) and of the libraries linked in: Ceres Solver and hidapi (BSD-3-Clause), Eigen (MPL-2.0), libjpeg-turbo (IJG, BSD-3-Clause, zlib) |
 
 `/usr/lib64/riftlinux/...`, `/usr/local/lib/riftlinux/...` and `/opt/riftlinux/...` are also found
 (`riftlinux-setup` looks in all four, or where `RIFTLINUX_SYSTEM_DIR` says). Do not edit the driver manifest; do not
@@ -133,6 +138,7 @@ desktops honour with or without systemd.
 | `usbutils` (required) | The `lsusb` command: Steam uses it to see that the headset is connected (SteamVR's headset detection on Linux) |
 | udev with systemd-logind (`uaccess`) | Device access for the user at the machine, no group needed |
 | `rtkit` (recommended; a dependency of the Arch package, as Arch does not install it with a desktop) | Real-time priority for the tracking and compositor threads inside SteamVR (RealtimeKit over D-Bus; the container reaches the system bus). Without it the headset says so when it is put on |
+| `hicolor-icon-theme` (required) | The icon theme the app menu entries' icon is installed into |
 | `libcap` tools (recommended) | `setcap` for SteamVR's compositor priority, offered by `riftlinux-setup repair` |
 | Steam and SteamVR | Installed by the user from Steam; not a package dependency (any Steam: native, Flatpak, Snap) |
 
@@ -164,9 +170,9 @@ On a fresh user account with Steam and SteamVR installed but never started:
 
 1. Install the package; `riftlinux-setup check` as the user: driver registered (for each Steam the user has), device
    access ok.
-2. Restart Steam, plug in the Rift and put it on (SteamVR starts; or start it from Steam): the SteamVR log (`~/.local/share/Steam/logs/vrserver.txt`, or the
-   Flatpak/Snap equivalent) has `Loaded server driver monado` from the user's copy; picture and tracking in the
-   headset, no Room Setup.
+2. Restart Steam, plug in the Rift and put it on (SteamVR starts; or start it from Steam): the SteamVR log
+   (`~/.local/share/Steam/logs/vrserver.txt`, or the Flatpak/Snap equivalent) has `Loaded server driver monado` from
+   the user's copy; picture and tracking in the headset, no Room Setup.
 3. Upgrade the package: after the next login or plug-in the user's copy has the new `VERSION`.
 4. Remove the package: the driver is no longer in the user's `openvrpaths.vrpath`.
 

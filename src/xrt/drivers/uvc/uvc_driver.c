@@ -154,7 +154,9 @@ process_payload(struct uvc_fs *stream, unsigned char *payload, size_t len)
 #endif
 	bool error, have_pts, is_eof;
 
-	if (len == 0 || len == 12) {
+	// A payload is the 12-byte header and then data: anything not longer is no payload (RiftLinux: a device sending
+	// fewer bytes made the data length below wrap around, and the copy then ran far past the frame).
+	if (len <= 12) {
 		return;
 	}
 
@@ -303,7 +305,8 @@ process_payload(struct uvc_fs *stream, unsigned char *payload, size_t len)
 		return;
 	}
 
-	if (stream->frame_collected + payload_len > stream->frame_size) {
+	// Written so that it cannot wrap: frame_collected never passes frame_size.
+	if (payload_len > stream->frame_size - stream->frame_collected) {
 		UVC_ERROR(stream, "UVC frame buffer overflow: %zu + %zu > %zu", stream->frame_collected, payload_len,
 		          stream->frame_size);
 		return;

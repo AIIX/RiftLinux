@@ -46,6 +46,9 @@ knob; the thumbstick does not change anything.
   **Reset** puts either back to 50 %.
 - **HDR Bright:** HDR games and videos placed brighter, like a TV's bright picture mode. It needs HDR content and is
   not part of Auto-HDR; the line under it says whether HDR content is on screen now.
+- **Panel uniformity** (0.1.6 pre-release): both panels evened out with your headset's own factory calibration. The
+  first time, it is downloaded from Meta and built, and the picture changes once it is ready
+  ([The picture](picture.md#panel-uniformity)).
 
 **Motion** (in direct mode)
 - **Motion smoothing:** smooth motion when a game cannot keep 90 frames a second, like Oculus' ASW. See

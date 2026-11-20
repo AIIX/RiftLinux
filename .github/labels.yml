@@ -40,3 +40,6 @@
 - name: "duplicate"
   color: "cfd3d7"
   description: "Already reported"
+- name: "fix-released"
+  color: "0e8a16"
+  description: "Fixed or added in a release; please try it and confirm"

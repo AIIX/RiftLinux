@@ -62,6 +62,10 @@ install -m 0644 "$SRC/scripts/riftlinux/packaging/riftlinux-run.kde-servicemenu.
 	"$R/usr/share/kio/servicemenus/riftlinux-run.desktop"
 install -m 0644 "$PKG/resources/notices/quick-tab.png" "$R/usr/share/icons/hicolor/256x256/apps/riftlinux.png"
 install -m 0644 "$NAT/libjpeg-turbo-LICENSE.md" "$R/usr/share/doc/riftlinux/libjpeg-turbo-LICENSE.md"
+# The licence texts of RiftLinux and of every library linked in (steamrt-build.sh collects them).
+[ -f "$NAT/licenses/ceres-solver-LICENSE" ] || { echo "no licence files in $NAT/licenses: build again" >&2; exit 1; }
+install -d "$R/usr/share/licenses/riftlinux"
+install -m 0644 "$NAT"/licenses/* "$R/usr/share/licenses/riftlinux/"
 install -m 0644 "$SRC/scripts/riftlinux/udev/70-rift-cv1.rules" "$R/usr/lib/udev/rules.d/"
 install -m 0644 "$SRC/scripts/riftlinux/packaging/riftlinux-register.service" "$R/usr/lib/systemd/user/"
 install -m 0644 "$SRC/scripts/riftlinux/packaging/riftlinux-register.desktop" "$R/etc/xdg/autostart/"
@@ -75,7 +79,8 @@ RiftLinux: a modified Monado, specialized for full Oculus Rift CV1 support (Stea
 Copyright 2026 Aditya Mehra <aix.m@outlook.com>; Monado: Collabora, Ltd. and the Monado contributors; see the SPDX
 headers in the source. License: BSL-1.0 (Boost Software License 1.0); bundled Eigen (MPL-2.0), Ceres Solver
 (BSD-3-Clause), hidapi (BSD-3-Clause) and libjpeg-turbo (IJG License, BSD-3-Clause, zlib; this software is based in
-part on the work of the Independent JPEG Group; see libjpeg-turbo-LICENSE.md) linked in.
+part on the work of the Independent JPEG Group; see libjpeg-turbo-LICENSE.md) linked in. The licence texts are in
+/usr/share/licenses/riftlinux.
 COPY
 # System files: not writable by group or others.
 chmod -R u+rwX,go+rX,go-w "$R"
@@ -92,7 +97,7 @@ Version: $VER
 Architecture: amd64
 Maintainer: Aditya Mehra <aix.m@outlook.com>
 Installed-Size: $SIZE
-Depends: python3, usbutils, libc6 (>= 2.30), libudev1, libusb-1.0-0, libdbus-1-3, libvulkan1, libdrm2, libx11-6, libx11-xcb1,
+Depends: python3, usbutils, hicolor-icon-theme, libc6 (>= 2.30), libudev1, libusb-1.0-0, libdbus-1-3, libvulkan1, libdrm2, libx11-6, libx11-xcb1,
  libxcb1, libxcb-randr0, libwayland-client0, libsdl2-2.0-0, libglx0
 Recommends: rtkit, libcap2-bin, libnotify-bin
 Section: misc
@@ -184,8 +189,8 @@ pkgrel=1
 pkgdesc="Oculus Rift CV1 driver for Linux (SteamVR and OpenXR): tracking, Touch, Auto-HDR, motion smoothing"
 arch=('x86_64')
 url="$URL"
-license=('BSL-1.0')
-depends=('python' 'usbutils' 'rtkit' 'glibc' 'systemd-libs' 'libusb' 'dbus' 'vulkan-icd-loader' 'libdrm' 'libx11' 'libxcb' 'wayland'
+license=('BSL-1.0' 'MPL-2.0' 'BSD-3-Clause' 'IJG' 'Zlib')
+depends=('python' 'usbutils' 'hicolor-icon-theme' 'rtkit' 'glibc' 'systemd-libs' 'libusb' 'dbus' 'vulkan-icd-loader' 'libdrm' 'libx11' 'libxcb' 'wayland'
 	'sdl2' 'libglvnd')
 optdepends=('steam: SteamVR runs the driver' 'libnotify: notifications from the RiftLinux Runtime app entry')
 install=riftlinux.install
@@ -222,12 +227,13 @@ Name:           riftlinux
 Version:        $RVER
 Release:        $RREL
 Summary:        Oculus Rift CV1 driver for Linux (SteamVR and OpenXR)
-License:        BSL-1.0
+License:        BSL-1.0 AND MPL-2.0 AND BSD-3-Clause AND IJG AND Zlib
 BuildArch:      x86_64
 # The SteamVR driver's libraries are the Steam runtime's, not the system's, so no automatic requirements; the own
 # runtime's (riftlinux-runtime) are listed by library name, valid on Fedora and openSUSE alike.
 AutoReqProv:    no
 Requires:       python3
+Requires:       hicolor-icon-theme
 Requires:       usbutils
 Requires:       libudev.so.1()(64bit) libusb-1.0.so.0()(64bit) libdbus-1.so.3()(64bit) libvulkan.so.1()(64bit)
 Requires:       libdrm.so.2()(64bit) libX11.so.6()(64bit) libX11-xcb.so.1()(64bit) libxcb.so.1()(64bit)
@@ -263,6 +269,7 @@ if [ \$1 -eq 0 ]; then /usr/lib/riftlinux/before-remove.sh; fi
 /usr/lib/systemd/user/riftlinux-register.service
 %config(noreplace) /etc/xdg/autostart/riftlinux-register.desktop
 /usr/share/doc/riftlinux
+/usr/share/licenses/riftlinux
 SPEC
 	[ -z "$URL" ] || sed -i "/^License:/a URL:            $URL" "$F/SPECS/riftlinux.spec"
 	docker run --rm -v "$F:/rpm" riftlinux-pkg-fedora sh -c \

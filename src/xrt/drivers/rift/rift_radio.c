@@ -1404,8 +1404,10 @@ rift_touch_controller_calibration_hash_read_callback(void *user_data, uint16_t a
 		char *calibration_data = u_file_read_content(calibration_file, &file_size);
 		fclose(calibration_file);
 
-		if (memcmp(calibration_data, controller->radio_data.calibration_hash, CALIBRATION_HASH_BYTE_LENGTH) ==
-		    0) {
+		// A cached file too short to hold the hash counts as no match (RiftLinux: it was compared regardless).
+		if (calibration_data != NULL && file_size >= CALIBRATION_HASH_BYTE_LENGTH &&
+		    memcmp(calibration_data, controller->radio_data.calibration_hash, CALIBRATION_HASH_BYTE_LENGTH) ==
+		        0) {
 			HMD_INFO(controller->hmd,
 			         "Calibration hash matches cached file for controller %d, loading from disk",
 			         controller->device_type);
@@ -2204,9 +2206,17 @@ rift_radio_handle_command(struct rift_hmd *hmd)
 
 		(*data->serial_valid) = true;
 
-		HMD_INFO(hmd, "Read radio serial: %s", serial_ptr);
 		memcpy(data->serial, (char *)serial_ptr, SERIAL_NUMBER_LENGTH);
 		data->serial[SERIAL_NUMBER_LENGTH] = 0;
+		// Letters, digits and '-' only (RiftLinux): the serial names cache files and goes into the log, and it
+		// comes from the device unterminated and unchecked.
+		for (int i = 0; i < SERIAL_NUMBER_LENGTH && data->serial[i] != 0; i++) {
+			const char c = data->serial[i];
+			if (!((c >= '0' && c <= '9') || (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || c == '-')) {
+				data->serial[i] = '_';
+			}
+		}
+		HMD_INFO(hmd, "Read radio serial: %s", data->serial);
 
 		break;
 	}

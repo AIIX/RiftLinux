@@ -7,9 +7,9 @@ SPDX-License-Identifier: CC-BY-4.0
 # OpenXR apps on the Rift CV1 without SteamVR
 
 Besides the SteamVR driver, RiftLinux has **its own OpenXR runtime**: OpenXR applications run on the Rift CV1 directly,
-with no SteamVR involved. It has the same tracking, the same picture (Auto-HDR, motion smoothing) and the same
-[Rift tab](rift-tab.md) on the right Oculus button, plus a button to close the running application. It is part of
-every package; nothing extra to install.
+with no SteamVR involved. It has the same tracking, the same picture (Auto-HDR, motion smoothing, panel uniformity)
+and the same [Rift tab](rift-tab.md) on the right Oculus button, plus a button to close the running application. It
+is part of every package; nothing extra to install.
 
 SteamVR and RiftLinux's runtime cannot hold the headset at the same time: close SteamVR first. SteamVR games are not
 affected by any of this.
@@ -30,10 +30,10 @@ once the last of them ends).
 riftlinux-run <program> [its arguments]
 ```
 
-`riftlinux-run` does the same: it starts the runtime if it is not running, runs the program on it, and stops the
-runtime afterwards if it started it, once no other application uses it. If the runtime can't start, it tells you why (for example, that SteamVR is running).
-It also works from an SSH login: it uses the desktop session of the computer it runs on, also when your SSH client
-forwards X.
+`riftlinux-run` does the same: it starts the runtime if it is not running, runs the program on it, and stops the runtime
+afterwards if it started it, once no other application uses it. If the runtime can't start, it tells you why (for
+example, that SteamVR is running). It also works from an SSH login: it uses the desktop session of the computer it runs
+on, also when your SSH client forwards X.
 
 ## Keep the runtime running
 
@@ -59,6 +59,8 @@ The runtime writes its log to `~/.cache/riftlinux/runtime.log`.
 - When you put the headset on, the view is recentred on you. When you take it off, the picture goes black, and after
   a while black the display switches off; on Wayland the desktop then gets the display back, and the runtime takes it
   again when you put the headset on.
+- When the runtime stops, the headset is switched off completely: display, headphones and tracking LEDs (0.1.6
+  pre-release).
 - There is no boundary (SteamVR's Chaperone exists only in SteamVR).
 
 ## Example: WayVR, your desktop in VR

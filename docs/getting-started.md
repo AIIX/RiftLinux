@@ -54,6 +54,9 @@ Place the sensors where both can see the space you play in; [Sensors](sensors.md
    tar xf riftlinux-<version>-x86_64.tar.gz && sudo ./riftlinux-<version>-x86_64/install.sh   # any distribution
    ```
 
+   On Arch and its relatives the same package is also in the AUR as `riftlinux-bin`: install it with your AUR helper
+   (for example `yay -S riftlinux-bin`) instead of steps 1 to 3.
+
 That is all there is to set up. The package gives your user access to the Rift's USB devices and registers the
 driver with SteamVR for every user: at once for whoever is logged in, and again at each login and whenever the
 headset is plugged in. SteamVR does not need to have run before. The driver gives SteamVR its room (no Room Setup),
@@ -86,12 +89,12 @@ opens on the monitor (put the headset on first).
 
 - **Upgrade:** install the newer package the same way, then restart Steam once. Every user's copy of the driver
   follows at their next login or when the headset is plugged in.
-- **Remove:** `sudo apt remove riftlinux`, `sudo pacman -R riftlinux`, `sudo dnf remove riftlinux`, or
-  `sudo ./uninstall.sh` in the unpacked tarball's folder. The driver is unregistered from SteamVR. Your settings and
-  the sensors' calibration stay in `~/.config/riftlinux` and `~/.config/monado`; delete those folders to remove them
-  too.
+- **Remove:** `sudo apt remove riftlinux`, `sudo pacman -R riftlinux` (from the AUR: `sudo pacman -R riftlinux-bin`),
+  `sudo dnf remove riftlinux`, or `sudo ./uninstall.sh` in the unpacked tarball's folder. The driver is unregistered
+  from SteamVR. Your settings and the sensors' calibration stay in `~/.config/riftlinux` and `~/.config/monado`; delete
+  those folders to remove them too.
 
 ## Next
 
-- [The Rift tab](rift-tab.md): volume, microphone, floor, Auto-HDR, motion smoothing, status.
+- [The Rift tab](rift-tab.md): volume, microphone, floor, Auto-HDR, panel uniformity, motion smoothing, status.
 - [Troubleshooting](troubleshooting.md), if something does not work: start with `riftlinux-setup check`.

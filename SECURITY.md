@@ -16,6 +16,10 @@ a public issue: a public report of an unfixed problem puts every user at risk.
   devices.
 - The driver's local socket (`~/.cache/riftlinux/driver.sock`) and its settings file
   (`~/.config/riftlinux/settings.json`): both are read by the driver while SteamVR runs.
+- Data the driver reads from USB devices that claim to be a Rift, a sensor or a controller: a faulty or malicious
+  device must not be able to make the driver write outside its memory.
+- Panel uniformity: the factory measurement `riftlinux-setup` downloads and the calibration files it builds or
+  imports (`~/.config/riftlinux/spud/`), which the compositor reads.
 
 ## Not in scope
 

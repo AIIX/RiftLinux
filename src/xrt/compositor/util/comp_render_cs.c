@@ -857,6 +857,11 @@ comp_render_cs_layer(struct render_compute *render,
 	// Set the number of layers.
 	ubo_data->layer_count.value = cur_layer;
 	ubo_data->layer_count.linear_target = render->r->scratch_linear ? 1 : 0;
+	{
+		struct render_output_settings rs;
+		render_output_settings_get(&rs);
+		ubo_data->layer_count.supersample_filter = rs.supersample_filter ? 1 : 0;
+	}
 
 	for (uint32_t i = cur_layer; i < RENDER_MAX_LAYERS; i++) {
 		ubo_data->layers[i].layer_data.layer_type = LAYER_COMP_TYPE_NOOP; // Explicit no-op.

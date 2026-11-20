@@ -27,6 +27,13 @@ void
 rl_panel_settings_to_env(void);
 
 /*!
+ * The settings file's panel uniformity keys, while the server runs: a change (riftlinux-setup uniformity on/off/...)
+ * reaches the compositor from the next frame. Checks the file's time only; call about once a second.
+ */
+void
+rl_panel_settings_watch(void);
+
+/*!
  * Creates the panel and its thread: applies the settings file (picture, floor and height), switches the default audio
  * output to the headset's headphones. NULL without a compositor or a head device.
  */

@@ -443,7 +443,13 @@ ovrd_socket_stop()
 		return;
 	}
 	const char byte = 1;
-	(void)write(g_socket.wake[1], &byte, 1);
+	ssize_t woke;
+	do {
+		woke = write(g_socket.wake[1], &byte, 1);
+	} while (woke < 0 && errno == EINTR);
+	if (woke != 1) {
+		ovrd_log("Socket: can't wake the socket's thread (%s)\n", strerror(errno));
+	}
 	g_socket.thread.join();
 	close(g_socket.listen_fd);
 	close(g_socket.wake[0]);

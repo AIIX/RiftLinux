@@ -87,7 +87,14 @@ if [ ! -e $D/share/pkgconfig/wayland-protocols.pc ]; then
 fi
 # -U "JPEG_*": an older build directory found the shared libjpeg of the SDK; now the static one in $D.
 # -U "*SYSTEMD*": the options that depend on the systemd library fall back to off with it.
+# Hardening, as distributions build their packages (the SDK compiler adds none of it by itself): stack protector and
+# stack clash protection, the checked string and memory functions of glibc, and relocations resolved at load and then made
+# read-only (full RELRO).
 cmake -S /src -B /out/build -G Ninja -U "*WAYLAND_PROTOCOLS*" -U "JPEG_*" -U "*SYSTEMD*" -DXRT_HAVE_WAYLAND_DIRECT=ON \
+	-DCMAKE_C_FLAGS="-fstack-protector-strong -fstack-clash-protection -D_FORTIFY_SOURCE=2" \
+	-DCMAKE_CXX_FLAGS="-fstack-protector-strong -fstack-clash-protection -D_FORTIFY_SOURCE=2" \
+	-DCMAKE_SHARED_LINKER_FLAGS="-Wl,-z,relro -Wl,-z,now" -DCMAKE_MODULE_LINKER_FLAGS="-Wl,-z,relro -Wl,-z,now" \
+	-DCMAKE_EXE_LINKER_FLAGS="-Wl,-z,relro -Wl,-z,now" \
 	-DXRT_HAVE_SYSTEMD=OFF -DCMAKE_BUILD_TYPE=RelWithDebInfo -DCMAKE_PREFIX_PATH=$D \
 	-DXRT_HAVE_SYSTEM_CJSON=OFF -DXRT_FEATURE_STEAMVR_PLUGIN=ON \
 	-DXRT_BUILD_DRIVER_RIFT=ON -DXRT_BUILD_DRIVER_RIFT_SENSOR=ON -DXRT_BUILD_DRIVER_UVC=ON -DXRT_BUILD_DRIVER_SIMULATED=OFF \
@@ -109,7 +116,8 @@ cmake --build /out/build -j$J --target driver_monado monado-service openxr_monad
 # file, the C++ library linked in (Steam brings its own, of an unknown version).
 mkdir -p /out/build/watchdog32
 g++ -m32 -std=c++17 -O2 -fPIC -shared -fvisibility=hidden -Wall -Wextra -Werror -pthread \
-	-static-libstdc++ -static-libgcc -Wl,--no-undefined \
+	-fstack-protector-strong -fstack-clash-protection -D_FORTIFY_SOURCE=2 \
+	-static-libstdc++ -static-libgcc -Wl,--no-undefined -Wl,-z,relro -Wl,-z,now \
 	-isystem /src/src/external/openvr_includes -I/src/src/xrt/state_trackers/steamvr_drv -I/src/src/xrt/auxiliary \
 	/src/src/xrt/targets/steamvr_drv/riftlinux_watchdog32.cpp -o /out/build/watchdog32/driver_monado.so
 '
@@ -148,6 +156,17 @@ printf '{\n  "file_format_version": "1.0.0",\n  "runtime": {"name": "RiftLinux",
 printf '{\n  "file_format_version": "1.0.0",\n  "runtime": {"name": "RiftLinux", "library_path": "/run/host/usr/lib/riftlinux/native/libopenxr_monado.so"}\n}\n' \
 	> "$NAT/openxr_riftlinux_flatpak.json"
 cp "$OUT/deps/share/doc/libjpeg-turbo/LICENSE.md" "$NAT/libjpeg-turbo-LICENSE.md"
+# Every library linked in, with its own licence files (their copyright lines), from the sources fetched above; the
+# packages install them in /usr/share/licenses/riftlinux.
+rm -rf "$NAT/licenses" && mkdir -p "$NAT/licenses"
+cp "$NAT/libjpeg-turbo-LICENSE.md" "$NAT/licenses/libjpeg-turbo-LICENSE.md"
+tar -xOzf "$OUT/dl/libjpeg-turbo-3.2.0.tar.gz" libjpeg-turbo-3.2.0/README.ijg > "$NAT/licenses/libjpeg-turbo-README.ijg"
+tar -xOzf "$OUT/dl/ceres-2.2.0.tar.gz" ceres-solver-2.2.0/LICENSE > "$NAT/licenses/ceres-solver-LICENSE"
+tar -xOzf "$OUT/dl/hidapi-0.14.0.tar.gz" hidapi-hidapi-0.14.0/LICENSE.txt > "$NAT/licenses/hidapi-LICENSE.txt"
+tar -xOzf "$OUT/dl/hidapi-0.14.0.tar.gz" hidapi-hidapi-0.14.0/LICENSE-bsd.txt > "$NAT/licenses/hidapi-LICENSE-bsd.txt"
+tar -xOzf "$OUT/dl/eigen-3.4.0.tar.gz" eigen-3.4.0/COPYING.MPL2 > "$NAT/licenses/eigen-COPYING.MPL2"
+tar -xOzf "$OUT/dl/eigen-3.4.0.tar.gz" eigen-3.4.0/COPYING.README > "$NAT/licenses/eigen-COPYING.README"
+cp "$SRC/LICENSES/BSL-1.0.txt" "$NAT/licenses/BSL-1.0.txt"
 echo "native runtime: $NAT"
 du -sh "$NAT"
 readelf -d "$NAT/monado-service" "$NAT/libopenxr_monado.so" | grep NEEDED | sort -u

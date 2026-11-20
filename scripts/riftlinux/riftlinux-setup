@@ -94,6 +94,22 @@
                                           black, so the desktop sees no monitor unplugged, and switches it off after
                                           <minutes> black (default 10); off switches the display off at once (an
                                           unplug and plug for the desktop at every take-off and put-on)
+  riftlinux-setup uniformity on|off|status
+                                          panel uniformity (SPUD): evens out each panel's uneven brightness and colour
+                                          with the headset's own factory calibration (off by default); the first on
+                                          fetches the headset's factory measurement from Meta (it asks first; sends
+                                          only the headset's serial, no account) and builds the calibration from it;
+                                          at once while it runs
+  riftlinux-setup uniformity download [--yes] | build | import <file> [--serial <serial>]
+                                          download: the factory measurement from Meta, and the calibration built
+                                          from it; build: the calibration again from the kept measurement; import: a
+                                          measurement you have (HMD_<serial>.spud), or the calibration a Windows
+                                          install prepared (%LOCALAPPDATA%\\Oculus\\Spud\\HMD_<serial>.mashed);
+                                          kept in ~/.config/riftlinux/spud; nothing is sent unless you run download
+                                          or on
+  riftlinux-setup uniformity strength|near-black [<percent>|default|status]
+                                          how much it corrects (default 100), and how much of it on the darkest greys
+                                          (full from level 25 up; default 60); at once while it runs
 
 Options: --package DIR (the driver package; default: the directory this tool is in), --json (machine-readable
 output for front ends), --yes (no questions), --print-root (only print the commands that need root).
@@ -110,11 +126,18 @@ import glob
 import json
 import os
 import re
+import shlex
 import shutil
 import struct
 import subprocess
 import sys
 import time
+import hashlib
+import io
+import urllib.error
+import urllib.parse
+import urllib.request
+import zipfile
 
 VENDOR = "2833"
 PRODUCTS = {"0031": "Rift CV1 headset", "0211": "Rift CV1 sensor", "2031": "Rift CV1 hub", "3031": "Rift CV1 hub (USB 3)",
@@ -1594,6 +1617,7 @@ def check_devices(p, opts):
 
 def package_install_cmd(package):
     """The distribution's command to install a package, or None when no known package manager is present."""
+    package = shlex.quote(package)
     for tool, cmd in (("apt-get", f"apt-get install -y {package}"),
                       ("pacman", f"pacman -S --needed --noconfirm {package}"),
                       ("dnf", f"dnf install -y {package}"),
@@ -1704,10 +1728,11 @@ def check_usb_power(p, opts):
 def udev_root_cmds(p):
     src = p.udev_src if os.path.exists(p.udev_src) else None
     target = f"/etc/udev/rules.d/{UDEV_NAME}"
+    # Quoted for root's shell: the package folder can be anywhere (a tarball unpacked by the user).
     if src:
-        install = f"install -m 0644 '{src}' {target}"
+        install = f"install -m 0644 {shlex.quote(src)} {target}"
     else:
-        install = f"printf %s {json.dumps(udev_rules_text())} > {target}"
+        install = f"printf '%s' {shlex.quote(udev_rules_text())} > {target}"
     return [install, "udevadm control --reload-rules", f"udevadm trigger --attr-match=idVendor={VENDOR}"]
 
 
@@ -1730,9 +1755,14 @@ def check_priority(p, opts):
         return result("priority", "SteamVR compositor priority", "info", "No vrcompositor-launcher in this SteamVR.")
     if file_has_cap(launcher, CAP_SYS_NICE):
         return result("priority", "SteamVR compositor priority", "ok", "vrcompositor-launcher has CAP_SYS_NICE.")
+    # The path comes from Steam's files in the home folder: root gets the real file, quoted, and only a regular file.
+    real = os.path.realpath(launcher)
+    if not os.path.isfile(real) or os.path.islink(real):
+        return result("priority", "SteamVR compositor priority", "warn",
+                      f"vrcompositor-launcher is not a plain file ({real}): not given CAP_SYS_NICE.")
     return result("priority", "SteamVR compositor priority", "fix",
                   "vrcompositor-launcher lacks CAP_SYS_NICE (SteamVR updates remove it): its compositor would run at "
-                  "normal priority.", None, "root", [f"setcap CAP_SYS_NICE=eip '{launcher}'"])
+                  "normal priority.", None, "root", [f"setcap CAP_SYS_NICE=eip {shlex.quote(real)}"])
 
 
 def openxr_runtime(p):
@@ -2339,12 +2369,906 @@ def check_headset_mode(p, opts):
                   "will be restarted into normal mode.", fix, "user")
 
 
+# --------------------------------------------------------------------------------------------------------------------
+# The headset's factory panel calibration (its SPUD file): Meta measured the two panels of every CV1 at the factory
+# (each panel's uneven brightness, its mura) and serves a headset's file by the headset's serial. Fetched only when
+# the user runs `riftlinux-setup uniformity download`; kept in ~/.config/riftlinux/spud. Having the file changes nothing in
+# the picture by itself.
+
+SPUD_LOOKUP = "https://graph.oculus.com/non_uniformity_by_serial"
+# Meta's service expects the Oculus runtime's package ID as the caller: an ID, no secret and no account.
+SPUD_CALLER = "OAuth OC|572698886195608|"
+SPUD_MAX_BYTES = 32 * 1024 * 1024
+
+
+def spud_dir():
+    return os.path.join(XDG_CONFIG, "riftlinux", "spud")
+
+
+def spud_path(serial):
+    return os.path.join(spud_dir(), f"HMD_{serial}.spud")
+
+
+def spud_serial_ok(serial):
+    return bool(serial) and serial.isascii() and serial.isalnum() and len(serial) <= 32
+
+
+def headset_serial():
+    """The connected headset's serial, as its USB device reports it (the one the SPUD file names), or None."""
+    for d in usb_devices():
+        if d["product"] == "0031":
+            serial = sysfs(d["sysfs"], "serial")
+            if spud_serial_ok(serial):
+                return serial
+    return None
+
+
+class SpudError(ValueError):
+    pass
+
+
+def spud_read(data, full=True):
+    """{serial, panels, measured, entries} of a SPUD file's bytes; SpudError when they are not a whole SPUD file.
+    full also checks every entry's checksum."""
+    try:
+        with zipfile.ZipFile(io.BytesIO(data)) as z:
+            items = z.infolist()
+            if len(items) > 1024 or sum(i.file_size for i in items) > 128 * 1024 * 1024:
+                raise SpudError("larger than a SPUD file can be")
+            cfg = json.loads(z.read("SpudCfg.json"))
+            if full and z.testzip() is not None:
+                raise SpudError("damaged (a checksum does not match)")
+    except SpudError:
+        raise
+    except Exception as e:  # anything a broken or foreign file makes zipfile, zlib or json raise
+        raise SpudError("not a SPUD file") from e
+    serial = cfg.get("Serial") if isinstance(cfg, dict) else None
+    if not isinstance(serial, str) or not spud_serial_ok(serial):
+        raise SpudError("not a SPUD file (no headset serial in it)")
+    names = [v for table in (cfg.get("Global") or {}).values() if isinstance(table, dict)
+             for k, v in table.items() if k != "Enabled" and isinstance(v, str)]
+    panels = sorted({n.split("-")[0] for n in names if "-" in n})
+    measured = sorted({m.group(1) for m in (re.search(r"-(\d{8})_", n) for n in names) if m})
+    return {"serial": serial, "panels": panels, "measured": measured, "entries": len(items)}
+
+
+def spud_describe(info):
+    when = ", ".join(f"{d[:4]}-{d[4:6]}-{d[6:]}" for d in info["measured"]) or "date unknown"
+    return f"headset {info['serial']}, panels {' and '.join(info['panels']) or 'unknown'}, measured {when}"
+
+
+def spud_save(serial, data):
+    """Writes the file in one step (a failed write leaves the one there); returns (path, 'saved'|'unchanged')."""
+    path = spud_path(serial)
+    try:
+        with open(path, "rb") as f:
+            if hashlib.sha256(f.read()).digest() == hashlib.sha256(data).digest():
+                return path, "unchanged"
+    except OSError:
+        pass
+    os.makedirs(spud_dir(), mode=0o700, exist_ok=True)
+    tmp = f"{path}.tmp-riftlinux"
+    with open(tmp, "wb") as f:
+        f.write(data)
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(tmp, path)
+    return path, "saved"
+
+
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None  # each request stays on the address it was made for
+
+
+def spud_get(url, headers, limit):
+    """GET with exactly these headers (no User-Agent): (None, body), or (what went wrong, None)."""
+    opener = urllib.request.build_opener(_NoRedirect)
+    opener.addheaders = []
+    try:
+        with opener.open(urllib.request.Request(url, headers=headers), timeout=45) as r:
+            data = r.read(limit + 1)
+            if r.status != 200:
+                return f"HTTP {r.status}", None
+            if len(data) > limit:
+                return "the answer was larger than a SPUD file can be", None
+            return None, data
+    except urllib.error.HTTPError as e:
+        code = None
+        try:
+            code = json.loads(e.read(65536)).get("error", {}).get("code")
+        except (ValueError, AttributeError, OSError):
+            pass
+        e.close()
+        return f"HTTP {e.code}" + (f", error {code}" if isinstance(code, int) else ""), None
+    except (urllib.error.URLError, OSError):
+        return "no connection to Meta's servers", None
+
+
+# Panel uniformity: the compositor reads the headset's calibration, HMD_<serial>.rlspudc ("RLSPUDC1", a JSON manifest,
+# then the maps: per eye three response maps and one per-pixel map, packed as the Oculus software packs them in its
+# prepared cache). This tool builds it from the headset's factory measurement (.spud, above); a Windows install's
+# prepared cache (HMD_<serial>.mashed) can be imported instead.
+CAL_MAGIC = b"RLSPUDC1"
+CAL_FORMAT = "riftlinux-spud-calibration"
+CAL_VERSION = 1           # imported calibrations (maps packed as bytes with a scale and offset)
+CAL_OWN_VERSION = 2       # RiftLinux's own calibrations (maps as half floats)
+CAL_BUILDER_VERSION = 3
+CACHE_SIZE = 10446152
+CAL_RESPONSE_W, CAL_RESPONSE_H, CAL_WALL_W, CAL_WALL_H = 54, 60, 1080, 1200
+# RiftLinux's calibration from the factory measurement. Colour: CIE 1976 u'v' to XYZ, panel RGB with the primaries the
+# headset's own EDID gives, white = the panel's measured white at its centre; target: SDR reference white 100 cd/m2 with
+# the EDID's gamma 2.2, the same for both eyes. Smoothing from the measurement's noise (grey 12 is the noisiest, 3-5 %
+# per block: 1.4 blocks brings it near 1 %).
+CAL_PRIMARIES = ((0.665, 0.334), (0.250, 0.711), (0.139, 0.050))
+CAL_GAMMA = 2.2
+CAL_REFERENCE_WHITE = 100.0
+CAL_SMOOTH_BLOCKS = 1.4
+CAL_WHITE_DISC_BLOCKS = 8
+# Per pixel: each pixel against its local level (Gaussian, 13 pixels); measurement defects are regions departing from
+# the block-scale level (Gaussian, one block = 20 pixels) by more than 2.5 times the local spread, at least 4 connected
+# pixels on the same side; grown by a pixel and refilled from the nearest 12 good pixels.
+CAL_PIXEL_SIGMA = 13.0
+CAL_BLOCK_SIGMA = 20.0
+CAL_DEFECT_SPREADS = 2.5
+CAL_DEFECT_MIN_PIXELS = 4
+CAL_DEFECT_FILL = 12
+# Grey levels of the response maps the method has been checked on against a Windows-prepared calibration.
+CAL_LEVELS = (12, 25, 35, 90)
+
+
+def _cal_map(z, names, key, w, h):
+    """One measurement map: (value per byte 0..255, the bytes)."""
+    name = names.get(key)
+    if not isinstance(name, str):
+        raise ValueError(f"its map {key} is missing")
+    try:
+        b = z.read("Global/" + name)
+    except KeyError as e:
+        raise ValueError(f"its map {key} is missing") from e
+    if len(b) != 20 + w * h or struct.unpack_from("<III", b, 0) != (1, w, h):
+        raise ValueError(f"its map {key} is not the size and version the Rift CV1's are")
+    lo, hi = struct.unpack_from("<ff", b, 12)
+    if not (math.isfinite(lo) and math.isfinite(hi)) or hi < lo:
+        raise ValueError(f"its map {key} has no valid range")
+    step = (hi - lo) / 255.0
+    return [lo + q * step for q in range(256)], b[20:]
+
+
+def _cal_kernel(sigma, r):
+    g = [math.exp(-(i * i) / (2.0 * sigma * sigma)) for i in range(-r, r + 1)]
+    s = sum(g)
+    return [v / s for v in g]
+
+
+def _cal_blur(a, w, h, sigma):
+    """Gaussian over a block map, zero outside it, divided by the kernel weight inside (edges keep their level)."""
+    r = math.ceil(3 * sigma)
+    g, k = _cal_kernel(sigma, r), 2 * r + 1
+
+    def along(src, n, m, si, sj):
+        out = [0.0] * (w * h)
+        for i in range(n):
+            for j in range(m):
+                acc = 0.0
+                for t in range(max(0, r - j), min(k, m + r - j)):
+                    acc += g[t] * src[i * si + (j + t - r) * sj]
+                out[i * si + j * sj] = acc
+        return out
+    num = along(along(a, h, w, w, 1), w, h, 1, w)
+    den = along(along([1.0] * (w * h), h, w, w, 1), w, h, 1, w)
+    return [x / d for x, d in zip(num, den)]
+
+
+def _cal_inv3(m):
+    (a, b, c), (d, e, f), (g, h, i) = m
+    co = [[e * i - f * h, c * h - b * i, b * f - c * e],
+          [f * g - d * i, a * i - c * g, c * d - a * f],
+          [d * h - e * g, b * g - a * h, a * e - b * d]]
+    det = a * co[0][0] + b * co[1][0] + c * co[2][0]
+    return [[v / det for v in row] for row in co]
+
+
+def _cal_xyz(x, y):
+    return (x / y, 1.0, (1.0 - x - y) / y)
+
+
+def _cal_response(level_map, side, levels):
+    """Response knots [colour][level], each a 54 x 60 block map: the panel's light at each grey level as panel RGB
+    relative to the reference white, gamma encoded: the input level each block shows at that drive."""
+    w, h = CAL_RESPONSE_W, CAL_RESPONSE_H
+    centre = [y * w + x for y in range(h) for x in range(w)
+              if math.hypot(y - (h - 1) / 2, x - (w - 1) / 2) <= CAL_WHITE_DISC_BLOCKS]
+    u, v = (math.fsum(m[i] for i in centre) / len(centre) for m in (level_map(f"{side}255U"), level_map(f"{side}255V")))
+    d = 6.0 * u - 16.0 * v + 12.0
+    if v <= 0 or d <= 0:
+        raise ValueError("its white measurement has no valid colour")
+    white = _cal_xyz(9.0 * u / d, 4.0 * v / d)
+    P = [[_cal_xyz(*p)[r] for p in CAL_PRIMARIES] for r in range(3)]  # columns: the primaries
+    s = [sum(row[c] * white[c] for c in range(3)) for row in _cal_inv3(P)]
+    M = _cal_inv3([[P[r][c] * s[c] for c in range(3)] for r in range(3)])  # XYZ -> panel RGB, white (1, 1, 1)
+    knots = [[None] * len(levels) for _ in range(3)]
+    for li, level in enumerate(levels):
+        Y, U, V = (_cal_blur(level_map(f"{side}{level:03d}{x}"), w, h, CAL_SMOOTH_BLOCKS) for x in ("", "U", "V"))
+        out = [[], [], []]
+        for y_, u_, v_ in zip(Y, U, V):
+            v_ = max(v_, 1e-6)
+            XYZ = (9.0 * u_ * y_ / (4.0 * v_) / CAL_REFERENCE_WHITE, y_ / CAL_REFERENCE_WHITE,
+                   (12.0 - 3.0 * u_ - 20.0 * v_) * y_ / (4.0 * v_) / CAL_REFERENCE_WHITE)
+            for c in range(3):
+                light = M[c][0] * XYZ[0] + M[c][1] * XYZ[1] + M[c][2] * XYZ[2]
+                out[c].append(max(light, 0.0) ** (1.0 / CAL_GAMMA))
+        for c in range(3):
+            if not all(math.isfinite(x) for x in out[c]):
+                raise ValueError("its grey measurements do not give a valid response")
+            knots[c][li] = out[c]
+    return knots
+
+
+def _cal_fields(n, w):
+    """The w 64-bit fields of a packed row, as a list of ints."""
+    return memoryview((n & ((1 << (64 * w)) - 1)).to_bytes(8 * w, "little")).cast("Q").tolist()
+
+
+def _cal_gauss(rows, w, h, G, edge):
+    """Separable Gaussian (integer weights G) over rows packed as big integers, a 64-bit field per pixel: each multiply
+    or add works on a whole row at once. edge: rows packed with r repeated border pixels each side, border rows
+    repeated; else zero outside the map (rows unpadded)."""
+    r = len(G) // 2
+    out = []
+    for y in range(h):
+        col = G[r] * rows[y]
+        for d in range(1, r + 1):
+            a, b = y - d, y + d
+            if edge:
+                col += G[r + d] * (rows[max(a, 0)] + rows[min(b, h - 1)])
+            elif a >= 0 and b < h:
+                col += G[r + d] * (rows[a] + rows[b])
+            elif a >= 0:
+                col += G[r + d] * rows[a]
+            elif b < h:
+                col += G[r + d] * rows[b]
+        p = col if edge else col << (64 * r)
+        acc = G[r] * (p >> (64 * r))
+        for d in range(1, r + 1):
+            acc += G[r + d] * ((p >> (64 * (r - d))) + (p >> (64 * (r + d))))
+        out.append(_cal_fields(acc, w))
+    return out
+
+
+def _cal_wall(values, q):
+    """Per-pixel corrections (rows of floats) from one single-pixel measurement (value per byte, the bytes): each
+    pixel's local level minus its measurement, with the measurement's defects refilled first."""
+    w, h = CAL_WALL_W, CAL_WALL_H
+    clamped = [max(v, 0.0) for v in values]  # below zero light is measurement noise
+    one = 1 << 24                             # values in integers: * 2^24 (well below a millionth of a level)
+    chunk = [round(v * one).to_bytes(8, "little") for v in clamped]
+    rowbytes = [q[y * w:(y + 1) * w] for y in range(h)]
+
+    # Local level: Gaussian of 13 pixels, border pixels repeated.
+    r = math.ceil(3 * CAL_PIXEL_SIGMA)
+    G = [round(v * (1 << 20)) for v in _cal_kernel(CAL_PIXEL_SIGMA, r)]
+    padded = [int.from_bytes(chunk[row[0]] * r + b"".join(chunk[b] for b in row) + chunk[row[-1]] * r, "little")
+              for row in rowbytes]
+    total = sum(G) ** 2 * one
+    local = [[s / total for s in row] for row in _cal_gauss(padded, w, h, G, True)]
+    del padded
+
+    # Departure from the block-scale level and its local spread (Gaussian of one block, zero outside the map, divided
+    # by the weight inside).
+    rb = math.ceil(3 * CAL_BLOCK_SIGMA)
+    Gb = [round(v * (1 << 20)) for v in _cal_kernel(CAL_BLOCK_SIGMA, rb)]
+    edge = [sum(Gb[rb + d] for d in range(-rb, rb + 1) if 0 <= i + d < n) for n in (h, w) for i in range(n)]
+    wy, wx = edge[:h], edge[h:]
+    plain = [int.from_bytes(b"".join(chunk[b] for b in row), "little") for row in rowbytes]
+    level = _cal_gauss(plain, w, h, Gb, False)
+    del plain
+    dep, squares = [], []
+    for y in range(h):
+        f = 1.0 / (wy[y] * float(one))
+        e = [clamped[b] - s * f / wxx for b, s, wxx in zip(rowbytes[y], level[y], wx)]
+        dep.append(e)
+        squares.append(int.from_bytes(struct.pack(f"<{w}Q", *[round(v * v * (1 << 28)) for v in e]), "little"))
+    del level
+    spread = _cal_gauss(squares, w, h, Gb, False)
+    del squares
+    cand = {}
+    k2 = CAL_DEFECT_SPREADS ** 2
+    for y in range(h):
+        f = k2 / (wy[y] * float(1 << 28))
+        e = dep[y]
+        for x, (v, s, wxx) in enumerate(zip(e, spread[y], wx)):
+            if v * v > s * f / wxx:
+                cand[y * w + x] = v > 0
+    del spread, dep
+
+    # Defects: connected groups (8 neighbours, the same side) of at least CAL_DEFECT_MIN_PIXELS, grown by a pixel.
+    masked = bytearray(w * h)
+    seen = set()
+    for start, side in cand.items():
+        if start in seen:
+            continue
+        group, todo = [], [start]
+        seen.add(start)
+        while todo:
+            i = todo.pop()
+            group.append(i)
+            y, x = divmod(i, w)
+            for dy in (-1, 0, 1):
+                for dx in (-1, 0, 1):
+                    if (dy or dx) and 0 <= y + dy < h and 0 <= x + dx < w:
+                        j = i + dy * w + dx
+                        if j not in seen and cand.get(j) is side:
+                            seen.add(j)
+                            todo.append(j)
+        if len(group) >= CAL_DEFECT_MIN_PIXELS:
+            for i in group:
+                y, x = divmod(i, w)
+                for yy in range(max(y - 1, 0), min(y + 2, h)):
+                    for xx in range(max(x - 1, 0), min(x + 2, w)):
+                        masked[yy * w + xx] = 1
+    del cand, seen
+
+    # Refill: each masked pixel takes the mean of the good pixels in the smallest square around it holding at least
+    # CAL_DEFECT_FILL of them.
+    delta = [[a - clamped[b] for a, b in zip(local[y], rowbytes[y])] for y in range(h)]
+    for i in (i for i, m in enumerate(masked) if m):
+        y, x = divmod(i, w)
+        for rad in range(1, max(w, h)):
+            vals = [clamped[q[yy * w + xx]] for yy in range(max(y - rad, 0), min(y + rad + 1, h))
+                    for xx in range(max(x - rad, 0), min(x + rad + 1, w)) if not masked[yy * w + xx]]
+            if len(vals) >= CAL_DEFECT_FILL:
+                delta[y][x] = local[y][x] - math.fsum(vals) / len(vals)
+                break
+    return delta
+
+
+def calibration_levels(cfg):
+    """(the four grey levels of the response maps, whether this measurement's layout is the one the method has been
+    checked on, what differs) from a measurement's SpudCfg.json; ValueError when it cannot be built at all."""
+    if not isinstance(cfg, dict) or cfg.get("Spud Version") != "3.0":
+        raise ValueError("it is a version of the factory measurement this tool does not know")
+    tables = cfg.get("Global") if isinstance(cfg.get("Global"), dict) else {}
+    spud, wall = tables.get("Spud"), tables.get("SpudWall")
+    if not isinstance(spud, dict) or not isinstance(wall, dict) or spud.get("Enabled") != 1 or wall.get("Enabled") != 1:
+        raise ValueError("its panel measurements are not enabled in it")
+    if spud.get("Rotated") or wall.get("Rotated"):
+        raise ValueError("its maps are rotated, a layout this tool does not know")
+    differs = []
+    for side in ("Left ", "Right"):
+        if any(not isinstance(wall.get(side + "025" + c), str) for c in "RGB"):
+            raise ValueError("its per-pixel measurements are missing")
+    extra = sorted({k[5:] for k in wall if k not in ("Enabled", "Rotated") and k[5:] not in ("025R", "025G", "025B")})
+    if extra:
+        differs.append("per-pixel measurements " + ", ".join(extra) + " not used")
+    measured = tuple(sorted(int(k[5:8]) for k in spud if len(k) == 8 and k[:5] == "Left " and k[5:8].isdigit() and
+                            all(isinstance(spud.get(s + k[5:8] + x), str) for s in ("Left ", "Right") for x in ("", "U", "V"))))
+    below = tuple(l for l in measured if 0 < l < 255)
+    if 255 not in measured or len(below) < 4:
+        raise ValueError("its grey measurements (" + ", ".join(map(str, measured)) + ") are not enough for a calibration")
+    # The four lowest grey levels below white (12, 25, 35, 90 of a CV1 measured 12, 25, 35, 90, 180, 255).
+    levels = below[:4]
+    if levels != CAL_LEVELS:
+        differs.append("grey levels " + ", ".join(map(str, levels)))
+    return levels, not differs, differs
+
+
+def calibration_build(spud_data):
+    """(blobs, layout) of RiftLinux's calibration built from a factory measurement's bytes: per eye the response knots
+    (colour, level, row, column; little-endian floats) and the per-pixel corrections (channel, row, column;
+    little-endian half floats);
+    ValueError when the measurement lacks what it needs."""
+    try:
+        z = zipfile.ZipFile(io.BytesIO(spud_data))
+        cfg = json.loads(z.read("SpudCfg.json"))
+    except Exception as e:
+        raise ValueError("not a SPUD file") from e
+    levels, checked, differs = calibration_levels(cfg)
+    spud, wallcfg = cfg["Global"]["Spud"], cfg["Global"]["SpudWall"]
+    blobs = []
+    for e, side in enumerate(("Left ", "Right")):
+        def level_map(key):
+            values, q = _cal_map(z, spud, key, CAL_RESPONSE_W, CAL_RESPONSE_H)
+            return [values[b] for b in q]
+        knots = _cal_response(level_map, side, levels)
+        flat = [v for c in range(3) for li in range(len(levels)) for v in knots[c][li]]
+        blobs.append((f"eye{e}.response", struct.pack(f"<{len(flat)}f", *flat)))
+        planes = []
+        for c in range(3):
+            values, q = _cal_map(z, wallcfg, side + "025" + "RGB"[c], CAL_WALL_W, CAL_WALL_H)
+            delta = _cal_wall(values, q)
+            planes.append(b"".join(struct.pack(f"<{CAL_WALL_W}e", *row) for row in delta))
+        blobs.append((f"eye{e}.pixel", b"".join(planes)))
+    return blobs, {"drive_shades": list(levels) + [255], "layout_checked": checked, "layout_differences": differs}
+
+
+UNIFORMITY_TUNING = {  # action: (settings key in "uniformity", default %, what it is)
+    "strength": ("strength", 100, "of the full correction"),
+    "near-black": ("near_black", 60, "of it on the darkest greys (full from level 25 up; 60 chosen by eye)"),
+}
+
+
+def calibration_path(serial):
+    return os.path.join(spud_dir(), f"HMD_{serial}.rlspudc")
+
+
+def prepared_cache_read(data):
+    """The Oculus software's prepared cache (HSAM version 9): (eyes, payloads); ValueError for anything else."""
+    import math as _m
+    if len(data) != CACHE_SIZE or data[:4] != b"HSAM":
+        raise ValueError("not a prepared SPUD cache of the Rift CV1")
+    u32 = lambda o: struct.unpack_from("<I", data, o)[0]
+    if u32(4) != 9 or u32(8) != 0 or tuple(u32(12 + 4 * i) for i in range(5)) != (12, 25, 35, 90, 255):
+        raise ValueError("a version of the cache this tool does not know")
+    if u32(32) & ~0xF:
+        raise ValueError("its channel mask does not read right")
+    eyes, blobs, pos = [], [], 392
+    for e in range(2):
+        b = 40 + 176 * e
+        if (u32(b), u32(b + 4), u32(b + 128), u32(b + 132)) != (54, 60, 1080, 1200):
+            raise ValueError("its maps are not the CV1's sizes")
+        f = lambda o, n: list(struct.unpack_from(f"<{n}f", data, b + o))
+        eye = {"rs": f(32, 12), "ro": f(80, 12), "ws": f(144, 4), "wo": f(160, 4)}
+        if not all(_m.isfinite(v) for k in eye for v in eye[k]):
+            raise ValueError("its constants are not finite")
+        eyes.append(eye)
+        for ch in "RGB":
+            blobs.append((f"eye{e}.response.{ch}", data[pos:pos + 12960]))
+            pos += 12960
+        blobs.append((f"eye{e}.wall", data[pos:pos + 5184000]))
+        pos += 5184000
+    if pos != len(data):
+        raise ValueError("its size does not match its contents")
+    return eyes, blobs, u32(32)
+
+
+def cache_matches_spud(blobs, spud_data):
+    """Correlation of the cache's per-pixel map with the factory per-pixel measurement (left eye, green, sampled):
+    strongly negative when the cache was prepared from this headset's measurement."""
+    try:
+        with zipfile.ZipFile(io.BytesIO(spud_data)) as z:
+            cfg = json.loads(z.read("SpudCfg.json"))
+            name = ((cfg.get("Global") or {}).get("SpudWall") or {}).get("Left 025G")
+            raw = z.read("Global/" + name)
+    except Exception:
+        return None
+    _, w, h = struct.unpack_from("<III", raw, 0)
+    if (w, h) != (1080, 1200):
+        return None
+    wall = dict(blobs)["eye0.wall"]
+    # Differences between neighbouring pixels: the pixel-scale pattern, without the panel's broad brightness changes.
+    xs, ys = [], []
+    for y in range(100, 1100, 7):
+        for x in range(100, 980, 7):
+            xs.append(raw[20 + y * w + x + 1] - raw[20 + y * w + x])
+            ys.append(wall[(y * w + x + 1) * 4 + 1] - wall[(y * w + x) * 4 + 1])
+    n = len(xs)
+    mx, my = sum(xs) / n, sum(ys) / n
+    sxy = sum((a - mx) * (b - my) for a, b in zip(xs, ys))
+    sxx = sum((a - mx) ** 2 for a in xs)
+    syy = sum((b - my) ** 2 for b in ys)
+    return sxy / (sxx * syy) ** 0.5 if sxx > 0 and syy > 0 else None
+
+
+def calibration_save(serial, cache_data, association):
+    """Writes HMD_<serial>.rlspudc from a prepared cache's bytes; returns its path."""
+    eyes, blobs, mask = prepared_cache_read(cache_data)
+    return calibration_write(serial, eyes, blobs, mask, association, {
+        "kind": "imported-prepared-cache", "importer_version": 1, "source_format": "HSAM", "source_version": 9,
+        "source_mode": 0, "source_size": len(cache_data), "source_sha256": hashlib.sha256(cache_data).hexdigest(),
+        "source_unresolved_header_field": struct.unpack_from("<I", cache_data, 36)[0]})
+
+
+def calibration_build_save(serial, spud_data):
+    """Builds HMD_<serial>.rlspudc (RiftLinux's own calibration, format 2) from the headset's factory measurement;
+    returns its path. ValueError if it can't."""
+    blobs, layout = calibration_build(spud_data)
+    digest = hashlib.sha256(spud_data).hexdigest()
+    entries, pos = [], 0
+    for name, b in blobs:
+        entries.append({"name": name, "offset": pos, "length": len(b), "sha256": hashlib.sha256(b).hexdigest()})
+        pos += len(b)
+    manifest = {
+        "format": CAL_FORMAT, "format_version": CAL_OWN_VERSION, "headset_serial": serial,
+        "headset_association": {"method": "built from headset " + serial + "'s factory measurement (the serial in it)",
+                                "factory_measurement_sha256": digest},
+        "preparation": {"kind": "built-from-factory-measurement", "builder_version": CAL_BUILDER_VERSION,
+                        "source_format": "SPUD", "source_size": len(spud_data), "source_sha256": digest,
+                        "layout_checked": layout["layout_checked"], "layout_differences": layout["layout_differences"],
+                        "method": {"primaries": "headset EDID", "white": f"centre disc {CAL_WHITE_DISC_BLOCKS} blocks",
+                                   "reference_white_cd_m2": CAL_REFERENCE_WHITE, "gamma": CAL_GAMMA,
+                                   "smoothing_blocks": CAL_SMOOTH_BLOCKS, "pixel_sigma": CAL_PIXEL_SIGMA,
+                                   "defects": {"block_sigma": CAL_BLOCK_SIGMA, "spreads": CAL_DEFECT_SPREADS,
+                                               "min_pixels": CAL_DEFECT_MIN_PIXELS, "fill": CAL_DEFECT_FILL}}},
+        "drive_shades": layout["drive_shades"],
+        "response": {"width": CAL_RESPONSE_W, "height": CAL_RESPONSE_H, "encoding": "float32",
+                     "order": "colour RGB, level, row, column"},
+        "pixel": {"width": CAL_WALL_W, "height": CAL_WALL_H, "encoding": "float16",
+                  "order": "channel RGB, row, column"},
+        "blobs": entries,
+    }
+    return calibration_store(serial, manifest, [b for _, b in blobs])
+
+
+def calibration_store(serial, manifest, body):
+    """Writes HMD_<serial>.rlspudc: magic, manifest length, JSON manifest, blobs (whole, then renamed)."""
+    text = json.dumps(manifest, indent=1, sort_keys=True).encode("utf-8")
+    path = calibration_path(serial)
+    os.makedirs(spud_dir(), exist_ok=True)
+    tmp = f"{path}.tmp-riftlinux"
+    with open(tmp, "wb") as f:
+        f.write(CAL_MAGIC + struct.pack("<I", len(text)) + text + b"".join(body))
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(tmp, path)
+    return path
+
+
+def calibration_info(serial):
+    """The manifest's preparation of headset serial's kept calibration ({} when there is none or it can't be read)."""
+    try:
+        with open(calibration_path(serial), "rb") as f:
+            head = f.read(12)
+            if head[:8] != CAL_MAGIC:
+                return {}
+            m = json.loads(f.read(struct.unpack_from("<I", head, 8)[0]))
+        prep = m.get("preparation")
+        return prep if isinstance(prep, dict) and m.get("headset_serial") == serial else {}
+    except (OSError, ValueError, struct.error):
+        return {}
+
+
+def calibration_write(serial, eyes, blobs, mask, association, preparation, shades=(12, 25, 35, 90, 255)):
+    """Writes HMD_<serial>.rlspudc (whole, then renamed); returns its path."""
+    entries, body, pos = [], [], 0
+    for name, b in blobs:
+        entries.append({"name": name, "offset": pos, "length": len(b), "sha256": hashlib.sha256(b).hexdigest()})
+        body.append(b)
+        pos += len(b)
+    manifest = {
+        "format": CAL_FORMAT, "format_version": CAL_VERSION, "headset_serial": serial,
+        "headset_association": association, "preparation": preparation,
+        "drive_shades": list(shades), "wall_channel_mask": mask,
+        "eyes": [{"response": {"width": 54, "height": 60, "channels": "RGB", "components": "levels 12,25,35,90",
+                               "scales_level_major": e["rs"], "offsets_level_major": e["ro"]},
+                  "wall": {"width": 1080, "height": 1200, "components": "RGBA", "scales": e["ws"], "offsets": e["wo"]}}
+                 for e in eyes],
+        "blobs": entries,
+    }
+    return calibration_store(serial, manifest, body)
+
+
+def uniformity_section(p):
+    d = load_settings(p).get("uniformity")
+    return d if isinstance(d, dict) else {}
+
+
+def uniformity_enabled(p):
+    """settings.json uniformity.enabled: True when the user switched it on (off by default)."""
+    return uniformity_section(p).get("enabled") is True
+
+
+def uniformity_tuning(p, action):
+    key, default, _what = UNIFORMITY_TUNING[action]
+    v = uniformity_section(p).get(key)
+    if isinstance(v, (int, float)) and not isinstance(v, bool):
+        return min(max(v, 0), 100)
+    return default
+
+
+def check_uniformity(p, opts):
+    title = "Panel uniformity (SPUD)"
+    on = uniformity_enabled(p)
+    serial = headset_serial()
+    tuned = [f"{a} {uniformity_tuning(p, a):g}%" for a, t in UNIFORMITY_TUNING.items() if uniformity_tuning(p, a) != t[1]]
+    switch = ("On" + (" (" + ", ".join(tuned) + ")" if tuned else "") + ": " if on else
+              "Off (the default; `riftlinux-setup uniformity on` switches it on): ")
+    have = calibrations_kept()
+    if serial and serial in have:
+        return result("uniformity", title, "info", switch + f"headset {serial}'s calibration is ready "
+                      f"({calibration_origin(serial)}).")
+    if have and not serial:
+        return result("uniformity", title, "info", switch + f"calibration kept for headset {', '.join(have)} (no "
+                      "headset connected now).")
+    spud = serial and os.path.exists(spud_path(serial))
+    return result("uniformity", title, "info", switch + (f"no calibration for headset {serial} yet: " if serial else
+                  "no calibration yet: ") + ("`riftlinux-setup uniformity build` makes it from the kept factory "
+                  "measurement." if spud else "`riftlinux-setup uniformity on` fetches the headset's factory "
+                  "measurement from Meta (it asks first and sends only the headset's serial; nothing is sent unless "
+                  "you run it) and builds the calibration from it."))
+
+
+def calibrations_kept():
+    return sorted(os.path.basename(f)[4:-8] for f in glob.glob(os.path.join(spud_dir(), "HMD_*.rlspudc")))
+
+
+def calibration_origin(serial):
+    prep = calibration_info(serial)
+    origin = {"built-from-factory-measurement": "built from its factory measurement",
+              "imported-prepared-cache": "imported from a Windows install"}.get(prep.get("kind"), "kept")
+    if prep.get("layout_checked") is False:
+        origin += ("; this headset's measurement has a layout (" + "; ".join(prep.get("layout_differences") or []) +
+                   ") the calibration has not been checked on yet")
+    return origin
+
+
+def calibration_outdated(serial):
+    """True when headset serial's calibration was built by an older builder than this tool's."""
+    prep = calibration_info(serial)
+    v = prep.get("builder_version")
+    return prep.get("kind") == "built-from-factory-measurement" and isinstance(v, int) and v < CAL_BUILDER_VERSION
+
+
+def calibration_make(serial, data=None):
+    """Builds headset serial's calibration from its kept factory measurement (or data); prints the outcome and
+    returns True when it is ready."""
+    try:
+        if data is None:
+            with open(spud_path(serial), "rb") as f:
+                data = f.read(SPUD_MAX_BYTES + 1)
+            spud_read(data, full=False)  # a kept file checked as a downloaded one is (size, entries) first
+        print(f"Building headset {serial}'s calibration from its factory measurement (this takes a moment) ...",
+              flush=True)
+        path = calibration_build_save(serial, data)
+    except Exception as e:  # any unreadable measurement: a clear message, never a traceback
+        print(f"No calibration built: {e}. A calibration kept before stays as it was.")
+        return False
+    running = [n for n in ("vrserver", "monado-service") if
+               subprocess.run(["pgrep", "-x", n], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).returncode == 0]
+    print(f"Built: {path.replace(HOME, '~', 1)}." + (" SteamVR or the runtime, running now, takes it at once while "
+          "panel uniformity is on." if running else ""))
+    prep = calibration_info(serial)
+    if prep.get("layout_checked") is False:
+        print("Note: this headset's measurement differs from the layout the calibration has been checked on (" +
+              "; ".join(prep.get("layout_differences") or []) + "). It is built the same way; if the picture looks "
+              "wrong with it, `riftlinux-setup uniformity off` and please report it.")
+    return True
+
+
+def calibration_compare(spud_data, cache_data):
+    """How RiftLinux's calibration built from a factory measurement compares with the calibration a Windows install
+    prepared for the same headset, in levels of 255: {mean, share above one level, largest} over the response knots and
+    the per-pixel corrections. ValueError when either can't be read or built."""
+    blobs, _layout = calibration_build(spud_data)
+    ours = dict(blobs)
+    cache_eyes, cache_blobs, _mask = prepared_cache_read(cache_data)
+    theirs = dict(cache_blobs)
+    w, h, rw, rh = CAL_WALL_W, CAL_WALL_H, CAL_RESPONSE_W, CAL_RESPONSE_H
+    total = count = above = 0
+    largest = 0.0
+    for e in range(2):
+        knots = memoryview(ours[f"eye{e}.response"]).cast("f")
+        for c in range(3):
+            packed = theirs[f"eye{e}.response.{'RGB'[c]}"]
+            for k in range(4):
+                s2, o2 = cache_eyes[e]["rs"][k * 3 + c], cache_eyes[e]["ro"][k * 3 + c]
+                mine = knots[(c * 4 + k) * rw * rh:(c * 4 + k + 1) * rw * rh]
+                for x, b in zip(mine, packed[k::4]):
+                    d = abs(x - (b * s2 / 255.0 + o2)) * 255.0
+                    total += d
+                    count += 1
+                    above += d > 1.0
+                    largest = max(largest, d)
+        pixel = ours[f"eye{e}.pixel"]
+        packed = theirs[f"eye{e}.wall"]
+        for c in range(3):
+            s2, o2 = cache_eyes[e]["ws"][c], cache_eyes[e]["wo"][c]
+            mine = struct.unpack_from(f"<{w * h}e", pixel, c * w * h * 2)
+            ds = [abs(x - (b * s2 / 255.0 + o2)) * 255.0 for x, b in zip(mine, packed[c::4])]
+            total += math.fsum(ds)
+            count += len(ds)
+            above += sum(1 for d in ds if d > 1.0)
+            largest = max(largest, max(ds))
+    return {"mean_levels": round(total / count, 4), "share_above_one_level": round(above / count, 6),
+            "largest_levels": round(largest, 3), "values": count}
+
+
+def write_uniformity(p, d):
+    s = load_settings(p)
+    if d:
+        s["uniformity"] = d
+    else:
+        s.pop("uniformity", None)
+    write_json(p.settings, s)
+
+
+def cmd_uniformity(p, opts):
+    if opts.action == "status":
+        report([check_uniformity(p, opts)], opts.json)
+        return 0
+    if opts.action in UNIFORMITY_TUNING:
+        key, default, what = UNIFORMITY_TUNING[opts.action]
+        value = opts.file
+        if value in (None, "status"):
+            print(f"Panel uniformity {opts.action}: {uniformity_tuning(p, opts.action):g}% ({what}; default {default}%).")
+            return 0
+        try:
+            number = default if value == "default" else float(value)
+        except ValueError:
+            print(f"Not a number: {value} (give 0 to 100, default or status).")
+            return 2
+        if not 0 <= number <= 100:
+            print(f"{value} is outside 0 to 100.")
+            return 2
+        d = uniformity_section(p)
+        if number == default:
+            d.pop(key, None)
+        else:
+            d[key] = int(number) if number == int(number) else number
+        write_uniformity(p, d)
+        print(f"Panel uniformity {opts.action}: {number:g}% ({what}; at once while it runs)." +
+              ("" if uniformity_enabled(p) else " Panel uniformity itself is off: `riftlinux-setup uniformity on`."))
+        return 0
+    if opts.serial and not spud_serial_ok(opts.serial):
+        print("A headset serial has letters and digits only.")
+        return 1
+    serial = opts.serial or headset_serial()
+    if opts.action in ("on", "off"):
+        d = uniformity_section(p)
+        if opts.action == "on":
+            have = calibrations_kept()
+            if serial and os.path.exists(spud_path(serial)) and (serial not in have or calibration_outdated(serial)):
+                if not calibration_make(serial):
+                    return 1
+            elif serial and serial not in have:
+                print(f"Panel uniformity needs headset {serial}'s factory measurement, which Meta keeps for every CV1.")
+                if spud_download(opts, serial) is None:
+                    print("Not switched on.")
+                    return 1
+            elif not serial and not have:
+                print("Not switched on: no Rift CV1 headset found on USB and no calibration kept. Connect the headset "
+                      "and run this again (its serial is read from it).")
+                return 1
+            d["enabled"] = True
+        else:
+            d.pop("enabled", None)
+        write_uniformity(p, d)
+        print("On: the panels are evened out with the headset's own factory calibration (at once while it runs)."
+              if opts.action == "on" else "Off: the panels as they are (at once while it runs).")
+        return 0
+    if opts.action == "build":
+        if not serial:
+            print("No Rift CV1 headset found on USB: connect it, or name its serial: riftlinux-setup uniformity build "
+                  "--serial <serial>")
+            return 1
+        if not os.path.exists(spud_path(serial)):
+            print(f"No factory measurement kept for headset {serial}: `riftlinux-setup uniformity download` fetches "
+                  "it from Meta and builds the calibration.")
+            return 1
+        return 0 if calibration_make(serial) else 1
+    if opts.action == "import":
+        if not opts.file:
+            print("Which file? riftlinux-setup uniformity import <file>: the headset's factory measurement "
+                  "(HMD_<serial>.spud), or the calibration a Windows install prepared "
+                  "(%LOCALAPPDATA%\\Oculus\\Spud\\HMD_<serial>.mashed)")
+            return 1
+        try:
+            with open(os.path.expanduser(opts.file), "rb") as f:
+                data = f.read(SPUD_MAX_BYTES + 1)
+        except OSError as e:
+            print(f"Not imported: {opts.file}: {e}. Nothing changed.")
+            return 1
+        if data[:4] == b"HSAM":
+            if not serial:
+                print("Not imported: the prepared calibration does not name its headset. Connect the headset, or name "
+                      "its serial: riftlinux-setup uniformity import <file> --serial <serial>. Nothing changed.")
+                return 1
+            try:
+                prepared_cache_read(data)
+            except ValueError as e:
+                print(f"Not imported: {opts.file}: {e}. Nothing changed.")
+                return 1
+            assoc = {"method": "imported for headset " + serial + (" (named)" if opts.serial else " (connected)")}
+            if os.path.exists(spud_path(serial)):
+                with open(spud_path(serial), "rb") as f:
+                    r = cache_matches_spud(prepared_cache_read(data)[1], f.read())
+                assoc["factory_measurement_sha256"] = hashlib.sha256(open(spud_path(serial), "rb").read()).hexdigest()
+                assoc["per_pixel_correlation_with_factory_measurement"] = r
+                if r is not None and r > -0.5:
+                    print(f"Not imported: this calibration does not match headset {serial}'s factory measurement "
+                          f"(correlation {r:+.2f}). Nothing changed.")
+                    return 1
+            comparison = None
+            if os.path.exists(spud_path(serial)):
+                print("Comparing it with the calibration built from the headset's factory measurement (this takes a "
+                      "moment) ...", flush=True)
+                try:
+                    with open(spud_path(serial), "rb") as f:
+                        comparison = calibration_compare(f.read(), data)
+                    assoc["comparison_with_calibration_built_on_linux"] = comparison
+                except (OSError, ValueError) as e:
+                    print(f"Not compared: {e}.")
+            path = calibration_save(serial, data, assoc)
+            print(f"Imported: headset {serial}'s calibration, {path.replace(HOME, '~', 1)}." +
+                  ("" if uniformity_enabled(p) else " `riftlinux-setup uniformity on` switches it on."))
+            if comparison:
+                print(f"The calibration RiftLinux builds from the factory measurement differs from it by "
+                      f"{comparison['mean_levels']:g} levels of 255 on average; "
+                      f"{100 * comparison['share_above_one_level']:.3f} % of its {comparison['values']} values by more "
+                      f"than one level, at most {comparison['largest_levels']:g}. "
+                      "(`riftlinux-setup uniformity build` uses the built one instead.)")
+            return 0
+        try:
+            if len(data) > SPUD_MAX_BYTES:
+                raise ValueError("larger than a SPUD file can be")
+            info = spud_read(data)
+        except ValueError as e:
+            print(f"Not imported: {opts.file}: {e}. Nothing changed.")
+            return 1
+        if serial and info["serial"] != serial:
+            print(f"Not imported: the file is for headset {info['serial']}, the connected headset is {serial}. "
+                  "Nothing changed.")
+            return 1
+        path, how = spud_save(info["serial"], data)
+        print(("Already kept: " if how == "unchanged" else "Imported: ") + f"{spud_describe(info)}, "
+              f"{path.replace(HOME, '~', 1)} (the factory measurement).")
+        if not calibration_make(info["serial"], data):
+            return 1
+        if not uniformity_enabled(p):
+            print("`riftlinux-setup uniformity on` switches it on.")
+        return 0
+    # download
+    if not serial:
+        print("No Rift CV1 headset found on USB: connect it (its serial is read from it). Without it, name the "
+              "serial yourself: riftlinux-setup uniformity download --serial <serial>")
+        return 1
+    if spud_download(opts, serial) is None:
+        return 1
+    if not uniformity_enabled(p):
+        print("`riftlinux-setup uniformity on` switches it on.")
+    return 0
+
+
+def spud_download(opts, serial):
+    """Asks, downloads headset serial's factory measurement from Meta, keeps it and builds the calibration from it;
+    prints each outcome. Returns the measurement's bytes, None when nothing was downloaded or built."""
+    print(f"This asks Meta's service (graph.oculus.com) for headset {serial}'s factory panel measurement and downloads "
+          "it from Meta's file servers (oculuscdn.com). Only the headset's serial is sent; no account is used.")
+    if not ask(opts, "Download it?"):
+        print("Nothing downloaded." + ("" if sys.stdin.isatty() else " (Add --yes to download without a question.)"))
+        return None
+    err, body = spud_get(SPUD_LOOKUP + "?" + urllib.parse.urlencode({"serial": serial}),
+                         {"Authorization": SPUD_CALLER}, 1024 * 1024)
+    if err:
+        print(f"Meta's service did not answer as expected ({err}). Nothing changed; try again later.")
+        return None
+    try:
+        rows = json.loads(body).get("data") or []
+        uri = next(r["download_uri"] for r in rows if isinstance(r, dict) and r.get("serial") == serial)
+        u = urllib.parse.urlsplit(uri)
+        host = u.hostname or ""
+        if u.scheme != "https" or u.username or u.password or u.port not in (None, 443) or \
+                not (host == "oculuscdn.com" or host.endswith(".oculuscdn.com")):
+            raise ValueError("unexpected download address")
+    except StopIteration:
+        print(f"Meta has no measurement file for headset {serial}. Nothing changed.")
+        return None
+    except (ValueError, KeyError, TypeError, AttributeError):
+        print("Meta's service answered in a form this tool does not know. Nothing changed.")
+        return None
+    err, data = spud_get(uri, {}, SPUD_MAX_BYTES)
+    if err:
+        print(f"The download did not complete ({err}). Nothing changed; try again later.")
+        return None
+    try:
+        info = spud_read(data)
+        if info["serial"] != serial:
+            raise SpudError(f"it is for headset {info['serial']}")
+    except ValueError as e:
+        print(f"The downloaded file was not kept: {e}. Nothing changed.")
+        return None
+    path, how = spud_save(serial, data)
+    print(("Already up to date: " if how == "unchanged" else "Downloaded: ") + f"{spud_describe(info)}, "
+          f"{path.replace(HOME, '~', 1)} (the factory measurement).")
+    return data if calibration_make(serial, data) else None
+
+
 CHECKS = [check_arch, check_steam, check_steam_runtime, check_package, check_registered, check_other_drivers, check_sandboxed, check_nvidia_vrr, check_lsfg_vk, check_ipd, check_controller_alignment, check_controller_coast, check_enabled, check_devices,
           check_lsusb, check_access, check_hid_bound, check_usb_power, check_holders, check_headset_mode, check_display, check_priority,
           check_openvr_runtime, check_steamvr_launch, check_steamvr_tool, check_env_overrides, check_launch_options,
           check_leaked_handles, check_steamvr_home_leftover, check_test_leftovers, check_proton_probe,
           check_watchdog_loaded, check_openxr, check_chaperone,
-          check_settings, check_realtime, check_calibration, check_native]
+          check_settings, check_realtime, check_calibration, check_uniformity, check_native]
 REPAIR = {"enabled", "priority", "room", "settings", "registered", "others", "sandboxed", "usbpower", "lsusb", "launch",
           "hidbind", "steamruntime"}
 
@@ -3652,6 +4576,11 @@ def main():
     nw.add_argument("minutes", nargs="?")
     pp = sub.add_parser("pair")
     pp.add_argument("--timeout", type=int, default=90)
+    mu = sub.add_parser("uniformity")
+    mu.add_argument("action", choices=["status", "on", "off", "download", "build", "import", "strength", "near-black"])
+    mu.add_argument("file", nargs="?")
+    mu.add_argument("--serial")
+    mu.add_argument("--yes", action="store_true", default=argparse.SUPPRESS)
     opts = ap.parse_args()
     p = Paths(opts.package)
     if opts.cmd == "check":
@@ -3700,6 +4629,8 @@ def main():
         return cmd_display_off(p, opts)
     if opts.cmd == "not-worn":
         return cmd_not_worn(p, opts)
+    if opts.cmd == "uniformity":
+        return cmd_uniformity(p, opts)
     return cmd_uninstall(p, opts)
 
 

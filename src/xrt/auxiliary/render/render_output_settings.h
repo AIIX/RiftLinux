@@ -62,6 +62,18 @@ struct render_output_settings
 
 	//! A single projection layer read by the lens pass directly (comp_compositor.c); off: the layer renderer first.
 	bool fast_path;
+
+	//! Supersample filter: each panel pixel averages the source image over its footprint, so an image larger than the
+	//! panel (supersampling) is shrunk without shimmer; off: one bilinear sample (fine lines shimmer when shrunk).
+	bool supersample_filter;
+
+	//! Panel uniformity (settings.json "uniformity"): each panel's uneven brightness and colour evened out with the
+	//! headset's own factory calibration (render_mura.c); only where it is loaded. Off by default.
+	bool mura_correction;
+	//! Its strength, 0..1 (1: the full correction, as the calibration asks).
+	float mura_strength;
+	//! How much of it applies near black, 0..1: full from level 25 up, easing to this at black.
+	float mura_near_black;
 };
 
 /*!
@@ -75,6 +87,15 @@ render_output_settings_get(struct render_output_settings *out_settings);
  */
 void
 render_output_settings_set(const struct render_output_settings *settings);
+
+/*!
+ * One key of settings.json's "uniformity" section (enabled; strength and near_black in percent) into @p s, within its
+ * range. @p present false: the key is not in the file and its default is taken (riftlinux-setup uniformity off removes
+ * the switch). Returns false for any other key. Shared by the runtime's and the SteamVR driver's live settings, so both
+ * read them the same.
+ */
+bool
+render_output_settings_uniformity_key(struct render_output_settings *s, const char *key, bool present, double value);
 
 /*!
  * An HDR layer was composited at @p now_ns (one mapped as HDR more than half: HDR Bright acts on it). For the Rift

@@ -355,8 +355,15 @@ rift_get_radio_cmd_response(struct rift_hmd *hmd, bool wait, bool radio_hid)
 {
 	unsigned char buffer[REPORT_MAX_SIZE] = {0};
 	int result;
+	// A radio that never stops saying "busy" must not hold the thread forever (RiftLinux): about two seconds of
+	// asking, then a timeout.
+	int tries = 0;
 
 	do {
+		if (tries++ > 2000) {
+			HMD_ERROR(hmd, "HMD radio command still busy after %d tries", tries - 1);
+			return -ETIMEDOUT;
+		}
 		result = rift_get_report(hmd, radio_hid, FEATURE_REPORT_RADIO_CONTROL, buffer, sizeof(buffer));
 		if (result < 1) {
 			HMD_ERROR(hmd, "HMD radio command failed - response too small");

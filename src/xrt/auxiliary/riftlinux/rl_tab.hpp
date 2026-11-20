@@ -185,12 +185,15 @@ struct PictureRow
 	bool bright = false;
 	//! HDR content on screen now (the driver's "cmd-hdr-content"): HDR Bright acts on nothing else.
 	bool hdr_content = false;
+	//! Panel uniformity: the panels evened out with the headset's own factory calibration.
+	bool uniformity = false;
 
 	bool
 	operator==(const PictureRow &o) const
 	{
 		return direct == o.direct && on == o.on && strength == o.strength && colour == o.colour &&
-		       smoothing == o.smoothing && bright == o.bright && hdr_content == o.hdr_content;
+		       smoothing == o.smoothing && bright == o.bright && hdr_content == o.hdr_content &&
+		       uniformity == o.uniformity;
 	}
 };
 
@@ -293,6 +296,8 @@ enum class Ctl
 	Strength,
 	Colour,
 	Bright,
+	//! Panel uniformity (the headset's factory calibration).
+	Uniformity,
 	Smoothing,
 	StHeadset,
 	StLeft,
@@ -340,6 +345,7 @@ constexpr RowSpec kRows[] = {
     {4, Ctl::Recentre, Kind::Note, "button"},
     {2, Ctl::AutoHdr, Kind::Switch, "autohdr"},   {2, Ctl::Strength, Kind::Slider, "strength"},
     {2, Ctl::Colour, Kind::Slider, "colour"},     {2, Ctl::Bright, Kind::Switch, "bright"},
+    {2, Ctl::Uniformity, Kind::Switch, "uniformity"},
     {3, Ctl::Smoothing, Kind::Switch, "smoothing"},
     {5, Ctl::StHeadset, Kind::Info, "st-headset"},  {5, Ctl::StLeft, Kind::Info, "st-left"},
     {5, Ctl::StRight, Kind::Info, "st-right"},      {5, Ctl::StSensors, Kind::Info, "st-sensors"},
@@ -878,6 +884,7 @@ draw_card(Image &img, const Pieces &p, const Layout &L, const TabState &s, int c
 			draw_faded(img, status, ix0 + 26, sy, text_alpha);
 			break;
 		}
+		case Ctl::Uniformity: draw_switch(img, R.control, oy, pic.uniformity, enabled); break;
 		case Ctl::Smoothing: draw_switch(img, R.control, oy, pic.smoothing, enabled); break;
 		case Ctl::StHeadset:
 		case Ctl::StLeft:

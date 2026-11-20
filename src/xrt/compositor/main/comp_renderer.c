@@ -1514,6 +1514,10 @@ comp_renderer_draw(struct comp_renderer *r)
 	 */
 	renderer_wait_queue_idle(r);
 
+	// RiftLinux, panel uniformity: a calibration built or replaced while running (riftlinux-setup uniformity) is
+	// loaded here, with the queue idle: nothing in flight reads the maps it replaces.
+	render_mura_reload_if_changed(&c->nr, c->xdev->serial, os_monotonic_get_ns());
+
 	if (screenshot) {
 		renderer_screenshot(r, &frame_state, view_count);
 	}

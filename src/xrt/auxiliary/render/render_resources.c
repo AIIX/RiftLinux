@@ -252,12 +252,14 @@ create_compute_distortion_descriptor_set_layout(struct vk_bundle *vk,
                                                 uint32_t ubo_binding,
                                                 uint32_t previous_binding,
                                                 uint32_t hdr_stats_binding,
+                                                uint32_t mura_response_binding,
+                                                uint32_t mura_wall_binding,
                                                 uint32_t view_count,
                                                 VkDescriptorSetLayout *out_descriptor_set_layout)
 {
 	VkResult ret;
 
-	VkDescriptorSetLayoutBinding set_layout_bindings[6] = {
+	VkDescriptorSetLayoutBinding set_layout_bindings[8] = {
 	    {
 	        .binding = src_binding,
 	        .descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
@@ -293,6 +295,20 @@ create_compute_distortion_descriptor_set_layout(struct vk_bundle *vk,
 	        // HDR layers' histograms: the fast path measures its HDR layer (unused by clear.comp).
 	        .binding = hdr_stats_binding,
 	        .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
+	        .descriptorCount = 1,
+	        .stageFlags = VK_SHADER_STAGE_COMPUTE_BIT,
+	    },
+	    {
+	        // Mura correction's blocks (render_mura.c; unused by clear.comp).
+	        .binding = mura_response_binding,
+	        .descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
+	        .descriptorCount = 1,
+	        .stageFlags = VK_SHADER_STAGE_COMPUTE_BIT,
+	    },
+	    {
+	        // Mura correction's pixels (render_mura.c; unused by clear.comp).
+	        .binding = mura_wall_binding,
+	        .descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
 	        .descriptorCount = 1,
 	        .stageFlags = VK_SHADER_STAGE_COMPUTE_BIT,
 	    },
@@ -483,6 +499,8 @@ render_resources_init(struct render_resources *r,
 	r->compute.ubo_binding = 3;
 	r->compute.previous_binding = 4;
 	r->compute.hdr_stats_binding = 5;
+	r->compute.mura_response_binding = 6;
+	r->compute.mura_wall_binding = 7;
 
 	r->compute.layer.image_array_size =
 	    MIN(vk->limits.max_per_stage_descriptor_sampled_images, RENDER_MAX_IMAGES_SIZE);
@@ -776,7 +794,8 @@ render_resources_init(struct render_resources *r,
 	struct vk_descriptor_pool_info compute_pool_info = {
 	    .uniform_per_descriptor_count = 1,
 	    // layer images
-	    .sampler_per_descriptor_count = r->compute.layer.image_array_size + RENDER_DISTORTION_IMAGES_COUNT(r),
+	    // + the mura correction's two images (distortion only).
+	    .sampler_per_descriptor_count = r->compute.layer.image_array_size + RENDER_DISTORTION_IMAGES_COUNT(r) + 2,
 	    .storage_image_per_descriptor_count = 2, // Target, and the previous frame (output capture).
 	    .storage_buffer_per_descriptor_count = 1, // HDR layers' brightness histograms (layer squasher).
 	    .descriptor_count = compute_descriptor_count,
@@ -905,6 +924,8 @@ render_resources_init(struct render_resources *r,
 	    r->compute.ubo_binding,                            // ubo_binding,
 	    r->compute.previous_binding,                       // previous_binding,
 	    r->compute.hdr_stats_binding,                      // hdr_stats_binding,
+	    r->compute.mura_response_binding,                    // mura_response_binding,
+	    r->compute.mura_wall_binding,                    // mura_wall_binding,
 	    r->view_count,                                     // view_count
 	    &r->compute.distortion.descriptor_set_layout);     // out_descriptor_set_layout
 	VK_CHK_WITH_RET(ret, "create_compute_distortion_descriptor_set_layout", false);
@@ -1050,6 +1071,12 @@ render_resources_init(struct render_resources *r,
 	// RiftLinux, motion smoothing: without it everything else still works.
 	render_motion_init(r);
 
+	// RiftLinux, mura correction: neutral images until the headset's table is loaded (render_mura_load).
+	if (!render_mura_init(r)) {
+		U_LOG_E("Mura correction: its neutral images could not be made");
+		return false;
+	}
+
 	/*
 	 * Done
 	 */
@@ -1136,6 +1163,7 @@ render_resources_fini(struct render_resources *r)
 	}
 	render_buffer_fini(vk, &r->compute.distortion.ubo);
 
+	render_mura_fini(r);
 	vk_cmd_pool_destroy(vk, &r->distortion_pool);
 	D(CommandPool, r->cmd_pool);
 

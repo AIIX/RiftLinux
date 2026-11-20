@@ -46,6 +46,9 @@ defaults, and `riftlinux-setup fix` then checks the rest.
 | `riftlinux-setup display-off <seconds>\|never\|default\|status` | How long after the headset is taken off its display goes black (5 s by default, at least 1 s) | Next start |
 | `riftlinux-setup not-worn black [<minutes>\|never]\|off\|default\|status` | A headset taken off: its display kept on showing black, switched off after a while black (10 minutes by default, at least 1), or switched off at once | Next start |
 | `riftlinux-setup direct-mode on\|off\|status` | SteamVR's frames through RiftLinux's compositor (Auto-HDR, motion smoothing) or SteamVR's own | Next start |
+| `riftlinux-setup uniformity on\|off\|status` | Panel uniformity (0.1.6 pre-release): both panels evened out with your headset's own factory calibration, downloaded from Meta the first time ([The picture](picture.md#panel-uniformity)); off by default | At once |
+| `riftlinux-setup uniformity strength\|near-black <0-100>\|default\|status` | How much of panel uniformity is applied (100 % by default), and how much on the darkest greys (60 %) | At once |
+| `riftlinux-setup uniformity download\|build\|import <file>` | The factory measurement fetched again, the calibration built from it again, or one from a Windows install imported | At once |
 | `riftlinux-setup fix last-known` | A settings file that cannot be read: kept aside, and the last good one put back | Next start |
 | `riftlinux-setup record on\|off\|status` | Recording SteamVR sessions for a bug report ([Troubleshooting](troubleshooting.md#logs-and-reporting-a-problem)) | Next start |
 
@@ -216,6 +219,9 @@ longer. `riftlinux-setup wear-sensor on` turns it back on.
 
 ## When the headset is taken off
 
+When SteamVR or RiftLinux's runtime quits, the headset is switched off completely (display, headphones and tracking
+LEDs; from the 0.1.6 pre-release). While it runs:
+
 5 seconds after the headset is taken off its display goes black, and the moment it is on your head again the picture
 is back. The display stays switched on, showing pure black: an OLED panel gives no light then, and nothing is lit that
 could burn in. After 10 minutes black it switches off. Switching the display off takes the headset off its HDMI
@@ -278,6 +284,11 @@ the file has its default.
   },
   "display": {
     "direct_mode": true
+  },
+  "uniformity": {
+    "enabled": false,
+    "strength": 100,
+    "near_black": 60
   }
 }
 ```
@@ -302,6 +313,8 @@ the file has its default.
 | `headset.black_then_off_min` | `10` | With `"black"`: minutes black before the display switches off; negative: never |
 | `headset.ipd_mm` | not set (the slider) | The distance between your eyes set by hand, 50 to 80 mm, for a headset whose IPD slider is not read; `0` or not set follows the slider (`riftlinux-setup ipd`) |
 | `display.direct_mode` | `true` | SteamVR's frames through RiftLinux's compositor; `false`: SteamVR's own (`riftlinux-setup direct-mode`) |
+| `uniformity.enabled` | `false` | Panel uniformity (0.1.6 pre-release): both panels evened out with the headset's own factory calibration (`riftlinux-setup uniformity`, the Rift tab) |
+| `uniformity.strength`, `uniformity.near_black` | `100`, `60` | How much of it is applied, and how much on the darkest greys, in % |
 | `display.backdrop_blur` | `true` | RiftLinux's own runtime: frosted glass for the layers an application asks it for; `false`: those layers without it (`riftlinux-setup backdrop-blur`) |
 | `display.lsfg_vk` | `false` | lsfg-vk (Lossless Scaling's frame generation) kept out of SteamVR's server and RiftLinux's own runtime; `true`: allowed there as before (`riftlinux-setup lsfg-vk`) |
 

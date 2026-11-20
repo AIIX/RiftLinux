@@ -95,9 +95,9 @@ through its display lease, never as a desktop window. With NVIDIA and a VRR moni
 ## Which Linux distributions are supported? Does it work on a Steam Deck?
 
 Any x86-64 distribution that runs Steam: packages for Debian 12+ and Ubuntu 22.04+ (also Linux Mint, Pop!_OS), Arch,
-CachyOS, EndeavourOS and Manjaro, Fedora 43+, and a tarball for the rest. Tested in the headset on Ubuntu 25.04 and
-CachyOS; the packages are installed and checked in clean Debian, Ubuntu, Fedora and Arch systems for every release. A
-Steam Deck has not been tried. ARM computers are not supported by the packages.
+CachyOS, EndeavourOS and Manjaro (also in the AUR as `riftlinux-bin`), Fedora 43+, and a tarball for the rest. Tested
+in the headset on Ubuntu 25.04 and CachyOS; the packages are installed and checked in clean Debian, Ubuntu, Fedora and
+Arch systems for every release. A Steam Deck has not been tried. ARM computers are not supported by the packages.
 
 ## Does it work with AMD or Intel graphics?
 
@@ -115,6 +115,12 @@ Remote, its back button. Tested with both Touch controllers and the Oculus Remot
 
 Yes. Three sensors are tested: one placed behind you tracks the headset by the LEDs on the back of the headband, and
 the controllers, so you can turn all the way around. See [Sensors](sensors.md).
+
+## Does RiftLinux even out the panels' uneven brightness (mura), as the Oculus software does?
+
+Yes, from the 0.1.6 pre-release: **Panel uniformity** in the Rift tab (or `riftlinux-setup uniformity on`) uses your
+headset's own factory calibration, downloaded from Meta once, without a Meta account. It is off by default
+([The picture](picture.md#panel-uniformity)).
 
 ## Do Oculus Home, the Oculus Store, Dash or Guardian work?
 

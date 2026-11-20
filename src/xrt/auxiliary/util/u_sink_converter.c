@@ -375,13 +375,28 @@ from_MJPEG_to_frame(struct xrt_frame *dst_frame, size_t size, const uint8_t *dat
 
 	jpeg_start_decompress(&cinfo);
 
-	uint8_t *moving_ptr = dst_frame->data;
+	/*
+	 * The picture must fit the frame it is decoded into (RiftLinux): its size comes from the camera's data, the
+	 * frame's from the stream's settings, and a larger picture wrote past the frame.
+	 */
+	if (cinfo.output_width > dst_frame->width || cinfo.output_height > dst_frame->height ||
+	    (size_t)cinfo.output_width * (size_t)cinfo.output_components > dst_frame->stride ||
+	    (size_t)cinfo.output_height * dst_frame->stride > dst_frame->size) {
+		jpeg_abort_decompress(&cinfo);
+		jpeg_destroy_decompress(&cinfo);
+		return false;
+	}
 
-	uint32_t scanlines_read = 0;
-	while (scanlines_read < cinfo.image_height) {
-		int read_count = jpeg_read_scanlines(&cinfo, &moving_ptr, 16);
-		moving_ptr += read_count * dst_frame->stride;
-		scanlines_read += read_count;
+	// One row at a time: there is one row pointer (asked for up to 16 rows, the decoder could take the next rows'
+	// pointers from beyond it).
+	uint8_t *moving_ptr = dst_frame->data;
+	while (cinfo.output_scanline < cinfo.output_height) {
+		JSAMPROW row = moving_ptr;
+		JDIMENSION read_count = jpeg_read_scanlines(&cinfo, &row, 1);
+		if (read_count == 0) {
+			break;
+		}
+		moving_ptr += (size_t)read_count * dst_frame->stride;
 	}
 
 	jpeg_finish_decompress(&cinfo);

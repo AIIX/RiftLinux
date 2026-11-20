@@ -548,7 +548,8 @@ rift_sensor_thread_tick(struct rift_hmd *hmd)
 		struct dk2_in_report report;
 
 		// don't treat invalid IN reports as fatal, just ignore them
-		if (result < (int)sizeof(report)) {
+		// The report follows its id byte.
+		if (result < (int)sizeof(report) + 1) {
 			HMD_WARN(hmd, "Got malformed DK2 IN report with size %d", result);
 			break;
 		}
@@ -931,10 +932,19 @@ rift_read_led_model(struct rift_hmd *hmd)
 	    .min_leds_for_correspondence_search_with_prior = 5,
 	};
 
-	// minus one to get rid of the IMU, which is also in here
-	hmd->led_model.leds = U_TYPED_ARRAY_CALLOC(struct t_constellation_tracker_led, position_report.position_count);
+	/*
+	 * The table sized by the first report's count, and only that many read and stored (RiftLinux): each report read
+	 * below brings its own count, and a larger one wrote past the table.
+	 */
+	const uint32_t position_count = position_report.position_count;
+	hmd->led_model.leds = U_TYPED_ARRAY_CALLOC(struct t_constellation_tracker_led, position_count);
+	if (position_count == 0 || hmd->led_model.leds == NULL) {
+		HMD_ERROR(hmd, "No LED positions to read (count %u)", position_count);
+		result = -1;
+		goto read_led_model_err;
+	}
 
-	for (uint32_t i = 0; i < position_report.position_count; i++) {
+	for (uint32_t i = 0; i < position_count; i++) {
 		result = rift_get_position_calibration_report(hmd, &position_report);
 		if (result < 0) {
 			HMD_ERROR(hmd, "Failed to read position calibration report, reason %d", result);
@@ -968,6 +978,9 @@ rift_read_led_model(struct rift_hmd *hmd)
 			normal.y = normal.y;
 			normal.z = -normal.z;
 
+			if (hmd->led_model.led_count >= position_count) {
+				continue;
+			}
 			hmd->led_model.leds[hmd->led_model.led_count++] = (struct t_constellation_tracker_led){
 			    .position = pos,
 			    .normal = normal,
@@ -1850,13 +1863,19 @@ rift_frame_node_break_apart(struct xrt_frame_node *node)
 		os_thread_helper_stop_and_wait(&hmd->sensor_thread);
 	}
 
-	// The panel off when the driver stops (RiftLinux): nothing turned it off before, so a worn headset's stayed lit
-	// until it slept by itself.
-	if (hmd->variant == RIFT_VARIANT_CV1 && hmd->display_on) {
-		rift_enable_components(
-		    hmd, &(struct rift_enable_components_report){.flags = RIFT_COMPONENT_AUDIO | RIFT_COMPONENT_LEDS});
+	/*
+	 * The headset as a fresh one starts when the driver stops (RiftLinux): display, audio and LEDs off. Only the
+	 * display was switched off before, so the LEDs and the headphones' power stayed on after SteamVR or the runtime
+	 * quit (and nothing was sent at all when the display was already off, not worn).
+	 */
+	if (hmd->variant == RIFT_VARIANT_CV1) {
+		int result = rift_enable_components(hmd, &(struct rift_enable_components_report){.flags = 0});
 		hmd->display_on = false;
-		HMD_INFO(hmd, "Display off: the driver stops.");
+		if (result < 0) {
+			HMD_WARN(hmd, "Could not switch the headset off as the driver stops, reason %d", result);
+		} else {
+			HMD_INFO(hmd, "Display, audio and LEDs off: the driver stops.");
+		}
 	}
 
 	if (hmd->radio_state.thread.initialized) {
@@ -2141,17 +2160,29 @@ rift_devices_create(struct os_hid_device *hmd_dev,
 			goto error;
 		}
 
-		hmd->num_lens_distortions = lens_distortion_report.num_distortions;
-		struct rift_lens_distortion *lens_distortions =
-		    calloc(lens_distortion_report.num_distortions, sizeof(struct rift_lens_distortion));
+		/*
+		 * The first report's count sizes the table and every report's index must be inside it (RiftLinux: the
+		 * index came from the headset unchecked).
+		 */
+		const uint16_t num_distortions = lens_distortion_report.num_distortions;
+		if (num_distortions == 0 || lens_distortion_report.distortion_idx >= num_distortions) {
+			HMD_ERROR(hmd, "Invalid lens distortion report (index %u of %u)",
+			          (unsigned)lens_distortion_report.distortion_idx, (unsigned)num_distortions);
+			goto error;
+		}
+		hmd->num_lens_distortions = num_distortions;
+		struct rift_lens_distortion *lens_distortions = calloc(num_distortions, sizeof(struct rift_lens_distortion));
+		if (lens_distortions == NULL) {
+			goto error;
+		}
 
 		rift_parse_distortion_report(&lens_distortion_report,
 		                             &lens_distortions[lens_distortion_report.distortion_idx]);
 		// TODO: actually verify we initialize all the distortions. if the headset is working correctly,
 		// this should have happened, but you never know.
-		for (uint16_t i = 1; i < hmd->num_lens_distortions; i++) {
+		for (uint16_t i = 1; i < num_distortions; i++) {
 			result = rift_get_lens_distortion(hmd, &lens_distortion_report);
-			if (result < 0) {
+			if (result < 0 || lens_distortion_report.distortion_idx >= num_distortions) {
 				HMD_ERROR(hmd, "Failed to get lens distortion idx %d, reason %d", i, result);
 				free(lens_distortions);
 				goto error;

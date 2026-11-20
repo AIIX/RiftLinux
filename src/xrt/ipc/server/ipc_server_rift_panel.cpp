@@ -34,9 +34,11 @@
 #include "riftlinux/rl_room.hpp"
 #include "riftlinux/rl_pulse.hpp"
 #include "riftlinux/rl_settings.hpp"
+#include "riftlinux/rl_uniformity.hpp"
 #include "riftlinux/rl_tab.hpp"
 
 #include <signal.h>
+#include <sys/stat.h>
 #include <unistd.h>
 
 // The notices' panels are PNG files (made for SteamVR's overlays): read here, PNG only.
@@ -48,6 +50,7 @@
 #include <cmath>
 #include <cstring>
 #include <deque>
+#include <iterator>
 #include <mutex>
 #include <optional>
 #include <string>
@@ -348,6 +351,25 @@ apply_floor(struct rl_panel *p, const cJSON *root)
 	b_space_overseer_set_floor(p->s->xso, p->floor_known, -p->floor_m, raise);
 }
 
+//! Panel uniformity's keys in settings.json's "uniformity" section (render_output_settings_uniformity_key).
+const char *const kMuraKeys[] = {"enabled", "strength", "near_black"};
+
+//! uniformity.@p key as a number (true 1, false 0) in @p out_value; false when the file does not hold it.
+bool
+mura_value(const cJSON *root, const char *key, double *out_value)
+{
+	const cJSON *v = rl::settings::item(root, "uniformity", key);
+	if (cJSON_IsBool(v)) {
+		*out_value = cJSON_IsTrue(v) ? 1.0 : 0.0;
+		return true;
+	}
+	if (cJSON_IsNumber(v)) {
+		*out_value = v->valuedouble;
+		return true;
+	}
+	return false;
+}
+
 //! The settings file into the compositor and the spaces, at start.
 void
 load_settings(struct rl_panel *p)
@@ -365,6 +387,14 @@ load_settings(struct rl_panel *p)
 	rs.hdr_measured_peak = rl::settings::boolean(root, "display", "hdr_measured_peak", rs.hdr_measured_peak);
 	// Frosted glass for the layers an application asks it for (XR_MNDX_composition_layer_backdrop_blur).
 	rs.backdrop_blur = rl::settings::boolean(root, "display", "backdrop_blur", rs.backdrop_blur);
+	// Panel uniformity (render_mura.c, the "uniformity" section): on, strength and near_black in percent; a key not in the file
+	// keeps the compositor's value (its environment's or default).
+	for (const char *key : kMuraKeys) {
+		double d = 0.0;
+		if (mura_value(root, key, &d)) {
+			render_output_settings_uniformity_key(&rs, key, true, d);
+		}
+	}
 	render_output_settings_set(&rs);
 	p->base = rs;
 
@@ -376,6 +406,7 @@ load_settings(struct rl_panel *p)
 	pic.colour = (int)std::lround(rl::settings::number(root, "display", "auto_hdr_colour_strength", 50));
 	pic.bright = rl::settings::boolean(root, "display", "hdr_bright", rs.hdr_bright);
 	pic.smoothing = rl::settings::boolean(root, "display", "motion_smoothing", rs.motion_smoothing);
+	pic.uniformity = rs.mura_correction;
 	TabInfo &info = p->state.info;
 	info.native = true;
 	info.display = 3;
@@ -386,9 +417,10 @@ load_settings(struct rl_panel *p)
 	apply_picture(p);
 	apply_floor(p, root);
 	cJSON_Delete(root);
-	U_LOG_I("Rift panel: settings applied: Auto-HDR %s %d/%d %%, HDR Bright %s, smoothing %s, fast path %s",
-	        pic.on ? "on" : "off", pic.strength, pic.colour, pic.bright ? "on" : "off", pic.smoothing ? "on" : "off",
-	        info.fast_path ? "on" : "off");
+	U_LOG_I("Rift panel: settings applied: Auto-HDR %s %d/%d %%, HDR Bright %s, panel uniformity %s, smoothing %s, "
+	        "fast path %s",
+	        pic.on ? "on" : "off", pic.strength, pic.colour, pic.bright ? "on" : "off", pic.uniformity ? "on" : "off",
+	        pic.smoothing ? "on" : "off", info.fast_path ? "on" : "off");
 }
 
 /*
@@ -625,6 +657,10 @@ update_status(struct rl_panel *p, double t)
 	os_mutex_unlock(&p->s->global_state.lock);
 	info.other_app = ipc_server_has_previous_client(p->s);
 	info.app_closing = p->closing.stage > 0;
+	// Panel uniformity as the compositor has it: riftlinux-setup or an edit of the file may switch it too.
+	struct render_output_settings rs;
+	render_output_settings_get(&rs);
+	p->state.picture.uniformity = rs.mura_correction;
 	if (p->was_measuring && !info.sensors_measuring) {
 		p->measuring_ended_s = t;
 	}
@@ -952,6 +988,22 @@ act(struct rl_panel *p, const Hit &hit, int64_t at_ns)
 		pic.bright = !pic.bright;
 		rl::settings::set_bool("display", "hdr_bright", pic.bright);
 		break;
+	case Ctl::Uniformity: {
+		// At once in the compositor, and kept in the file (the settings watch then finds it as it is).
+		pic.uniformity = !pic.uniformity;
+		struct render_output_settings rs;
+		render_output_settings_get(&rs);
+		render_output_settings_uniformity_key(&rs, "enabled", true, pic.uniformity ? 1.0 : 0.0);
+		render_output_settings_set(&rs);
+		rl::settings::set_bool("uniformity", "enabled", pic.uniformity);
+		U_LOG_I("Rift panel: panel uniformity %s", pic.uniformity ? "on" : "off");
+		if (pic.uniformity) {
+			const std::string said = rl::uniformity::switched_on(p->head != nullptr ? p->head->serial : "");
+			if (!said.empty()) {
+				U_LOG_W("Rift panel: panel uniformity: %s", said.c_str());
+			}
+		}
+	} break;
 	case Ctl::Smoothing:
 		pic.smoothing = !pic.smoothing;
 		rl::settings::set_bool("display", "motion_smoothing", pic.smoothing);
@@ -1538,6 +1590,67 @@ rl_panel_settings_to_env(void)
 	if (!lsfg.empty()) {
 		U_LOG_W("%s", lsfg.c_str());
 	}
+	/*
+	 * The picture settings into the compositor from its start, as the SteamVR driver passes them (ovrd_driver.cpp):
+	 * a session without the Rift panel (or before it comes up) gets them too. Environment variables already set win.
+	 */
+	const cJSON *display = cJSON_GetObjectItemCaseSensitive(root, "display");
+	static const struct
+	{
+		const char *key;
+		const char *env;
+	} picture[] = {
+	    {"dither_bits", "XRT_COMPOSITOR_DITHER_BITS"},
+	    {"vibrance", "XRT_COMPOSITOR_VIBRANCE"},
+	    {"black_level", "XRT_COMPOSITOR_BLACK_LEVEL"},
+	    {"tonemap_shoulder", "XRT_COMPOSITOR_TONEMAP_SHOULDER"},
+	    {"auto_hdr", "XRT_COMPOSITOR_AUTO_HDR"},
+	    {"auto_hdr_highlights", "XRT_COMPOSITOR_AUTO_HDR_HIGHLIGHTS"},
+	    {"auto_hdr_shadows", "XRT_COMPOSITOR_AUTO_HDR_SHADOWS"},
+	    {"auto_hdr_colour", "XRT_COMPOSITOR_AUTO_HDR_COLOUR"},
+	    {"auto_hdr_knee", "XRT_COMPOSITOR_AUTO_HDR_KNEE"},
+	    {"hdr_white", "XRT_COMPOSITOR_HDR_WHITE"},
+	    {"hdr_float_layers", "XRT_COMPOSITOR_HDR_FLOAT_LAYERS"},
+	    {"hdr_metadata", "XRT_COMPOSITOR_HDR_METADATA"},
+	    {"hdr_measured_peak", "XRT_COMPOSITOR_HDR_MEASURED_PEAK"},
+	    {"hdr_bright", "XRT_COMPOSITOR_HDR_BRIGHT"},
+	    {"hdr_white_bright", "XRT_COMPOSITOR_HDR_WHITE_BRIGHT"},
+	    {"backdrop_blur", "XRT_COMPOSITOR_BACKDROP_BLUR"},
+	    {"supersample_filter", "XRT_COMPOSITOR_SUPERSAMPLE_FILTER"},
+	};
+	for (const auto &o : picture) {
+		const cJSON *v = cJSON_IsObject(display) ? cJSON_GetObjectItemCaseSensitive(display, o.key) : nullptr;
+		char text[32];
+		if (cJSON_IsNumber(v)) {
+			snprintf(text, sizeof(text), "%g", v->valuedouble);
+		} else if (cJSON_IsBool(v)) {
+			snprintf(text, sizeof(text), "%d", cJSON_IsTrue(v) ? 1 : 0);
+		} else {
+			continue;
+		}
+		setenv(o.env, text, 0);
+	}
+	// Panel uniformity, its own section: on, strength and near_black in percent.
+	static const struct
+	{
+		const char *key;
+		const char *env;
+	} uniformity[] = {
+	    {"enabled", "XRT_COMPOSITOR_MURA"},
+	    {"strength", "XRT_COMPOSITOR_MURA_STRENGTH"},
+	    {"near_black", "XRT_COMPOSITOR_MURA_NEAR_BLACK"},
+	};
+	for (const auto &o : uniformity) {
+		double d = 0.0;
+		if (mura_value(root, o.key, &d)) {
+			char text[32];
+			snprintf(text, sizeof(text), "%g", d);
+			setenv(o.env, text, 0);
+		}
+	}
+	// The CV1's panel shows sRGB levels 1-3 as black: lifted by default, as the SteamVR driver does (0 off).
+	setenv("XRT_COMPOSITOR_BLACK_LEVEL", "2.3", 0);
+
 	const double scale = rl::settings::number(root, "display", "render_scale", 0.0);
 	if (scale >= 25.0 && scale <= 400.0 && getenv("XRT_COMPOSITOR_RENDER_SCALE") == nullptr) {
 		char text[32];
@@ -1550,6 +1663,65 @@ rl_panel_settings_to_env(void)
 		}
 	}
 	cJSON_Delete(root);
+}
+
+extern "C" void
+rl_panel_settings_watch(void)
+{
+	/*
+	 * The file's time and the uniformity keys as last read: a key the file changes (riftlinux-setup uniformity,
+	 * an editor) is taken at once, one it removes goes back to its default; the others stay as the start set them
+	 * (an environment variable given at start stays until the file changes that key).
+	 */
+	static int64_t mtime_seen = -1;
+	static bool seen_present[std::size(kMuraKeys)];
+	static double seen_value[std::size(kMuraKeys)];
+
+	const std::string path = rl::settings::path();
+	struct stat st;
+	const int64_t mtime = stat(path.c_str(), &st) == 0
+	                          ? static_cast<int64_t>(st.st_mtim.tv_sec) * 1000000000LL + st.st_mtim.tv_nsec
+	                          : -2;
+	if (mtime == mtime_seen) {
+		return;
+	}
+	cJSON *root = rl::settings::load();
+	const bool first = mtime_seen == -1;
+	mtime_seen = mtime;
+
+	struct render_output_settings rs;
+	render_output_settings_get(&rs);
+	bool changed = false;
+	for (size_t i = 0; i < std::size(kMuraKeys); i++) {
+		double d = 0.0;
+		const bool present = mura_value(root, kMuraKeys[i], &d);
+		if (!first && (present != seen_present[i] || (present && d != seen_value[i]))) {
+			render_output_settings_uniformity_key(&rs, kMuraKeys[i], present, d);
+			changed = true;
+			if (present) {
+				U_LOG_W("Settings: uniformity.%s = %g (settings.json, live)", kMuraKeys[i], d);
+			} else {
+				U_LOG_W("Settings: uniformity.%s removed, default (settings.json, live)", kMuraKeys[i]);
+			}
+		}
+		seen_present[i] = present;
+		seen_value[i] = d;
+	}
+	// The supersample filter (display.supersample_filter), live too; absent: on, the default.
+	static int seen_filter = -1;
+	const cJSON *display = cJSON_GetObjectItemCaseSensitive(root, "display");
+	const cJSON *f = cJSON_IsObject(display) ? cJSON_GetObjectItemCaseSensitive(display, "supersample_filter") : nullptr;
+	const int filter = cJSON_IsBool(f) ? (cJSON_IsTrue(f) ? 1 : 0) : 1;
+	if (!first && filter != seen_filter) {
+		rs.supersample_filter = filter != 0;
+		changed = true;
+		U_LOG_W("Settings: display.supersample_filter = %d (settings.json, live)", filter);
+	}
+	seen_filter = filter;
+	cJSON_Delete(root);
+	if (changed) {
+		render_output_settings_set(&rs);
+	}
 }
 
 extern "C" struct rl_panel *

@@ -2,7 +2,7 @@
 SPDX-FileCopyrightText: 2026 Aditya Mehra <aix.m@outlook.com>
 SPDX-License-Identifier: CC-BY-4.0
 -->
-<!-- description: The Rift CV1's picture on Linux: direct mode, Auto-HDR for its OLED panel, HDR games and video, ASW-style motion smoothing, true render size. -->
+<!-- description: The Rift CV1's picture on Linux: direct mode, Auto-HDR for its OLED panel, HDR games and video, ASW-style motion smoothing, panel uniformity from the headset's factory calibration, true render size. -->
 
 # The picture: direct mode, Auto-HDR, HDR and motion smoothing on the Rift CV1
 
@@ -55,11 +55,33 @@ frames it makes.
 ASW 2.0 on Windows also corrects sideways head movement with the game's depth image, for games that send one; that
 is not in RiftLinux yet.
 
+## Panel uniformity
+
+Every CV1 panel is a little uneven: some areas are a shade brighter or tinted, which shows most in dark grey scenes as
+a faint pattern. Each headset was measured at the factory, and Meta keeps that measurement for every CV1. **Panel
+uniformity** evens out both panels with your headset's own measurement, as the Oculus software does on Windows. It
+comes with the 0.1.6 pre-release.
+
+- Switch it on in the Rift tab (*Settings*, *Picture*, **Panel uniformity**) or with `riftlinux-setup uniformity on`.
+  It is off by default, and switching applies at once.
+- The first time, RiftLinux downloads your headset's factory measurement from Meta (the request carries the
+  headset's serial number; no Meta account is used) and builds its calibration from it. After that it works offline.
+  The calibration is kept in `~/.config/riftlinux/spud/`.
+- `riftlinux-setup uniformity strength <0-100>` sets how much of it is applied (100 % by default), `near-black
+  <0-100>` how much on the darkest greys (60 %). `riftlinux-setup uniformity status` shows what is there.
+- A calibration from a Windows install of the Oculus software (`%LOCALAPPDATA%\Oculus\Spud\HMD_<serial>.mashed`) can
+  be imported instead: `riftlinux-setup uniformity import <file>`.
+
+It needs RiftLinux's compositor: direct mode in SteamVR, and always in RiftLinux's own runtime.
+
 ## Sharpness and render size
 
 - Games are asked for the CV1's own 1:1 size at the lens centre (1332x1586 a view, Oculus' pixel density 1.0).
   SteamVR's supersampling setting works on top, and the Rift tab's **Render scale** (50-200 %, from SteamVR's next
   start) sets it for RiftLinux.
+- Above 100 %, RiftLinux's compositor filters the larger picture down to the panel over each pixel's whole area (0.1.6
+  pre-release, Lanczos), for games and for windows and panels that apps hand it as layers: text and fine lines stay
+  steady instead of shimmering, and the extra detail shows.
 - The **fast path** (on) reads the game's image straight in the lens correction: one resampling instead of two, a
   sharper picture. It switches off by itself when overlays such as the dashboard are shown.
 - The panel's near-black levels are lifted so the first shades above black stay visible, black stays black; the
@@ -72,3 +94,5 @@ is not in RiftLinux yet.
   not see a monitor unplugged; after a while black (10 minutes, a setting) it switches off (OLED burn-in). The
   picture is back at once when you put it on. The light on the front is white while the display is on, orange while
   it is off. [Settings](settings.md#when-the-headset-is-taken-off) has the choices.
+- When SteamVR or RiftLinux's runtime quits, the headset is switched off completely: display, headphones and tracking
+  LEDs (0.1.6 pre-release).

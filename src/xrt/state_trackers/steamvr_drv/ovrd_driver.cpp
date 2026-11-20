@@ -83,6 +83,7 @@ extern "C" {
 #include "riftlinux/rl_room.hpp"
 #include "riftlinux/rl_settings.hpp"
 #include "riftlinux/rl_tab.hpp"
+#include "riftlinux/rl_uniformity.hpp"
 #include "main/comp_main_interface.h"
 #include "render/render_output_settings.h"
 extern char **environ;
@@ -331,6 +332,10 @@ static struct
 	bool smoothing = false;
 	//! HDR Bright: HDR content placed brighter on the panel.
 	bool bright = false;
+	//! Panel uniformity (the compositor's own switch, mura_correction; the tab shows it).
+	bool uniformity = false;
+	//! The headset's serial: its calibration file's name.
+	std::string serial;
 	struct render_output_settings base = {};
 } g_picture;
 
@@ -2130,6 +2135,11 @@ CDeviceDriver_Monado::Activate(vr::TrackedDeviceIndex_t unObjectId)
 	 * The Rift CV1's headphones are a USB audio device named after the headset's serial; SteamVR switches the
 	 * playback to it while it runs. Without, nothing was heard in SteamVR Home.
 	 */
+	{
+		// Panel uniformity's calibration file is named after it (the Rift tab's switch).
+		std::lock_guard<std::mutex> plock(g_picture.lock);
+		g_picture.serial = m_xdev->serial;
+	}
 	if (strncmp(m_xdev->serial, "WMHD", 4) == 0) {
 		char sink[256];
 		// The audio device's USB serial is the HMD's first 13 characters (WMHD316G100C9 of WMHD316G100C9Z, 13
@@ -3459,14 +3469,16 @@ riftlinux_helper_command(const char *command)
 	notices_send_locked(command);
 }
 
-//! The Rift tab's picture card as the driver has it ("cmd-picture direct on strength colour smoothing bright").
+//! The Rift tab's picture card as the driver has it
+//! ("cmd-picture direct on strength colour smoothing bright uniformity").
 static std::string
 picture_line()
 {
 	std::lock_guard<std::mutex> plock(g_picture.lock);
 	return "cmd-picture " + std::to_string(g_picture.direct ? 1 : 0) + " " + std::to_string(g_picture.on ? 1 : 0) +
 	       " " + std::to_string(g_picture.strength) + " " + std::to_string(g_picture.colour) + " " +
-	       std::to_string(g_picture.smoothing ? 1 : 0) + " " + std::to_string(g_picture.bright ? 1 : 0);
+	       std::to_string(g_picture.smoothing ? 1 : 0) + " " + std::to_string(g_picture.bright ? 1 : 0) + " " +
+	       std::to_string(g_picture.uniformity ? 1 : 0);
 }
 
 /*
@@ -3501,16 +3513,25 @@ display_read_settings_live()
 	    "auto_hdr",         "auto_hdr_strength", "auto_hdr_colour_strength", "hdr_bright",
 	    "hdr_white",        "hdr_white_bright",  "hdr_float_layers",         "hdr_metadata",
 	    "hdr_measured_peak", "hdr_players",      "motion_smoothing",         "direct_mode_fast_path",
+	    "uniformity.enabled", "uniformity.strength", "uniformity.near_black", "supersample_filter",
 	};
+	// A panel uniformity key the file removes goes back to its default (riftlinux-setup uniformity off removes the
+	// switch); those keys live in their own "uniformity" section.
+	static const double kAbsent = -1.0e300;
 	std::vector<std::pair<std::string, double>> changed;
 	const cJSON *display = cJSON_GetObjectItemCaseSensitive(root, "display");
+	const cJSON *uniformity = cJSON_GetObjectItemCaseSensitive(root, "uniformity");
 	for (const char *key : kKeys) {
-		const cJSON *v = cJSON_GetObjectItemCaseSensitive(display, key);
-		if (!cJSON_IsBool(v) && !cJSON_IsNumber(v)) {
+		const bool mura = strncmp(key, "uniformity.", 11) == 0;
+		const cJSON *v = mura ? cJSON_GetObjectItemCaseSensitive(uniformity, key + 11)
+		                      : cJSON_GetObjectItemCaseSensitive(display, key);
+		if (!cJSON_IsBool(v) && !cJSON_IsNumber(v) && !mura) {
 			file_values.erase(key);
 			continue;
 		}
-		const double d = cJSON_IsBool(v) ? (cJSON_IsTrue(v) ? 1.0 : 0.0) : v->valuedouble;
+		const double d = cJSON_IsBool(v)     ? (cJSON_IsTrue(v) ? 1.0 : 0.0)
+		                 : cJSON_IsNumber(v) ? v->valuedouble
+		                                     : kAbsent;
 		auto it = file_values.find(key);
 		if (!first && (it == file_values.end() || it->second != d)) {
 			changed.emplace_back(key, d);
@@ -3560,6 +3581,25 @@ display_read_settings_live()
 				set(rs.hdr_measured_peak, on, compositor);
 			} else if (key == "direct_mode_fast_path") {
 				set(rs.fast_path, on, compositor);
+			} else if (key == "supersample_filter") {
+				set(rs.supersample_filter, on, compositor);
+			} else if (key.rfind("uniformity.", 0) == 0) {
+				// Panel uniformity (render_mura.c), read as the runtime reads it.
+				struct render_output_settings before = rs;
+				render_output_settings_uniformity_key(&rs, key.c_str() + 11, d != kAbsent, d);
+				// The tab's switch follows (riftlinux-setup uniformity on/off, an edit of the file).
+				if (g_picture.uniformity != rs.mura_correction) {
+					g_picture.uniformity = rs.mura_correction;
+					tab = true;
+				}
+				if (memcmp(&before, &rs, sizeof(rs)) != 0) {
+					compositor = true;
+					if (d != kAbsent) {
+						ovrd_log("Settings: %s = %g (settings.json, live)\n", key.c_str(), d);
+					} else {
+						ovrd_log("Settings: %s removed, default (settings.json, live)\n", key.c_str());
+					}
+				}
 			} else if (key == "hdr_players") {
 				if (g_direct_mode->m_players_hdr.exchange(on) != on) {
 					ovrd_log("Settings: display.hdr_players = %d (settings.json, live): players' HDR descriptions %s\n",
@@ -3728,6 +3768,30 @@ riftlinux_helper_poll()
 				picture_apply_locked();
 				riftlinux_settings_set_number("display", "hdr_bright", g_picture.bright ? 1 : 0);
 				ovrd_log("Rift panel: HDR Bright %s\n", g_picture.bright ? "on" : "off");
+			}
+		} else if (line == "uniformity 1" || line == "uniformity 0") {
+			std::string serial;
+			bool on = false;
+			{
+				std::lock_guard<std::mutex> plock(g_picture.lock);
+				if (g_picture.direct) {
+					// At once in the compositor, and kept in the file (the settings watch then finds it as it is).
+					on = line == "uniformity 1";
+					g_picture.uniformity = on;
+					struct render_output_settings rs;
+					render_output_settings_get(&rs);
+					render_output_settings_uniformity_key(&rs, "enabled", true, on ? 1.0 : 0.0);
+					render_output_settings_set(&rs);
+					riftlinux_settings_set_bool("uniformity", "enabled", on);
+					ovrd_log("Rift panel: panel uniformity %s\n", on ? "on" : "off");
+					serial = g_picture.serial;
+				}
+			}
+			if (on) {
+				const std::string said = rl::uniformity::switched_on(serial);
+				if (!said.empty()) {
+					ovrd_log("Rift panel: panel uniformity: %s\n", said.c_str());
+				}
 			}
 		} else if (line == "smoothing 1" || line == "smoothing 0") {
 			std::lock_guard<std::mutex> plock(g_picture.lock);
@@ -4174,8 +4238,8 @@ CServerDriver_Monado::Init(vr::IVRDriverContext *pDriverContext)
 	 * default 8), auto_hdr (and _highlights, _shadows, _colour, _knee), vibrance (0 off), black_level (0 off),
 	 * tonemap_shoulder (0 off), float_scratch (default on), motion_smoothing (default off; motion_capture,
 	 * motion_capture_start, motion_test_half, motion_test_yaw_mdeg, motion_test_shadow for tests), capture_output
-	 * (frames of the panel's output to ~/.cache/riftlinux/output-capture, for tests); environment variables already
-	 * set win.
+	 * (frames of the panel's output to ~/.cache/riftlinux/output-capture, for tests), mura_correction (and _strength,
+	 * _cap, _pixel_cap); environment variables already set win.
 	 */
 	if (direct_mode) {
 		cJSON *settings = riftlinux_settings_load();
@@ -4216,6 +4280,7 @@ CServerDriver_Monado::Init(vr::IVRDriverContext *pDriverContext)
 		    {"motion_flow", "XRT_COMPOSITOR_MOTION_FLOW"},
 		    {"motion_subpixel", "XRT_COMPOSITOR_MOTION_SUBPIXEL"},
 		    {"scratch_headroom", "XRT_COMPOSITOR_SCRATCH_HEADROOM"},
+		    {"supersample_filter", "XRT_COMPOSITOR_SUPERSAMPLE_FILTER"},
 		    {"motion_capture", "XRT_COMPOSITOR_MOTION_CAPTURE"},
 		    {"motion_capture_start", "XRT_COMPOSITOR_MOTION_CAPTURE_START"},
 		    {"motion_test_half", "XRT_COMPOSITOR_MOTION_TEST_HALF"},
@@ -4244,6 +4309,30 @@ CServerDriver_Monado::Init(vr::IVRDriverContext *pDriverContext)
 			setenv(o.env, text, 0);
 			ovrd_log("Display: %s = %s\n", o.key, text);
 		}
+		// Panel uniformity, its own section: on, strength and near_black in percent.
+		static const struct
+		{
+			const char *key;
+			const char *env;
+		} uniformity_options[] = {
+		    {"enabled", "XRT_COMPOSITOR_MURA"},
+		    {"strength", "XRT_COMPOSITOR_MURA_STRENGTH"},
+		    {"near_black", "XRT_COMPOSITOR_MURA_NEAR_BLACK"},
+		};
+		const cJSON *uniformity = cJSON_GetObjectItemCaseSensitive(settings, "uniformity");
+		for (const auto &o : uniformity_options) {
+			const cJSON *v = cJSON_GetObjectItemCaseSensitive(uniformity, o.key);
+			char text[32];
+			if (cJSON_IsNumber(v)) {
+				snprintf(text, sizeof(text), "%g", v->valuedouble);
+			} else if (cJSON_IsBool(v)) {
+				snprintf(text, sizeof(text), "%d", cJSON_IsTrue(v) ? 1 : 0);
+			} else {
+				continue;
+			}
+			setenv(o.env, text, 0);
+			ovrd_log("Uniformity: %s = %s\n", o.key, text);
+		}
 		/*
 		 * The compositor's scratch images follow the CV1's 1:1 size with 25 % headroom a side for SteamVR's
 		 * supersampling (comp_compositor.c); a larger display.render_scale gets as much more headroom.
@@ -4267,6 +4356,7 @@ CServerDriver_Monado::Init(vr::IVRDriverContext *pDriverContext)
 		g_picture.on = g_picture.base.auto_hdr;
 		g_picture.smoothing = g_picture.base.motion_smoothing;
 		g_picture.bright = g_picture.base.hdr_bright;
+		g_picture.uniformity = g_picture.base.mura_correction;
 		const cJSON *strength = cJSON_GetObjectItemCaseSensitive(display, "auto_hdr_strength");
 		if (cJSON_IsNumber(strength)) {
 			g_picture.strength = std::clamp(strength->valueint, 0, 100);
@@ -4276,9 +4366,10 @@ CServerDriver_Monado::Init(vr::IVRDriverContext *pDriverContext)
 			g_picture.colour = std::clamp(colour->valueint, 0, 100);
 		}
 		picture_apply_locked();
-		ovrd_log("Display: Auto-HDR %s, strength %d %%, colour %d %%, motion smoothing %s, HDR Bright %s\n",
+		ovrd_log("Display: Auto-HDR %s, strength %d %%, colour %d %%, motion smoothing %s, HDR Bright %s, panel "
+		         "uniformity %s\n",
 		         g_picture.on ? "on" : "off", g_picture.strength, g_picture.colour, g_picture.smoothing ? "on" : "off",
-		         g_picture.bright ? "on" : "off");
+		         g_picture.bright ? "on" : "off", g_picture.uniformity ? "on" : "off");
 		cJSON_Delete(settings);
 	}
 	// Capture runs are unattended (the headset on a desk): the panel stays on a minute unworn, not 5 s.

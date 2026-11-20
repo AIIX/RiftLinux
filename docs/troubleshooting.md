@@ -111,6 +111,14 @@ As it starts, Steam runs a graphics driver check through a Proton build; with so
 check's OpenXR test starts SteamVR. The driver quits that SteamVR again when the headset is not put on; `riftlinux-setup
 check` says whether it happens and through which Proton.
 
+**SteamVR keeps starting with "headset not found" while no headset is plugged in.**
+The same driver check, through GE-Proton ([#8](https://github.com/AIIX/RiftLinux/issues/8)). Steam runs it through
+every GE-Proton build you have installed, not only through Steam's default compatibility tool. Run through GE-Proton
+(seen with 11-6 and 11-7) the check does not finish, and it starts SteamVR again and again until Steam gives up on it;
+with no headset plugged in, SteamVR shows its "headset not found" message each time. Move the GE-Proton builds out of
+Steam's `compatibilitytools.d` folder (in your Steam folder, for example `~/.steam/debian-installation`) and restart
+Steam, or keep the headset plugged in: RiftLinux then quits that SteamVR again.
+
 **SteamVR Home does not open any more after SteamVR quit.**
 A SteamVR Home left running after SteamVR quit (seen on KDE after starting Steam with `-pipewire`) keeps every new
 Home from starting. The driver's watchdog in Steam ends it while Steam runs; `riftlinux-setup check` reports one and
@@ -165,6 +173,16 @@ for GNOME 51). Switch HDR off and on in *Settings*, *Displays*. KDE Plasma keeps
 
 **No Auto-HDR, HDR or motion smoothing.**
 They need direct mode: `riftlinux-setup direct-mode status`, and `on` to switch it on (from SteamVR's next start).
+
+**A faint pattern or uneven patches in dark grey scenes.**
+That is the panel itself: every CV1 panel is a little uneven. From the 0.1.6 pre-release, switch on **Panel uniformity**
+in the Rift tab or with `riftlinux-setup uniformity on` ([The picture](picture.md#panel-uniformity)).
+
+**Panel uniformity is on, but the picture looks the same.**
+`riftlinux-setup uniformity status` says whether your headset's calibration is there. The first time it has to be
+downloaded, which needs the internet; switched on in the Rift tab, what the download said is in
+`~/.cache/riftlinux/uniformity-setup.log`, and `riftlinux-setup uniformity on` in a terminal tries again and shows why.
+In SteamVR it also needs direct mode.
 
 ## Tracking
 

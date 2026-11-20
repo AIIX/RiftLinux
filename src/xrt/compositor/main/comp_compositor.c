@@ -1085,6 +1085,10 @@ compositor_init_render_resources(struct comp_compositor *c)
 		return false;
 	}
 
+	// RiftLinux, panel uniformity: the headset's calibration (riftlinux-setup uniformity), if kept; switched with the
+	// picture settings (render_output_settings: mura_correction); one built later is loaded by the renderer.
+	render_mura_load(&c->nr, c->xdev->serial);
+
 	return true;
 }
 

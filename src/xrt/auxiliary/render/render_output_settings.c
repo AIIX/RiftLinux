@@ -11,6 +11,7 @@
 #include "util/u_debug.h"
 
 #include <pthread.h>
+#include <string.h>
 
 /*
  * Output processing in the distortion shader (RiftLinux): dither to the link's bit depth (the panel
@@ -71,6 +72,19 @@ DEBUG_GET_ONCE_BOOL_OPTION(motion_smoothing, "XRT_COMPOSITOR_MOTION_SMOOTHING", 
 //! The fast path, live (XRT_COMPOSITOR_DISABLE_FAST_PATH still turns it off for good). On by default.
 DEBUG_GET_ONCE_BOOL_OPTION(fast_path, "XRT_COMPOSITOR_FAST_PATH", true)
 
+/*
+ * Panel uniformity (render_mura.c; settings.json "uniformity"): the headset's own factory calibration evens out each
+ * panel's brightness and colour. Off by default; strength and near_black in percent (100: as the calibration asks).
+ */
+//! The supersample filter (settings.json display.supersample_filter): on by default.
+DEBUG_GET_ONCE_BOOL_OPTION(supersample_filter, "XRT_COMPOSITOR_SUPERSAMPLE_FILTER", true)
+
+#define UNIFORMITY_STRENGTH_DEFAULT 100.0f
+#define UNIFORMITY_NEAR_BLACK_DEFAULT 60.0f
+DEBUG_GET_ONCE_BOOL_OPTION(mura_correction, "XRT_COMPOSITOR_MURA", false)
+DEBUG_GET_ONCE_FLOAT_OPTION(mura_strength, "XRT_COMPOSITOR_MURA_STRENGTH", UNIFORMITY_STRENGTH_DEFAULT)
+DEBUG_GET_ONCE_FLOAT_OPTION(mura_near_black, "XRT_COMPOSITOR_MURA_NEAR_BLACK", UNIFORMITY_NEAR_BLACK_DEFAULT)
+
 static pthread_mutex_t g_lock = PTHREAD_MUTEX_INITIALIZER;
 static bool g_set = false;
 static struct render_output_settings g_settings;
@@ -96,6 +110,10 @@ from_environment(struct render_output_settings *s)
 	s->motion_smoothing = debug_get_bool_option_motion_smoothing();
 	s->backdrop_blur = debug_get_bool_option_backdrop_blur();
 	s->fast_path = debug_get_bool_option_fast_path();
+	s->supersample_filter = debug_get_bool_option_supersample_filter();
+	s->mura_correction = debug_get_bool_option_mura_correction();
+	s->mura_strength = debug_get_float_option_mura_strength() / 100.0f; // percent, as in settings.json
+	s->mura_near_black = debug_get_float_option_mura_near_black() / 100.0f;
 }
 
 void
@@ -117,6 +135,30 @@ render_output_settings_set(const struct render_output_settings *settings)
 	g_settings = *settings;
 	g_set = true;
 	pthread_mutex_unlock(&g_lock);
+}
+
+static float
+clamp_or(double value, bool present, float lo, float hi, float fallback)
+{
+	if (!present || value != value) {
+		return fallback;
+	}
+	return (float)(value < lo ? lo : value > hi ? hi : value);
+}
+
+bool
+render_output_settings_uniformity_key(struct render_output_settings *s, const char *key, bool present, double value)
+{
+	if (strcmp(key, "enabled") == 0) {
+		s->mura_correction = present && value != 0.0;
+	} else if (strcmp(key, "strength") == 0) {
+		s->mura_strength = clamp_or(value, present, 0.0f, 100.0f, UNIFORMITY_STRENGTH_DEFAULT) / 100.0f;
+	} else if (strcmp(key, "near_black") == 0) {
+		s->mura_near_black = clamp_or(value, present, 0.0f, 100.0f, UNIFORMITY_NEAR_BLACK_DEFAULT) / 100.0f;
+	} else {
+		return false;
+	}
+	return true;
 }
 
 static int64_t g_last_hdr_layer_ns = 0;

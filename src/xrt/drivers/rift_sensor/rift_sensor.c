@@ -8,7 +8,10 @@
  * @ingroup drv_rift_sensor
  */
 
+#include <math.h>
+
 #include "xrt/xrt_byte_order.h"
+#include "xrt/xrt_compiler.h"
 
 #include "os/os_time.h"
 
@@ -207,25 +210,58 @@ rift_sensor_post_init_callback(uint16_t vid, uint16_t pid, bool is_usb2, libusb_
 	return true;
 }
 
+/*!
+ * A whole number from @p lo to @p hi stored as a float in the sensor's calibration (RiftLinux): false for anything
+ * else (NaN, a fraction, out of range), which must never become a count or a size.
+ */
+static bool
+calib_whole(float value, int lo, int hi, int *out)
+{
+	if (!(value >= (float)lo && value <= (float)hi) || value != floorf(value)) {
+		return false;
+	}
+	*out = (int)value;
+	return true;
+}
+
+/*!
+ * Decodes the camera calibration of @p stream_len floats read from the sensor's flash. Every count in it is checked
+ * against the arrays it fills and every read stays inside the stream (RiftLinux: the counts came from the sensor's
+ * data unchecked and overran the arrays on the stack).
+ */
 static bool
 rift_sensor_decode_camera_calib_stream(struct rift_sensor_context *context,
                                        __lef32 *stream,
+                                       size_t stream_len,
                                        struct t_camera_calibration *calib)
 {
-	int marker = (int)__lef32_to_cpu(stream[0]);
-	if (marker != 1) {
-		SENSOR_ERROR(context, "Invalid camera calibration stream marker: %d", marker);
+	if (stream_len < 14) {
+		SENSOR_ERROR(context, "Camera calibration stream too short: %zu values", stream_len);
+		return false;
+	}
+	int marker = 0;
+	if (!calib_whole(__lef32_to_cpu(stream[0]), 0, 1000, &marker) || marker != 1) {
+		SENSOR_ERROR(context, "Invalid camera calibration stream marker: %f", (double)__lef32_to_cpu(stream[0]));
 		return false;
 	}
 
-	int lens_type = (int)__lef32_to_cpu(stream[1]);
+	int lens_type = -1;
+	if (!calib_whole(__lef32_to_cpu(stream[1]), 0, 1000, &lens_type)) {
+		SENSOR_ERROR(context, "Invalid lens type in camera calibration stream");
+		return false;
+	}
 	if (lens_type == RIFT_SENSOR_CV1_LENS_TYPE_OLD_BA_REJECTED) {
 		SENSOR_ERROR(context, "Invalid lens type in camera calibration stream: %d", lens_type);
 		return false;
 	}
 
-	int height = (int)__lef32_to_cpu(stream[2]);
-	int width = (int)__lef32_to_cpu(stream[3]);
+	int height = 0;
+	int width = 0;
+	if (!calib_whole(__lef32_to_cpu(stream[2]), 1, 8192, &height) ||
+	    !calib_whole(__lef32_to_cpu(stream[3]), 1, 8192, &width)) {
+		SENSOR_ERROR(context, "Invalid image size in camera calibration stream");
+		return false;
+	}
 	float focal = __lef32_to_cpu(stream[4]);
 	float cx = __lef32_to_cpu(stream[5]);
 	float cy = __lef32_to_cpu(stream[6]);
@@ -275,25 +311,34 @@ rift_sensor_decode_camera_calib_stream(struct rift_sensor_context *context,
 	}
 	case RIFT_SENSOR_CV1_LENS_TYPE_KB_LEGACY:
 	case RIFT_SENSOR_CV1_LENS_TYPE_KB_SPLINE: {
-		__lef32 *cursor_kb;
+		size_t at;
 		if (lens_type == RIFT_SENSOR_CV1_LENS_TYPE_KB_LEGACY) {
 			affine_count = 2;
 			affine[0] = __lef32_to_cpu(stream[9]);
 			affine[1] = __lef32_to_cpu(stream[10]);
-			cursor_kb = stream + 11;
+			at = 11;
 		} else {
-			affine_count = (int)__lef32_to_cpu(stream[9]);
-			cursor_kb = stream + 10;
+			if (!calib_whole(__lef32_to_cpu(stream[9]), 0, (int)ARRAY_SIZE(affine), &affine_count) ||
+			    10 + (size_t)affine_count >= stream_len) {
+				SENSOR_ERROR(context, "Invalid affine count in camera calibration stream");
+				return false;
+			}
+			at = 10;
 			for (int i = 0; i < affine_count; i++) {
-				affine[i] = __lef32_to_cpu(*(cursor_kb++));
+				affine[i] = __lef32_to_cpu(stream[at++]);
 			}
 		}
-		spline_count = (int)__lef32_to_cpu(*cursor_kb);
-		__lef32 *cursor_spline = cursor_kb + 1;
-		for (int i = 0; i < spline_count; i++) {
-			spline_ratio[i] = __lef32_to_cpu(*(cursor_spline++));
+		// The spline: its count, its ratios and its end slope, all inside the stream.
+		if (!calib_whole(__lef32_to_cpu(stream[at]), 0, (int)ARRAY_SIZE(spline_ratio), &spline_count) ||
+		    at + 1 + (size_t)spline_count >= stream_len) {
+			SENSOR_ERROR(context, "Invalid spline count in camera calibration stream");
+			return false;
 		}
-		float spline_end_slope = __lef32_to_cpu(*cursor_spline);
+		at++;
+		for (int i = 0; i < spline_count; i++) {
+			spline_ratio[i] = __lef32_to_cpu(stream[at++]);
+		}
+		float spline_end_slope = __lef32_to_cpu(stream[at]);
 		(void)spline_end_slope; // @note we aren't able to utilize this format yet.
 
 		// We auto-correct to the new format
@@ -302,14 +347,23 @@ rift_sensor_decode_camera_calib_stream(struct rift_sensor_context *context,
 		return false; // @todo implement this format
 	}
 	case RIFT_SENSOR_CV1_LENS_TYPE_CV1: {
-		radial_count = (int)__lef32_to_cpu(stream[9]);
-		__lef32 *cursor = stream + 10;
-		for (int i = 0; i < radial_count; i++) {
-			radial[i] = __lef32_to_cpu(*(cursor++));
+		if (!calib_whole(__lef32_to_cpu(stream[9]), 0, (int)ARRAY_SIZE(radial), &radial_count) ||
+		    10 + (size_t)radial_count >= stream_len) {
+			SENSOR_ERROR(context, "Invalid radial count in camera calibration stream");
+			return false;
 		}
-		affine_count = (int)__lef32_to_cpu(*(cursor++));
+		size_t at = 10;
+		for (int i = 0; i < radial_count; i++) {
+			radial[i] = __lef32_to_cpu(stream[at++]);
+		}
+		if (!calib_whole(__lef32_to_cpu(stream[at]), 0, (int)ARRAY_SIZE(affine), &affine_count) ||
+		    at + 1 + (size_t)affine_count > stream_len) {
+			SENSOR_ERROR(context, "Invalid affine count in camera calibration stream");
+			return false;
+		}
+		at++;
 		for (int i = 0; i < affine_count; i++) {
-			affine[i] = __lef32_to_cpu(*(cursor++));
+			affine[i] = __lef32_to_cpu(stream[at++]);
 		}
 
 		(*calib) = (struct t_camera_calibration){
@@ -434,7 +488,8 @@ rift_sensor_read_calibration(struct rift_sensor_context *context,
 		(void)crc;     // @todo: implement CRC check with crc length
 		(void)crc_length;
 
-		if (!rift_sensor_decode_camera_calib_stream(context, (__lef32 *)&calib.body, &sensor->calibration)) {
+		if (!rift_sensor_decode_camera_calib_stream(context, (__lef32 *)&calib.body,
+		                                            sizeof(calib.body) / sizeof(__lef32), &sensor->calibration)) {
 			sensor->calibration = default_calib;
 			SENSOR_ERROR(context, "Failed to decode camera calibration stream");
 			return -1;

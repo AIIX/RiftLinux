@@ -15,15 +15,21 @@ riftlinux_logged_in_users() {
 	} | sort -u | grep -v '^root$' || true
 }
 
-# Runs "$@" as user $1 with that user's HOME (runuser where it exists, else su).
+# Runs "$@" as user $1 in a clean environment of that user's own (HOME, USER, PATH, the session's runtime folder),
+# nothing of the installer's (runuser where it exists, else su).
 riftlinux_as_user() {
 	user=$1
 	shift
 	home=$(getent passwd "$user" | cut -d: -f6)
-	[ -n "$home" ] || return 1
+	uid=$(id -u "$user" 2>/dev/null)
+	[ -n "$home" ] && [ -n "$uid" ] || return 1
+	runtime=/run/user/$uid
+	[ -d "$runtime" ] || runtime=
 	if command -v runuser >/dev/null 2>&1; then
-		runuser -u "$user" -- env HOME="$home" "$@"
+		runuser -u "$user" -- env -i HOME="$home" USER="$user" LOGNAME="$user" PATH=/usr/local/bin:/usr/bin:/bin \
+			LANG=C.UTF-8 ${runtime:+XDG_RUNTIME_DIR="$runtime"} "$@"
 	else
-		su -s /bin/sh "$user" -c 'HOME="$0" exec "$@"' "$home" "$@"
+		su -s /bin/sh "$user" -c 'h=$1 u=$2 r=$3; shift 3; exec env -i HOME="$h" USER="$u" LOGNAME="$u" \
+			PATH=/usr/local/bin:/usr/bin:/bin LANG=C.UTF-8 ${r:+XDG_RUNTIME_DIR="$r"} "$@"' sh "$home" "$user" "$runtime" "$@"
 	fi
 }

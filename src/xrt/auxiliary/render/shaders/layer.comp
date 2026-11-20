@@ -299,7 +299,75 @@ vec2 transform_uv_subimage(vec2 uv, uint layer)
 	return values.xy;
 }
 
-vec4 do_cylinder(vec2 view_uv, uint layer)
+// One target pixel in view coordinates (RiftLinux, the supersample filter's footprints); set in main().
+vec2 rl_step = vec2(0.0);
+
+// Lanczos-2 kernel (radius 2), for the supersample filter.
+float lanczos2(float t)
+{
+	t = abs(t);
+	if (t < 1e-4) {
+		return 1.0;
+	}
+	if (t >= 2.0) {
+		return 0.0;
+	}
+	float a = PI * t;
+	return 2.0 * sin(a) * sin(a * 0.5) / (a * a);
+}
+
+/*
+ * Supersample filter (RiftLinux): a layer's image at uv, with this pixel's footprint in it (du, dv: how far the right and
+ * lower neighbours land). Shrunk by more than `shrunk` texels a pixel: Lanczos-2 over the footprint, up to most x most
+ * taps (at most 24), kept inside the layer's sub-image; else one bilinear sample, as before. Windows and panels (quad,
+ * cylinder, equirect) from 1.25 with up to 24 x 24 taps: often shown far smaller than their image, which the lens pass
+ * cannot recover; a window placed far away is shrunk 6:1 and more, and with fewer taps (8) it was read with gaps again
+ * and looked grainy, apart from the calm background; far away it covers few pixels, so the taps cost little (about 16
+ * a texel of its image, however far). Projection layers
+ * only from 1.6 (a supersampled game's image): the lens pass filters the scratch image again, and filtering the
+ * whole view twice cost the frame its margin at 300 % (measured). Without it a shrunk image is read
+ * at four texels a pixel and the rest skipped: small text and fine lines shimmer as the head moves. The lens pass
+ * (distortion.comp) filters the same way; one switch for both (layer_count.z).
+ */
+vec4 sample_layer(uint index, vec2 uv, vec2 du, vec2 dv, vec4 post_transform, float shrunk, int most)
+{
+	vec2 texels = vec2(textureSize(source[index], 0));
+	float lx = length(du * texels);
+	float ly = length(dv * texels);
+	if (ubo.layer_count.z == 0 || max(lx, ly) <= shrunk) {
+		return texture(source[index], uv);
+	}
+	du *= max(1.0, 1.0 / max(lx, 1e-6));
+	dv *= max(1.0, 1.0 / max(ly, 1e-6));
+	int nx = clamp(int(ceil(4.0 * max(lx, 1.0))), 4, most);
+	int ny = clamp(int(ceil(4.0 * max(ly, 1.0))), 4, most);
+	vec2 lo = min(post_transform.xy, post_transform.xy + post_transform.zw) + 0.5 / texels;
+	vec2 hi = max(post_transform.xy, post_transform.xy + post_transform.zw) - 0.5 / texels;
+	float wx[24];
+	float wy[24];
+	float sx = 0.0;
+	float sy = 0.0;
+	for (int i = 0; i < 24; i++) {
+		wx[i] = i < nx ? lanczos2(((float(i) + 0.5) / float(nx)) * 4.0 - 2.0) : 0.0;
+		wy[i] = i < ny ? lanczos2(((float(i) + 0.5) / float(ny)) * 4.0 - 2.0) : 0.0;
+		sx += wx[i];
+		sy += wy[i];
+	}
+	vec4 c = vec4(0.0);
+	for (int j = 0; j < ny; j++) {
+		vec2 row = uv + (((float(j) + 0.5) / float(ny)) * 4.0 - 2.0) * dv;
+		vec4 r = vec4(0.0);
+		for (int i = 0; i < nx; i++) {
+			r += wx[i] * texture(source[index], clamp(row + (((float(i) + 0.5) / float(nx)) * 4.0 - 2.0) * du, lo, hi));
+		}
+		c += wy[j] * r;
+	}
+	// Lanczos rings a little at hard edges: nothing below zero.
+	return max(c / (sx * sy), vec4(0.0));
+}
+
+// A cylinder layer's (longitude 0..1, height) for view_uv; false when the ray misses it.
+bool cylinder_coords(vec2 view_uv, uint layer, out vec2 lon_y)
 {
 	// Get ray position in model space.
 	const vec3 ray_origin = (LAYER.mv_inverse * vec4(0, 0, 0, 1)).xyz;
@@ -334,14 +402,14 @@ vec4 do_cylinder(vec2 view_uv, uint layer)
 		float h = b * b - a * c;
 		if(h < 0.f) {
 			// no intersection
-			return vec4(0.f);
+			return false;
 		}
 
 		h = sqrt(h);
 		vec2 distances = vec2(-b - h, -b + h) / a;
 
 		if (distances.y < 0) {
-			return vec4(0.f);
+			return false;
 		}
 
 		dir_from_cyl = normalize(ray_origin + (ray_dir * distances.y));
@@ -352,6 +420,21 @@ vec4 do_cylinder(vec2 view_uv, uint layer)
 	// float y = tan(lat); // => [-inf, inf]
 	// simplified: -y/sqrt(1 - y^2)
 	const float y = -dir_from_cyl.y / sqrt(1 - (dir_from_cyl.y * dir_from_cyl.y)); // => [-inf, inf]
+
+	lon_y = vec2(lon, y);
+	return true;
+}
+
+vec4 do_cylinder(vec2 view_uv, uint layer)
+{
+	vec2 lon_y;
+	if (!cylinder_coords(view_uv, layer, lon_y)) {
+		return vec4(0.f);
+	}
+	const float lon = lon_y.x;
+	const float y = lon_y.y;
+	const float central_angle = LAYER.cylinder_data.y;
+	const float aspect_ratio = LAYER.cylinder_data.z;
 
 	vec4 out_color = vec4(0.f);
 
@@ -394,8 +477,17 @@ vec4 do_cylinder(vec2 view_uv, uint layer)
 #ifdef DEBUG
 		out_color += texture(source[index], uv_sub) / 2.f;
 #else
-
-		out_color = texture(source[index], uv_sub);
+		// The footprint from the neighbours' coordinates (none across the longitude seam).
+		vec2 nx_ly, ny_ly;
+		vec2 du = vec2(0.0);
+		vec2 dv = vec2(0.0);
+		if (cylinder_coords(view_uv + vec2(rl_step.x, 0.0), layer, nx_ly) && abs(nx_ly.x - lon) < 0.5) {
+			du = (nx_ly - lon_y) / extent * LAYER.post_transform.zw;
+		}
+		if (cylinder_coords(view_uv + vec2(0.0, rl_step.y), layer, ny_ly) && abs(ny_ly.x - lon) < 0.5) {
+			dv = (ny_ly - lon_y) / extent * LAYER.post_transform.zw;
+		}
+		out_color = sample_layer(index, uv_sub, du, dv, LAYER.post_transform, 1.25, 24);
 #endif
 	} else {
 		out_color += vec4(0.f);
@@ -404,7 +496,8 @@ vec4 do_cylinder(vec2 view_uv, uint layer)
 	return out_color;
 }
 
-vec4 do_equirect2(vec2 view_uv, uint layer)
+// An equirect layer's (longitude, latitude) 0..1 for view_uv; false when the ray misses it.
+bool equirect2_coords(vec2 view_uv, uint layer, out vec2 lon_lat)
 {
 	// Get ray position in model space.
 	const vec3 ray_origin = (LAYER.mv_inverse * vec4(0, 0, 0, 1)).xyz;
@@ -438,14 +531,14 @@ vec4 do_equirect2(vec2 view_uv, uint layer)
 		float H = radius * radius - dot(QC, QC);
 		if (H < 0.0) {
 			// no intersection
-			return vec4(0.f);
+			return false;
 		}
 
 		H = sqrt(H);
 
 		vec2 distances = vec2(-B - H, -B + H);
 		if (distances.y < 0) {
-			return vec4(0.f);
+			return false;
 		}
 
 		dir_from_sph = normalize(ray_origin + (ray_dir * distances.y));
@@ -453,6 +546,22 @@ vec4 do_equirect2(vec2 view_uv, uint layer)
 
 	const float lon = atan(dir_from_sph.x, -dir_from_sph.z) / (2 * PI) + 0.5;
 	const float lat = acos(dir_from_sph.y) / PI;
+
+	lon_lat = vec2(lon, lat);
+	return true;
+}
+
+vec4 do_equirect2(vec2 view_uv, uint layer)
+{
+	vec2 lon_lat;
+	if (!equirect2_coords(view_uv, layer, lon_lat)) {
+		return vec4(0.f);
+	}
+	const float lon = lon_lat.x;
+	const float lat = lon_lat.y;
+	const float central_horizontal_angle = LAYER.eq2_data.y;
+	const float upper_vertical_angle = LAYER.eq2_data.z;
+	const float lower_vertical_angle = LAYER.eq2_data.w;
 
 	vec4 out_color = vec4(0.f);
 
@@ -493,8 +602,17 @@ vec4 do_equirect2(vec2 view_uv, uint layer)
 #ifdef DEBUG
 		out_color += texture(source[index], uv_sub) / 2.0;
 #else
-
-		out_color = texture(source[index], uv_sub);
+		// The footprint from the neighbours' coordinates (none across the longitude seam).
+		vec2 nx_ll, ny_ll;
+		vec2 du = vec2(0.0);
+		vec2 dv = vec2(0.0);
+		if (equirect2_coords(view_uv + vec2(rl_step.x, 0.0), layer, nx_ll) && abs(nx_ll.x - lon) < 0.5) {
+			du = (nx_ll - lon_lat) / ll_extent * LAYER.post_transform.zw;
+		}
+		if (equirect2_coords(view_uv + vec2(0.0, rl_step.y), layer, ny_ll) && abs(ny_ll.x - lon) < 0.5) {
+			dv = (ny_ll - lon_lat) / ll_extent * LAYER.post_transform.zw;
+		}
+		out_color = sample_layer(index, uv_sub, du, dv, LAYER.post_transform, 1.25, 24);
 #endif
 	} else {
 		out_color += vec4(0.f);
@@ -506,6 +624,7 @@ vec4 do_equirect2(vec2 view_uv, uint layer)
 vec4 do_projection_uv(vec2 view_uv, uint layer, out vec2 out_uv)
 {
 	uint source_image_index = LAYER.image_info.color_image_index;
+	vec2 rl_view_uv = view_uv;
 
 	// Apply FOV and timewarp transformation.
 	view_uv = transform_uv_fov_timewarp(view_uv, layer);
@@ -529,8 +648,10 @@ vec4 do_projection_uv(vec2 view_uv, uint layer, out vec2 out_uv)
 	// Map from view space coordinates to sub image view coordinates.
 	vec2 image_uv = transform_uv_subimage(view_uv, layer);
 
-	// Sample the source.
-	vec4 colour = vec4(texture(source[source_image_index], image_uv).rgba);
+	// Sample the source, filtered over this pixel's footprint where the image is shrunk (sample_layer).
+	vec2 du = transform_uv_subimage(transform_uv_fov_timewarp(rl_view_uv + vec2(rl_step.x, 0.0), layer), layer) - image_uv;
+	vec2 dv = transform_uv_subimage(transform_uv_fov_timewarp(rl_view_uv + vec2(0.0, rl_step.y), layer), layer) - image_uv;
+	vec4 colour = sample_layer(source_image_index, image_uv, du, dv, LAYER.post_transform, 1.6, 6);
 
 	return colour;
 }
@@ -573,82 +694,62 @@ vec3 get_direction(vec2 uv)
 	return direction;
 }
 
-vec4 do_quad(vec2 view_uv, uint layer)
+// Where view_uv's ray meets a quad layer's plane, in the quad's 0..1 coordinates (outside them past its edges); false
+// when the ray misses the plane's front or meets it behind the eye.
+bool quad_plane_uv(vec2 view_uv, uint layer, out vec2 plane_uv)
 {
-	uint source_image_index = LAYER.image_info.color_image_index;
-
-	// center point of the plane in view space.
-	vec3 quad_position = LAYER.quad_position.xyz;
-
-	// normal vector of the plane.
-	vec3 normal = LAYER.quad_normal.xyz;
-	normal = normalize(normal);
-
-	// coordinate system is the view space, therefore the camera/eye position is in the origin.
-	vec3 camera = vec3(0.0, 0.0, 0.0);
-
-	// default color white should never be visible
-	vec4 colour = vec4(1.0, 1.0, 1.0, 1.0);
+	// Normal of the plane, the eye at the origin (view space, as all quad transforms and coordinates).
+	vec3 normal = normalize(LAYER.quad_normal.xyz);
 
 	//! @todo can we get better "pixel stuck" on projection layers with timewarp uv?
 	// never use the timewarp uv here because it depends on the projection layer pose
-	vec2 uv = view_uv;
+	vec3 direction = normalize(get_direction(view_uv));
 
-	/*
-	* To fill in the view_uv texel on the target texture, an imaginary ray is shot through texels on the target
-	* texture. When this imaginary ray hits a quad layer, it means that when the respective color at the hit
-	* intersection is picked for the current view_uv texel, the final image as seen through the headset will
-	* show this view_uv texel at the respective location.
-	*/
-	vec3 direction = get_direction(uv);
-	direction = normalize(direction);
-
+	// Negative when the vectors point towards each other, 0 when perpendicular, positive when the ray meets the
+	// back face, which is not drawn.
 	float denominator = dot(direction, normal);
-
-	// denominator is negative when vectors point towards each other, 0 when perpendicular,
-	// and positive when vectors point in a similar direction, i.e. direction vector faces quad backface, which we don't render.
-	if (denominator < 0.00001) {
-		// shortest distance between origin and plane defined by normal + quad_position
-		float dist = dot(camera - quad_position, normal);
-
-		// distance between origin and intersection point on the plane.
-		float intersection_dist = (dot(camera, normal) + dist) / -denominator;
-
-		// layer is behind camera as defined by direction vector
-		if (intersection_dist < 0) {
-			colour = vec4(0.0, 0.0, 0.0, 0.0);
-			return colour;
-		}
-
-		vec3 intersection = camera + intersection_dist * direction;
-
-		// ps for "plane space"
-		vec2 intersection_ps = (LAYER.inverse_quad_transform * vec4(intersection.xyz, 1.0)).xy;
-
-		bool in_plane_bounds =
-			intersection_ps.x >= - LAYER.quad_extent.x / 2. && //
-			intersection_ps.x <= LAYER.quad_extent.x / 2. && //
-			intersection_ps.y >= - LAYER.quad_extent.y / 2. && //
-			intersection_ps.y <= LAYER.quad_extent.y / 2.;
-
-		if (in_plane_bounds) {
-			// intersection_ps is in [-quad_extent .. quad_extent]. Transform to  [0 .. quad_extent], then scale to [ 0 .. 1 ] for sampling
-			vec2 plane_uv = (intersection_ps.xy + LAYER.quad_extent / 2.) / LAYER.quad_extent;
-
-			// sample on the desired subimage, not the entire texture
-			plane_uv = fma(plane_uv, LAYER.post_transform.zw, LAYER.post_transform.xy);
-
-			colour = texture(source[source_image_index], plane_uv);
-		} else {
-			// intersection on infinite plane outside of plane bounds
-			colour = vec4(0.0, 0.0, 0.0, 0.0);
-			return colour;
-		}
-	} else {
-		// no intersection with front face of infinite plane or perpendicular
-		colour = vec4(0.0, 0.0, 0.0, 0.0);
-		return colour;
+	if (denominator >= 0.00001) {
+		return false;
 	}
+
+	// Distance from the eye to the plane along the ray.
+	float intersection_dist = dot(-LAYER.quad_position.xyz, normal) / -denominator;
+	if (intersection_dist < 0) {
+		return false;
+	}
+
+	// ps for "plane space", in [-quad_extent / 2 .. quad_extent / 2] inside the quad, scaled to [0 .. 1].
+	vec2 intersection_ps = (LAYER.inverse_quad_transform * vec4(intersection_dist * direction, 1.0)).xy;
+	plane_uv = (intersection_ps + LAYER.quad_extent / 2.) / LAYER.quad_extent;
+	return true;
+}
+
+vec4 do_quad(vec2 view_uv, uint layer)
+{
+	/*
+	 * To fill in the view_uv texel on the target texture, an imaginary ray is shot through texels on the target
+	 * texture. When this imaginary ray hits a quad layer, it means that when the respective color at the hit
+	 * intersection is picked for the current view_uv texel, the final image as seen through the headset will
+	 * show this view_uv texel at the respective location.
+	 */
+	vec2 plane_uv;
+	if (!quad_plane_uv(view_uv, layer, plane_uv) || any(lessThan(plane_uv, vec2(0.0))) ||
+	    any(greaterThan(plane_uv, vec2(1.0)))) {
+		// No intersection with the quad's front face (or past its edges).
+		return vec4(0.0, 0.0, 0.0, 0.0);
+	}
+
+	// The footprint: where the right and lower neighbours meet the plane (sample_layer filters where shrunk).
+	vec2 px, py;
+	vec2 du = quad_plane_uv(view_uv + vec2(rl_step.x, 0.0), layer, px) ? (px - plane_uv) * LAYER.post_transform.zw
+	                                                                    : vec2(0.0);
+	vec2 dv = quad_plane_uv(view_uv + vec2(0.0, rl_step.y), layer, py) ? (py - plane_uv) * LAYER.post_transform.zw
+	                                                                    : vec2(0.0);
+
+	// sample on the desired subimage, not the entire texture
+	vec4 colour = sample_layer(LAYER.image_info.color_image_index,
+	                           fma(plane_uv, LAYER.post_transform.zw, LAYER.post_transform.xy), du, dv,
+	                           LAYER.post_transform, 1.25, 24);
 
 	// Only invert alpha if we have a color, i.e. in plane bounds.
 	colour.a = invert_alpha(colour.a, layer);
@@ -756,6 +857,7 @@ void main()
 
 	ivec2 offset = ivec2(ubo.view.xy);
 	ivec2 extent = ivec2(ubo.view.zw);
+	rl_step = vec2(1.0 / float(extent.x), 1.0 / float(extent.y));
 
 #ifdef RL_BACKDROP_BLUR
 	if (backdrop_pass.pass >= 0) {

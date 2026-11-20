@@ -22,7 +22,7 @@ overview, the comparison with other ways of running a CV1 on Linux, the build in
 | [The Rift tab](rift-tab.md) | The menu on the right Oculus button: every setting, the status page, the performance numbers |
 | [Sensors](sensors.md) | Placing the Constellation sensors, measuring them, what happens when one is moved |
 | [Touch controllers and pairing](controllers.md) | Pairing without Windows, batteries, buttons, finger poses, haptics |
-| [The picture](picture.md) | Direct mode, Auto-HDR, HDR games and video, motion smoothing (ASW-style), render size |
+| [The picture](picture.md) | Direct mode, Auto-HDR, HDR games and video, motion smoothing (ASW-style), panel uniformity, render size and supersampling |
 | [OpenXR without SteamVR](openxr-without-steamvr.md) | RiftLinux's own runtime: app menu, right-click "Run with the Rift", `riftlinux-run`, WayVR |
 | [Settings](settings.md) | SteamVR starting when you put the headset on, SteamVR's standby, the wear sensor (face shields, pads), the headset taken off, a settings file broken by hand |
 | [Troubleshooting](troubleshooting.md) | A symptom, its cause and the fix; `riftlinux-setup check`; where the logs are |
@@ -31,7 +31,8 @@ overview, the comparison with other ways of running a CV1 on Linux, the build in
 ## In one minute
 
 1. Download the package for your distribution from the [Releases page](https://github.com/AIIX/RiftLinux/releases)
-   and install it (`sudo apt install ./riftlinux_<version>_amd64.deb`, `sudo pacman -U ...`, `sudo dnf install ...`).
+   and install it (`sudo apt install ./riftlinux_<version>_amd64.deb`, `sudo pacman -U ...`, `sudo dnf install ...`;
+   on Arch also `riftlinux-bin` from the AUR).
 2. Restart Steam once, plug in the Rift (HDMI and USB) and the sensors (USB).
 3. Put the headset on: SteamVR starts. Face the sensors and slowly turn your head left and right, then up and down, until the
    measuring notice goes away. Then press the right Oculus button, open the Rift tab and press **Set floor** with a

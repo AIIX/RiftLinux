@@ -32,6 +32,11 @@ layout(set = 0, binding = 5, std430) buffer restrict HdrStats
 {
 	uint bins[];
 } hdr_stats;
+// Panel calibration (RiftLinux, render_mura.c): response knots (levels 12, 25, 35, 90) per eye and colour, layer
+// eye * 3 + colour, 54 x 60, decoded floats; per-pixel maps per eye (layer), 1080 x 1200, bytes as stored. Read with
+// texelFetch only (no filtering across eyes, colours or texels).
+layout(set = 0, binding = 6) uniform sampler2DArray mura_response;
+layout(set = 0, binding = 7) uniform sampler2DArray mura_wall;
 layout(set = 0, binding = 3, std140) uniform restrict Config
 {
 	ivec4 views[2];
@@ -41,7 +46,8 @@ layout(set = 0, binding = 3, std140) uniform restrict Config
 	mat4 transform_timewarp_scanout_end[2];
 	// Output processing (RiftLinux): x dither step (0 off), y black lift (0 off), z tone-map shoulder (0 off), w frame.
 	vec4 post0;
-	// Unused (overdrive, parked on riftlinux/overdrive-parked).
+	// Panel calibration: x strength (drive space), y per-pixel maps' gain (experimental), z dark mode (0 left as it
+	// is, 1 dark-end formula, experimental), w dark noise (constant 0..1, negative: moving noise).
 	vec4 post1;
 	// Auto-HDR: x highlights, y shadows, z colour (0 each off), w the knee (OKLab lightness).
 	vec4 post2;
@@ -50,6 +56,17 @@ layout(set = 0, binding = 3, std140) uniform restrict Config
 	vec4 hdr_range;
 	// The lens test's pattern (RiftLinux): per view xy the lens centre's pixel, z 1 drawn.
 	ivec4 pattern[2];
+	// Panel calibration: x dark floor F, y dark minimum M (drive 0..1), z 1 response maps used, w 1 on.
+	vec4 mura;
+	// Panel calibration's per-pixel maps: scale, offset (RGBA) of eye 0, then eye 1.
+	vec4 mura_wall[4];
+	// Panel calibration: x where the per-pixel maps start fading out toward white (drive 0..1), y how much of the
+	// correction applies near black (full from level 25 up, easing to y at black).
+	vec4 mura_top;
+	// Panel calibration: the drive levels of the response knots (drive 0..1), from the calibration file.
+	vec4 mura_shades;
+	// Supersample filter (RiftLinux): x 1 on, y the most samples per axis.
+	vec4 lens;
 }ubo;
 
 
@@ -160,6 +177,170 @@ vec3 dither(vec3 c, ivec2 pixel, float step_size, float frame)
 	return clamp(c + n * step_size * fade, 0.0, 1.0);
 }
 
+/*
+ * Panel calibration (RiftLinux): on the panel's drive levels (after the sRGB encoding, before the dither). The response
+ * knots a, b, c, d of a place on the panel are what it gives at drive levels 12, 25, 35 and 90 (as drive values);
+ * the corrected drive for an input x is found between the knots it falls between (piecewise linear), and above d on
+ * the line from (d, 90) to (1, 1). The knots are interpolated before that inversion. Below a is the dark range
+ * (experimental). Places whose interpolated knots do not rise, or reach 1, are left as they are.
+ */
+// Near black the correction eases (mura_top.y), full from this level up (RiftLinux policy, tuned by eye).
+const float MURA_NEAR_BLACK_FULL = 25.0 / 255.0;
+
+// The knots of colour c at eye-local pixel at: bilinear between texel centres, clamped at the edges.
+vec4 mura_knots(uint eye, int c, uvec2 at, ivec2 extent)
+{
+	ivec2 size = textureSize(mura_response, 0).xy;
+	// Sampled at x / width, y / height of the eye (the pixel's corner, as the reference samples the response maps).
+	vec2 t = clamp(vec2(at) / vec2(extent) * vec2(size) - 0.5, vec2(0.0), vec2(size) - 1.0);
+	ivec2 p0 = ivec2(floor(t));
+	ivec2 p1 = min(p0 + 1, size - 1);
+	vec2 f = t - vec2(p0);
+	int layer = int(eye) * 3 + c;
+	vec4 k00 = texelFetch(mura_response, ivec3(p0.x, p0.y, layer), 0);
+	vec4 k10 = texelFetch(mura_response, ivec3(p1.x, p0.y, layer), 0);
+	vec4 k01 = texelFetch(mura_response, ivec3(p0.x, p1.y, layer), 0);
+	vec4 k11 = texelFetch(mura_response, ivec3(p1.x, p1.y, layer), 0);
+	return (k00 * (1.0 - f.x) + k10 * f.x) * (1.0 - f.y) + (k01 * (1.0 - f.x) + k11 * f.x) * f.y;
+}
+
+// The corrected drive for x (0..1), or negative: not evaluated (knots that do not rise, exact black kept, or the dark
+// range left alone). Dark modes (experimental): 0 left as it is below a (diagnostic: not continuous at a); 1 the
+// reference's dark end with exact black kept black (RiftLinux); 2 as the reference: the response stage's input is at
+// least the minimum M (an exact 0 too), below the lower threshold the floor F or M by the noise.
+float mura_drive(vec4 k, float x, float noise)
+{
+	if (any(isnan(k)) || any(isinf(k))) {
+		return -1.0;
+	}
+	// RiftLinux policy (not the reference's): the curve's gain limited to 8, so where the factory data is too weak
+	// (one map's bottom strip: no light measured at 12 and 25) near-black inputs are not lifted steeply into specks;
+	// continuous, so no boundary where it starts. Elsewhere the gain stays below 3.5 and nothing changes.
+	const vec4 S = ubo.mura_shades;
+	k.y = max(k.y, k.x + (S.y - S.x) / 8.0);
+	k.z = max(k.z, k.y + (S.z - S.y) / 8.0);
+	k.w = max(k.w, k.z + (S.w - S.z) / 8.0);
+	if (!(k.x < k.y && k.y < k.z && k.z < k.w && k.w < 1.0)) {
+		return -1.0;
+	}
+	float mode = ubo.post1.z;
+	float F = ubo.mura.x;
+	float M = ubo.mura.y;
+	if (mode >= 0.5) {
+		if (mode < 1.5 && x <= 0.0) {
+			return -1.0;
+		}
+		x = max(x, M);
+	}
+	if (x >= k.w) {
+		return S.w + (x - k.w) * (1.0 - S.w) / (1.0 - k.w);
+	}
+	if (x >= k.z) {
+		return S.z + (x - k.z) * (S.w - S.z) / (k.w - k.z);
+	}
+	if (x >= k.y) {
+		return S.y + (x - k.y) * (S.z - S.y) / (k.z - k.y);
+	}
+	if (x >= k.x) {
+		return S.x + (x - k.x) * (S.y - S.x) / (k.y - k.x);
+	}
+	if (mode < 0.5) {
+		return -1.0;
+	}
+	float lower = k.x - clamp((k.y - k.x) / (S.y - S.x), 0.0, 1.0) * (S.x - F);
+	if (x >= lower) {
+		if (k.x - lower <= 0.0) {
+			return -1.0;
+		}
+		return F + (x - lower) * (S.x - F) / (k.x - lower);
+	}
+	if (lower <= 0.0) {
+		return -1.0;
+	}
+	return (x / lower >= noise) ? F : M;
+}
+
+// Structure-free noise for the dark range: an integer hash (PCG) of the pixel and the frame, white noise in 0..1. The
+// dither's interleaved gradient noise has a diagonal structure that showed near black as a sliding slope pattern.
+uint mura_pcg(uint v)
+{
+	uint state = v * 747796405u + 2891336453u;
+	uint word = ((state >> ((state >> 28u) + 4u)) ^ state) * 277803737u;
+	return (word >> 22u) ^ word;
+}
+
+float mura_noise(ivec2 pixel, float frame)
+{
+	uint h = mura_pcg(uint(pixel.x) + mura_pcg(uint(pixel.y) + mura_pcg(uint(frame))));
+	return float(h >> 8u) * (1.0 / 16777216.0);
+}
+
+vec3 mura_correct(vec3 d, uint eye, uvec2 at, ivec2 extent, ivec2 pixel)
+{
+	float noise = ubo.post1.w >= 0.0 ? ubo.post1.w : mura_noise(pixel, ubo.post0.w);
+
+	vec3 x = clamp(d, 0.0, 1.0);
+	vec3 y = x;
+	bvec3 changed = bvec3(false);
+	if (ubo.mura.z > 0.5 && ubo.post1.x > 0.0) {
+		for (int c = 0; c < 3; c++) {
+			float drive = mura_drive(mura_knots(eye, c, at, extent), x[c], noise);
+			// Near black only part of it, if set: full from level 25 up, easing to mura_top.y at black.
+			float s = ubo.post1.x * mix(ubo.mura_top.y, 1.0, clamp(x[c] / MURA_NEAR_BLACK_FULL, 0.0, 1.0));
+			if (drive >= 0.0) {
+				// Exactly the drive at full strength: x + (drive - x) (also how mix() can be evaluated) misses it
+				// by a rounding step, and where the drive is the floor the per-pixel maps' "at or above the floor"
+				// then differs (measured: 14 % of pixels at grey 8).
+				y[c] = s >= 1.0 ? drive : mix(x[c], drive, s);
+				changed[c] = true;
+			}
+		}
+	}
+	// Per-pixel maps: red and blue at 1, green from 1 to 1.5 as the corrected green goes from the first knot level to the
+	// second (12 to 25 on the CV1's usual calibration; on other layouts the same span between their first two); only on
+	// channels at or above the dark floor (and above 0). Integer arithmetic for the pixel: a GPU's float division is
+	// not exact, and truncating at * size / extent lands on the row above for some rows.
+	if (ubo.post1.y != 0.0) {
+		ivec2 wsize = textureSize(mura_wall, 0).xy;
+		ivec2 wp = clamp(ivec2(at) * wsize / extent, ivec2(0), wsize - 1);
+		vec4 wall = texelFetch(mura_wall, ivec3(wp, int(eye)), 0) * ubo.mura_wall[eye * 2u] +
+		            ubo.mura_wall[eye * 2u + 1u];
+		float tg = clamp((y.g - ubo.mura_shades.x) / (ubo.mura_shades.y - ubo.mura_shades.x), 0.0, 1.0);
+		vec3 k = vec3(1.0, 1.0 + 0.5 * tg, 1.0) * ubo.post1.y;
+		// RiftLinux policy (not the reference's): faded out over the top of the range (full up to mura_top[0], none
+		// at white), so it never pushes a highlight into clipping (measured on HDR frames: 2 % of channels otherwise).
+		for (int c = 0; c < 3; c++) {
+			if (y[c] >= ubo.mura.x && y[c] > 0.0) {
+				float top = clamp((1.0 - y[c]) / max(1.0 - ubo.mura_top.x, 1e-6), 0.0, 1.0);
+				float nb = mix(ubo.mura_top.y, 1.0, clamp(x[c] / MURA_NEAR_BLACK_FULL, 0.0, 1.0));
+				y[c] += k[c] * top * nb * wall[c];
+				changed[c] = true;
+			}
+		}
+	}
+	vec3 o = d;
+	for (int c = 0; c < 3; c++) {
+		if (changed[c]) {
+			o[c] = clamp(y[c], 0.0, 1.0);
+		}
+	}
+	return o;
+}
+
+// Lanczos-2 kernel (radius 2), for the supersample filter.
+float lanczos2(float t)
+{
+	t = abs(t);
+	if (t < 1e-4) {
+		return 1.0;
+	}
+	if (t >= 2.0) {
+		return 0.0;
+	}
+	float a = 3.14159265 * t;
+	return 2.0 * sin(a) * sin(a * 0.5) / (a * a);
+}
+
 void main()
 {
 	uint ix = gl_GlobalInvocationID.x;
@@ -194,12 +375,107 @@ void main()
 	vec2 uvs[3] = vec2[3](r_uv, g_uv, b_uv);
 	vec3 taps[3];
 	bool hdr = ubo.hdr_source.x > 0.5;
+
+	/*
+	 * Supersample filter (RiftLinux): each panel pixel is resampled from the source with a Lanczos-2 filter over its
+	 * own footprint: how far its right and lower neighbours land in the source (lens correction and timewarp included;
+	 * the green channel's, the three are close), never narrower than one source texel. A source larger than the panel
+	 * (supersampling, the layer squasher's images) is so shrunk without skipping texels: one bilinear sample reads only
+	 * the four nearest and fine lines and text shimmer as the head moves. Chosen by measurement (shimmer as the pumping
+	 * of moving fine detail, and contrast kept): at 2 to 3.3 source texels a panel pixel 40 % less shimmer than one
+	 * sample with 94-98 % of the fine contrast; a box average or mipmaps shimmer more, Gaussians and Mitchell are
+	 * softer. Up to lens.y x lens.y taps a channel (about one a texel across the filter). Off: one sample.
+	 */
+	vec2 foot_x = vec2(0.0);
+	vec2 foot_y = vec2(0.0);
+	int nx = 1;
+	int ny = 1;
+	vec2 inset = vec2(0.0);
+	if (ubo.lens.x > 0.5) {
+		vec2 step = vec2(1.0 / float(extent.x), 1.0 / float(extent.y));
+		vec2 g_x = texture(distortion[k_view_count * 1 + iz], dist_uv + vec2(step.x, 0.0)).xy;
+		vec2 g_y = texture(distortion[k_view_count * 1 + iz], dist_uv + vec2(0.0, step.y)).xy;
+		vec2 v0 = k_do_timewarp ? transform_uv_timewarp(g_uv, iz) : g_uv;
+		foot_x = (k_do_timewarp ? transform_uv_timewarp(g_x, iz) : g_x) - v0;
+		foot_y = (k_do_timewarp ? transform_uv_timewarp(g_y, iz) : g_y) - v0;
+		vec2 texels = vec2(textureSize(source[iz], 0)) * abs(ubo.post_transform[iz].zw);
+		// At least one source texel per panel pixel: an enlarged source is resampled in its own texels.
+		float lx = length(foot_x * texels);
+		float ly = length(foot_y * texels);
+		foot_x *= max(1.0, 1.0 / max(lx, 1e-6));
+		foot_y *= max(1.0, 1.0 / max(ly, 1e-6));
+		int most = max(int(ubo.lens.y), 4);
+		// Lanczos-2 spans four footprints (radius two): about one tap a texel across it.
+		nx = clamp(int(ceil(4.0 * max(lx, 1.0))), 4, most);
+		ny = clamp(int(ceil(4.0 * max(ly, 1.0))), 4, most);
+		inset = 0.5 / max(texels, vec2(1.0));
+	}
+
+	// The filter's weights, once a pixel, normalised per axis so their product sums to one. Green (72 % of the
+	// light, where shimmer is seen) gets the full tap count; red and blue at most 4 x 4 (measured: still far less
+	// shimmer than one sample), which halves the reads.
+	float wx[8];
+	float wy[8];
+	float wx4[4];
+	float wy4[4];
+	int nx4 = min(nx, 4);
+	int ny4 = min(ny, 4);
+	if (ubo.lens.x > 0.5) {
+		float sx = 0.0;
+		float sy = 0.0;
+		for (int i = 0; i < 8; i++) {
+			wx[i] = i < nx ? lanczos2(((float(i) + 0.5) / float(nx)) * 4.0 - 2.0) : 0.0;
+			wy[i] = i < ny ? lanczos2(((float(i) + 0.5) / float(ny)) * 4.0 - 2.0) : 0.0;
+			sx += wx[i];
+			sy += wy[i];
+		}
+		for (int i = 0; i < 8; i++) {
+			wx[i] /= sx;
+			wy[i] /= sy;
+		}
+		sx = 0.0;
+		sy = 0.0;
+		for (int i = 0; i < 4; i++) {
+			wx4[i] = i < nx4 ? lanczos2(((float(i) + 0.5) / float(nx4)) * 4.0 - 2.0) : 0.0;
+			wy4[i] = i < ny4 ? lanczos2(((float(i) + 0.5) / float(ny4)) * 4.0 - 2.0) : 0.0;
+			sx += wx4[i];
+			sy += wy4[i];
+		}
+		for (int i = 0; i < 4; i++) {
+			wx4[i] /= sx;
+			wy4[i] /= sy;
+		}
+	}
+
 	for (int k = 0; k < 3; k++) {
 		vec2 view_uv = k_do_timewarp ? transform_uv_timewarp(uvs[k], iz) : uvs[k];
 		bool inside = all(greaterThanEqual(view_uv, vec2(0.0))) && all(lessThan(view_uv, vec2(1.0)));
-		vec3 c = inside ? texture(source[iz], transform_uv_subimage(view_uv, iz)).rgb : vec3(0.0);
+		vec3 c = vec3(0.0);
+		if (inside && ubo.lens.x <= 0.5) {
+			c = texture(source[iz], transform_uv_subimage(view_uv, iz)).rgb;
+			if (hdr) {
+				c = decode_hdr(c, ubo.hdr_source);
+			}
+		} else if (inside) {
+			// Kept inside the area the application drew (past it SteamVR's images hold old frames). In full colour:
+			// Auto-HDR's colour stage below works on the sample's colour.
+			bool full = k == 1;
+			int mx = full ? nx : nx4;
+			int my = full ? ny : ny4;
+			for (int j = 0; j < my; j++) {
+				vec2 row = view_uv + (((float(j) + 0.5) / float(my)) * 4.0 - 2.0) * foot_y;
+				vec3 r = vec3(0.0);
+				for (int i = 0; i < mx; i++) {
+					vec2 t = clamp(row + (((float(i) + 0.5) / float(mx)) * 4.0 - 2.0) * foot_x, inset, vec2(1.0) - inset);
+					vec3 s = texture(source[iz], transform_uv_subimage(t, iz)).rgb;
+					r += (full ? wx[i] : wx4[i]) * (hdr ? decode_hdr(s, ubo.hdr_source) : s);
+				}
+				c += (full ? wy[j] : wy4[j]) * r;
+			}
+			// Lanczos rings a little at hard edges: no light below zero.
+			c = max(c, vec3(0.0));
+		}
 		if (hdr) {
-			c = decode_hdr(c, ubo.hdr_source);
 			int slot = int(ubo.hdr_range.w) - 1;
 			float y = dot(c, vec3(0.2126, 0.7152, 0.0722));
 			if (k == 1 && inside && slot >= 0 && y > 1.0) {
@@ -231,6 +507,11 @@ void main()
 
 	// Do colour correction here since there are no automatic conversion in hardware available.
 	colour = vec4(from_linear_to_srgb(colour.rgb), 1);
+
+	// The panel's own unevenness (mura), on its drive levels, before the output capture and the dither.
+	if (ubo.mura.w > 0.5) {
+		colour.rgb = mura_correct(colour.rgb, iz, uvec2(ix, iy), extent, ivec2(offset.x + ix, offset.y + iy));
+	}
 
 	// Encoded for the panel, kept for the output capture, then dithered to the link's levels.
 	ivec2 pixel = ivec2(offset.x + ix, offset.y + iy);

@@ -1874,15 +1874,17 @@ main(int argc, char **argv)
 						continue;
 					}
 					if (name.rfind("cmd-picture ", 0) == 0) {
-						int direct = 0, on = 0, strength = 50, colour = 50, smoothing = 0, bright = 0;
-						if (sscanf(name.c_str() + 12, "%d %d %d %d %d %d", &direct, &on, &strength, &colour,
-						           &smoothing, &bright) >= 3) {
+						int direct = 0, on = 0, strength = 50, colour = 50, smoothing = 0, bright = 0,
+						    uniformity = 0;
+						if (sscanf(name.c_str() + 12, "%d %d %d %d %d %d %d", &direct, &on, &strength, &colour,
+						           &smoothing, &bright, &uniformity) >= 3) {
 							picture.direct = direct != 0;
 							picture.on = on != 0;
 							picture.strength = std::clamp(strength, 0, 100);
 							picture.colour = std::clamp(colour, 0, 100);
 							picture.smoothing = smoothing != 0;
 							picture.bright = bright != 0;
+							picture.uniformity = uniformity != 0;
 						}
 						continue;
 					}
@@ -2097,6 +2099,12 @@ main(int argc, char **argv)
 						picture.bright = !picture.bright;
 						tell_driver(picture.bright ? "hdr-bright 1" : "hdr-bright 0");
 						fprintf(stderr, "riftlinux-notices: HDR Bright %s\n", picture.bright ? "on" : "off");
+						break;
+					case Ctl::Uniformity:
+						picture.uniformity = !picture.uniformity;
+						tell_driver(picture.uniformity ? "uniformity 1" : "uniformity 0");
+						fprintf(stderr, "riftlinux-notices: panel uniformity %s\n",
+						        picture.uniformity ? "on" : "off");
 						break;
 					case Ctl::Smoothing:
 						picture.smoothing = !picture.smoothing;

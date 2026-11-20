@@ -373,6 +373,24 @@ _Static_assert(sizeof(struct render_compute_layer_ubo_data) <= 65536, "layer UBO
 DEBUG_GET_ONCE_NUM_OPTION(capture_output, "XRT_COMPOSITOR_CAPTURE_OUTPUT", 0)
 DEBUG_GET_ONCE_NUM_OPTION(capture_output_start, "XRT_COMPOSITOR_CAPTURE_OUTPUT_START", 2700)
 DEBUG_GET_ONCE_BOOL_OPTION(capture_output_ab, "XRT_COMPOSITOR_CAPTURE_OUTPUT_AB", false)
+//! With XRT_COMPOSITOR_CAPTURE_OUTPUT_AB: the first frame of each pair without the panel calibration instead of without
+//! Auto-HDR (everything else the same): the calibration's before and after on the same scene.
+DEBUG_GET_ONCE_BOOL_OPTION(capture_output_ab_mura, "XRT_COMPOSITOR_CAPTURE_OUTPUT_AB_MURA", false)
+
+/*
+ * Panel calibration, desk diagnostics (experimental, not settings), defaults as the calibration expects them: the
+ * response maps on, the per-pixel maps' gain 1 (red, blue x1, green x1 to 1.5), the dark range's mode 1 (the dark-end
+ * formula, exact black kept; 0 left as it is, diagnostic; 2 the other dark-end form, 0 entering at the minimum), floor F
+ * 3 and minimum M 1 (levels), the noise moving (negative) or a constant (desk comparisons).
+ */
+DEBUG_GET_ONCE_BOOL_OPTION(mura_response, "XRT_COMPOSITOR_MURA_RESPONSE", true)
+DEBUG_GET_ONCE_FLOAT_OPTION(mura_wall, "XRT_COMPOSITOR_MURA_WALL", 1.0f)
+DEBUG_GET_ONCE_NUM_OPTION(mura_dark, "XRT_COMPOSITOR_MURA_DARK", 1)
+DEBUG_GET_ONCE_FLOAT_OPTION(mura_dark_floor, "XRT_COMPOSITOR_MURA_DARK_FLOOR", 3.0f)
+DEBUG_GET_ONCE_FLOAT_OPTION(mura_dark_min, "XRT_COMPOSITOR_MURA_DARK_MIN", 1.0f)
+DEBUG_GET_ONCE_FLOAT_OPTION(mura_dark_noise, "XRT_COMPOSITOR_MURA_DARK_NOISE", -1.0f)
+//! Where the per-pixel maps start fading out toward white (levels; RiftLinux policy: no correction-made clipping).
+DEBUG_GET_ONCE_FLOAT_OPTION(mura_wall_top, "XRT_COMPOSITOR_MURA_WALL_TOP", 230.0f)
 
 enum capture_step
 {
@@ -539,19 +557,79 @@ static void
 fill_output_processing(struct render_compute_distortion_ubo_data *data,
                        bool previous_fresh,
                        bool auto_hdr_off,
-                       bool source_processed)
+                       bool calibration_off,
+                       bool source_processed,
+                       const struct render_resources *r)
 {
 	static uint32_t frame = 0;
 	struct render_output_settings s;
 	render_output_settings_get(&s);
 
+	// Supersample filter: Lanczos-2 over each panel pixel's footprint, up to 7 x 7 taps for green, 4 x 4 for red and blue.
+	data->lens[0] = s.supersample_filter ? 1.0f : 0.0f;
+	data->lens[1] = 7.0f;
+	data->lens[2] = 0.0f;
+	data->lens[3] = 0.0f;
 	data->post0[0] = s.dither_bits >= 1.0f ? 1.0f / (exp2f(s.dither_bits) - 1.0f) : 0.0f;
 	data->post0[1] = auto_hdr_off ? 0.0f : black_lift_for_level(s.black_level);
 	data->post0[2] = s.tonemap_shoulder;
 	data->post0[3] = (float)(frame++ % 1024u);
-	// post1: unused (overdrive, parked on riftlinux/overdrive-parked).
+	// Panel calibration (render_mura.c): only with the headset's calibration loaded.
 	(void)previous_fresh;
 	memset(data->post1, 0, sizeof(data->post1));
+	memset(data->mura, 0, sizeof(data->mura));
+	memset(data->mura_wall, 0, sizeof(data->mura_wall));
+	memset(data->mura_top, 0, sizeof(data->mura_top));
+	memset(data->mura_shades, 0, sizeof(data->mura_shades));
+	const __typeof__(r->compute.distortion.mura) *m = &r->compute.distortion.mura;
+	const float strength = fminf(fmaxf(s.mura_strength, 0.0f), 1.0f);
+	const float wall = debug_get_float_option_mura_wall();
+	const float dark = (float)debug_get_num_option_mura_dark();
+	const float floor_levels = debug_get_float_option_mura_dark_floor();
+	const float min_levels = debug_get_float_option_mura_dark_min();
+	const float noise = debug_get_float_option_mura_dark_noise();
+	const float response = debug_get_bool_option_mura_response() ? 1.0f : 0.0f;
+	// Its state in the log when it changes (warning level: the default log level shows it).
+	static int mura_was = -1;
+	static float mura_values_was[3] = {-1.0f, -1.0f, -1.0f};
+	const int mura_now = s.mura_correction && m->loaded ? 1 : 0;
+	const float near_black = fminf(fmaxf(s.mura_near_black, 0.0f), 1.0f);
+	const float mura_values[3] = {strength, wall, near_black};
+	const bool mura_values_changed = mura_now && memcmp(mura_values, mura_values_was, sizeof(mura_values)) != 0;
+	if (mura_now != mura_was || mura_values_changed) {
+		memcpy(mura_values_was, mura_values, sizeof(mura_values));
+		if (mura_now) {
+			U_LOG_W("Panel uniformity on: strength %.0f %%, near black %.0f %%, response maps %s, per-pixel maps gain %g, "
+			        "dark range %s (floor %g, minimum %g levels, noise %g)",
+			        (double)(strength * 100.0f), (double)(near_black * 100.0f), response > 0.0f ? "on" : "off",
+			        (double)wall,
+			        dark >= 2.0f   ? "dark-end formula as the reference (experimental)"
+			        : dark >= 1.0f ? "dark-end formula, exact black kept (experimental)"
+			                       : "left as it is (diagnostic)",
+			        (double)floor_levels,
+			        (double)min_levels, (double)noise);
+		} else if (mura_was == 1 || s.mura_correction) {
+			U_LOG_W("Panel uniformity off%s", s.mura_correction ? " (no calibration loaded for this headset)" : "");
+		}
+		mura_was = mura_now;
+	}
+	if (mura_now && !calibration_off) {
+		data->post1[0] = strength;
+		data->post1[1] = wall;
+		data->post1[2] = dark;
+		data->post1[3] = noise;
+		data->mura[0] = floor_levels / 255.0f;
+		data->mura[1] = min_levels / 255.0f;
+		data->mura[2] = response;
+		data->mura[3] = 1.0f;
+		data->mura_top[0] = fminf(fmaxf(debug_get_float_option_mura_wall_top(), 0.0f), 254.0f) / 255.0f;
+		data->mura_top[1] = near_black;
+		memcpy(data->mura_shades, m->shades, sizeof(data->mura_shades));
+		for (int e = 0; e < 2; e++) {
+			memcpy(data->mura_wall[e * 2], m->wall_scale[e], sizeof(m->wall_scale[e]));
+			memcpy(data->mura_wall[e * 2 + 1], m->wall_offset[e], sizeof(m->wall_offset[e]));
+		}
+	}
 
 	auto_hdr_params_from(&s, auto_hdr_off || source_processed, data->post2);
 
@@ -609,7 +687,9 @@ dispatch_project_pipeline(struct render_compute *render,
 	}
 	__typeof__(r->compute.distortion.previous) *prev = &r->compute.distortion.previous;
 	const enum capture_step capture_step = (enum capture_step)r->compute.distortion.capture.step;
-	fill_output_processing(data, prev->fresh, capture_step == CAPTURE_OFF, render->source_processed);
+	const bool ab_mura = debug_get_bool_option_capture_output_ab_mura();
+	fill_output_processing(data, prev->fresh, capture_step == CAPTURE_OFF && !ab_mura,
+	                       capture_step == CAPTURE_OFF && ab_mura, render->source_processed, r);
 	// The fast path's HDR layer, measured into the squasher's histograms; nothing after the squasher.
 	if (render->source_processed) {
 		memset(data->hdr_source, 0, sizeof(data->hdr_source));
@@ -701,6 +781,39 @@ dispatch_project_pipeline(struct render_compute *render,
 	    .pBufferInfo = &hdr_stats_info,
 	};
 	vk->vkUpdateDescriptorSets(vk->device, 1, &hdr_stats_write, 0, NULL);
+
+	// Panel calibration's images (neutral until the headset's calibration is loaded).
+	VkDescriptorImageInfo mura_infos[2] = {
+	    {
+	        .sampler = r->compute.distortion.mura.sampler,
+	        .imageView = r->compute.distortion.mura.response_view,
+	        .imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+	    },
+	    {
+	        .sampler = r->compute.distortion.mura.sampler,
+	        .imageView = r->compute.distortion.mura.wall_view,
+	        .imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+	    },
+	};
+	VkWriteDescriptorSet mura_writes[2] = {
+	    {
+	        .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+	        .dstSet = render->shared_descriptor_set,
+	        .dstBinding = r->compute.mura_response_binding,
+	        .descriptorCount = 1,
+	        .descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
+	        .pImageInfo = &mura_infos[0],
+	    },
+	    {
+	        .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+	        .dstSet = render->shared_descriptor_set,
+	        .dstBinding = r->compute.mura_wall_binding,
+	        .descriptorCount = 1,
+	        .descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
+	        .pImageInfo = &mura_infos[1],
+	    },
+	};
+	vk->vkUpdateDescriptorSets(vk->device, 2, mura_writes, 0, NULL);
 	vk_cmd_image_barrier_gpu_locked(                                   //
 	    vk,                                                            //
 	    r->cmd,                                                        //
@@ -829,7 +942,11 @@ render_compute_auto_hdr_params(struct render_compute *render, float out_params[4
 {
 	struct render_output_settings s;
 	render_output_settings_get(&s);
-	auto_hdr_params_from(&s, render->r->compute.distortion.capture.step == CAPTURE_OFF, out_params);
+	// In the calibration's A/B capture the first frame keeps Auto-HDR (only the calibration is off).
+	auto_hdr_params_from(&s,
+	                     render->r->compute.distortion.capture.step == CAPTURE_OFF &&
+	                         !debug_get_bool_option_capture_output_ab_mura(),
+	                     out_params);
 }
 
 void

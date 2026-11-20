@@ -501,6 +501,10 @@ struct render_resources
 		//! HDR layers' brightness histograms (layer squasher only, RiftLinux).
 		uint32_t hdr_stats_binding;
 
+		//! Panel calibration (render_mura.c, RiftLinux): response maps and per-pixel maps (distortion only).
+		uint32_t mura_response_binding;
+		uint32_t mura_wall_binding;
+
 		struct
 		{
 			//! Descriptor set layout for compute.
@@ -585,6 +589,35 @@ struct render_resources
 				uint64_t frames;
 				int done;
 			} capture;
+
+			/*!
+			 * Panel calibration (render_mura.c): the headset's prepared calibration. Response: per eye and colour
+			 * (layer eye * 3 + colour) a 54 x 60 map of the panel's response at drive levels 12, 25, 35 and 90
+			 * (decoded, RGBA float); wall: per eye (layer) a 1080 x 1200 per-pixel map as stored (RGBA bytes,
+			 * decoded in the shader with wall_scale and wall_offset). 1 x 1 neutral images until one is loaded.
+			 */
+			struct
+			{
+				VkImage response_image;
+				VkDeviceMemory response_memory;
+				VkImageView response_view;
+				VkImage wall_image;
+				VkDeviceMemory wall_memory;
+				VkImageView wall_view;
+				VkSampler sampler;
+				float wall_scale[2][4];
+				float wall_offset[2][4];
+				//! The drive levels (0..1) of the four response knots.
+				float shades[4];
+				bool loaded;
+				//! The calibration file as it was at the last load attempt (render_mura_reload_if_changed).
+				bool file_seen;
+				int64_t file_mtime_ns;
+				int64_t file_size;
+				int64_t next_check_ns;
+				//! A calibration being loaded beside the frames (render_mura.c), NULL when none.
+				struct render_mura_loader *loader;
+			} mura;
 		} distortion;
 
 		struct
@@ -659,6 +692,43 @@ render_distortion_images_ensure(struct render_resources *r,
  */
 void
 render_distortion_images_fini(struct render_resources *r);
+
+/*!
+ * Mura correction (RiftLinux): the neutral images (nothing corrected) the distortion pass reads until a table is
+ * loaded; called by render_resources_init.
+ *
+ * @public @memberof render_resources
+ */
+bool
+render_mura_init(struct render_resources *r);
+
+/*!
+ * Loads the panel calibration of the headset with serial @p serial (XRT_COMPOSITOR_MURA_FILE, else
+ * $XDG_CONFIG_HOME/riftlinux/spud/HMD_<serial>.rlspudc), replacing the images in use; false (and nothing changed) when
+ * there is none or it does not read right. Call before the first frame, or with the queue idle.
+ *
+ * @public @memberof render_resources
+ */
+bool
+render_mura_load(struct render_resources *r, const char *serial);
+
+/*!
+ * While panel uniformity is switched on: loads the calibration again when its file appeared or changed since the last
+ * load attempt (riftlinux-setup built or imported it while running); looks at most once a second. Call only with the
+ * queue idle (nothing in flight reads the images it replaces).
+ *
+ * @public @memberof render_resources
+ */
+void
+render_mura_reload_if_changed(struct render_resources *r, const char *serial, int64_t now_ns);
+
+/*!
+ * Frees the mura correction's images.
+ *
+ * @public @memberof render_resources
+ */
+void
+render_mura_fini(struct render_resources *r);
 
 /*!
  * Returns the timestamps for when the latest GPU work started and stopped that
@@ -1434,7 +1504,7 @@ struct render_compute_layer_ubo_data
 	{
 		uint32_t value;
 		uint32_t linear_target; // Non-zero: store linear values (render_resources::scratch_linear).
-		uint32_t padding1;      // Padding up to a vec4.
+		uint32_t supersample_filter; // Non-zero: shrunk layers filtered (render_output_settings::supersample_filter).
 		uint32_t padding2;
 	} layer_count;
 
@@ -1570,7 +1640,12 @@ struct render_compute_distortion_ubo_data
 	 */
 	float post0[4];
 
-	//! Overdrive: x rise gain, y fall gain, z extra gain near black, w on (1) or off (0).
+	/*!
+	 * Panel calibration (RiftLinux, render_mura.c): x strength (the response correction blended in drive space,
+	 * 0..1), y the per-pixel maps' gain (0 off; experimental), z the dark range's mode (0 left as it is, 1 the
+	 * dark-end formula with mura[0..1]; experimental), w the dark range's noise (a constant in 0..1, or negative:
+	 * the dither's moving noise).
+	 */
 	float post1[4];
 
 	/*!
@@ -1585,6 +1660,28 @@ struct render_compute_distortion_ubo_data
 
 	//! The lens test's pattern (RiftLinux, u_notice_lens_pattern): per view x, y its lens centre's pixel, z 1 drawn.
 	int32_t pattern[XRT_MAX_VIEWS][4];
+
+	//! Panel calibration: x the dark range's floor drive F, y its minimum M (0..1), z 1 response maps used, w 1 on.
+	float mura[4];
+
+	//! Panel calibration's per-pixel maps: scale and offset RGBA of eye 0, then of eye 1.
+	float mura_wall[4][4];
+
+	//! Panel calibration: x where the per-pixel maps start fading out toward white (drive 0..1; none at white), y how
+	//! much of the correction applies near black (0..1; full from level 25 up).
+	float mura_top[4];
+
+	/*!
+	 * Panel calibration (RiftLinux): the drive levels (0..1) of the four response knots, from the calibration file
+	 * (12, 25, 35 and 90 of 255 on the CV1's usual layout).
+	 */
+	float mura_shades[4];
+
+	/*!
+	 * Supersample filter (RiftLinux, render_output_settings::supersample_filter): x 1 on (each panel pixel averages
+	 * the source over its footprint), y the most samples per axis.
+	 */
+	float lens[4];
 };
 
 /*!
