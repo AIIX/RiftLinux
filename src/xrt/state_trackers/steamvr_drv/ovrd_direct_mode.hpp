@@ -1,4 +1,5 @@
 // SPDX-FileCopyrightText: 2026 Aditya Mehra <aix.m@outlook.com>
+// SPDX-FileCopyrightText: 2026 Ethan Dagnone <ethandagnone@gmail.com>
 // SPDX-License-Identifier: BSL-1.0
 /*!
  * @file
@@ -167,6 +168,8 @@ public:
 	 * compositor's own drawing only placeholder ones.
 	 */
 	bool m_fence = true;
+	std::atomic<bool> m_handoff{false};
+	uint64_t m_missing_fences = 0;
 	//! Present only takes the frame, PostPresent hands it to Monado (display.direct_mode_present_split); false: both
 	//! in Present.
 	bool m_present_split = true;

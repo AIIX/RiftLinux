@@ -1,4 +1,5 @@
 // Copyright 2019-2023, Collabora, Ltd.
+// SPDX-FileCopyrightText: 2026 Ethan Dagnone <ethandagnone@gmail.com>
 // SPDX-License-Identifier: BSL-1.0
 /*!
  * @file
@@ -94,7 +95,6 @@ swapchain_dec_image_use(struct xrt_swapchain *xsc, uint32_t index)
 
 	sc->images[index].use_count--;
 	if (sc->images[index].use_count == 0) {
-		os_mutex_unlock(&sc->images[index].use_mutex);
 		pthread_cond_broadcast(&sc->images[index].use_cond);
 	}
 
@@ -763,4 +763,30 @@ comp_swapchain_import(struct vk_bundle *vk,
 	xrt_swapchain_reference(out_xsc, &sc->base.base);
 
 	return xret;
+}
+
+VkResult
+comp_swapchain_enable_steamvr_color_handoff(struct comp_swapchain *sc)
+{
+	struct vk_bundle *vk = sc->vk;
+	struct vk_cmd_pool *pool = &sc->cscs->pool;
+	VkCommandBuffer cmd = VK_NULL_HANDLE;
+	vk_cmd_pool_lock(pool);
+	VkResult ret = vk_cmd_pool_create_and_begin_cmd_buffer_locked(vk, pool, 0, &cmd);
+	if (ret == VK_SUCCESS) {
+		VkImageSubresourceRange range = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+		for (uint32_t i = 0; i < sc->vkic.image_count; i++) {
+			vk_cmd_image_barrier_gpu_locked(
+			    vk, cmd, sc->vkic.images[i].handle, VK_ACCESS_SHADER_READ_BIT,
+			    VK_ACCESS_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
+			    VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, range);
+		}
+		// Creation only: finish before returning the handles for SteamVR's first render.
+		ret = vk_cmd_pool_end_submit_wait_and_free_cmd_buffer_locked(vk, pool, cmd);
+	}
+	vk_cmd_pool_unlock(pool);
+	if (ret == VK_SUCCESS) {
+		sc->steamvr_color_handoff = true;
+	}
+	return ret;
 }

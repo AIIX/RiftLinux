@@ -1,6 +1,7 @@
 // Copyright 2019-2023, Collabora, Ltd.
 // Copyright 2025-2026, NVIDIA CORPORATION.
 // SPDX-FileCopyrightText: 2026 Aditya Mehra <aix.m@outlook.com>
+// SPDX-FileCopyrightText: 2026 Ethan Dagnone <ethandagnone@gmail.com>
 // SPDX-License-Identifier: BSL-1.0
 /*!
  * @file
@@ -312,6 +313,26 @@ create_instance(struct vk_bundle *vk, const struct comp_vulkan_arguments *vk_arg
 	return ret;
 }
 
+bool
+comp_vulkan_is_radv(struct vk_bundle *vk)
+{
+	VkPhysicalDeviceProperties properties;
+	vk->vkGetPhysicalDeviceProperties(vk->physical_device, &properties);
+	// Driver properties are core in Vulkan 1.2. Older drivers keep the existing path.
+	if (properties.apiVersion < VK_API_VERSION_1_2) {
+		return false;
+	}
+	VkPhysicalDeviceDriverProperties driver = {
+	    .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DRIVER_PROPERTIES,
+	};
+	VkPhysicalDeviceProperties2 properties2 = {
+	    .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2,
+	    .pNext = &driver,
+	};
+	vk->vkGetPhysicalDeviceProperties2(vk->physical_device, &properties2);
+	return driver.driverID == VK_DRIVER_ID_MESA_RADV;
+}
+
 static VkResult
 create_device(struct vk_bundle *vk, const struct comp_vulkan_arguments *vk_args)
 {
@@ -329,7 +350,6 @@ create_device(struct vk_bundle *vk, const struct comp_vulkan_arguments *vk_args)
 	    VK_QUEUE_GLOBAL_PRIORITY_MEDIUM_EXT,   // Default fallback.
 	};
 
-	const bool only_compute_queue = vk_args->only_compute_queue;
 	int gpu_index = -1;
 
 	ret = resolve_selected_gpu_index(vk, vk_args, &gpu_index);
@@ -337,11 +357,20 @@ create_device(struct vk_bundle *vk, const struct comp_vulkan_arguments *vk_args)
 		return ret;
 	}
 
+	// Resolve the actual device before deciding whether RADV needs a graphics queue.
+	ret = vk_select_physical_device(vk, gpu_index);
+	if (ret != VK_SUCCESS) {
+		return ret;
+	}
+	gpu_index = vk->physical_device_index;
+	const bool handoff = vk_args->steamvr_color_handoff && comp_vulkan_is_radv(vk);
+	const bool only_compute_queue = vk_args->only_compute_queue && !handoff;
+
 	struct vk_device_features device_features = {
 	    .shader_image_gather_extended = true,
 	    .shader_storage_image_write_without_format = true,
 	    .storage_buffer_8bit_access = true,
-	    .null_descriptor = only_compute_queue,
+	    .null_descriptor = vk_args->only_compute_queue,
 	    .timeline_semaphore = vk_args->timeline_semaphore,
 	    .synchronization_2 = true,
 	    .present_id = true,

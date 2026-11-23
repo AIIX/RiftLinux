@@ -1,4 +1,5 @@
 // SPDX-FileCopyrightText: 2026 Aditya Mehra <aix.m@outlook.com>
+// SPDX-FileCopyrightText: 2026 Ethan Dagnone <ethandagnone@gmail.com>
 // SPDX-License-Identifier: BSL-1.0
 /*!
  * @file
@@ -12,8 +13,10 @@
 #include "math/m_vec3.h"
 #include "os/os_time.h"
 #include "util/u_time.h"
+#include "util/u_debug.h"
 
 #include <unistd.h>
+#include <fcntl.h>
 #include <dlfcn.h>
 #include <linux/types.h>
 #include <sys/ioctl.h>
@@ -32,6 +35,7 @@
 #include "vk/vk_helpers.h"
 #include "vk/vk_cmd_pool.h"
 #include "util/comp_swapchain.h"
+#include "util/comp_vulkan.h"
 #include <sys/stat.h>
 #endif
 
@@ -585,7 +589,7 @@ OvrdDirectMode::CreateSwapTextureSet(uint32_t unPid,
 		}
 	}
 
-	// The same images as a Monado swapchain; Monado duplicates the descriptors.
+	// Import consumes the native descriptors. Keep separate owned copies for fence ioctls.
 	struct xrt_swapchain_create_info info = {};
 	info.bits = (enum xrt_swapchain_usage_bits)(XRT_SWAPCHAIN_USAGE_COLOR | XRT_SWAPCHAIN_USAGE_SAMPLED |
 	                                            XRT_SWAPCHAIN_USAGE_TRANSFER_SRC | XRT_SWAPCHAIN_USAGE_TRANSFER_DST |
@@ -652,13 +656,51 @@ OvrdDirectMode::CreateSwapTextureSet(uint32_t unPid,
 	info.face_count = 1;
 	info.array_size = 1;
 	info.mip_count = 1;
+	int copies[3] = {-1, -1, -1};
+	for (int i = 0; i < 3; i++) {
+		copies[i] = fcntl(set->fds[i], F_DUPFD_CLOEXEC, 0);
+		if (copies[i] < 0) {
+			for (int j = 0; j < i; j++) {
+				close(copies[j]);
+			}
+			std::lock_guard<std::mutex> lock(m_lock);
+			destroy_set_locked(set.get());
+			return;
+		}
+	}
+	for (int i = 0; i < 3; i++) {
+		set->fds[i] = copies[i];
+	}
 	const xrt_result_t xret = xrt_comp_import_swapchain(&m_xcn->base, &info, natives, 3, &set->xsc);
 	if (xret != XRT_SUCCESS) {
+		// Import may have consumed all handles before a later setup failure.
+		for (int i = 0; i < 3; i++) {
+			if (natives[i].handle >= 0) {
+				close(natives[i].handle);
+			}
+		}
 		ovrd_log("Direct mode: Monado could not import the images (%d)\n", (int)xret);
 		std::lock_guard<std::mutex> lock(m_lock);
 		destroy_set_locked(set.get());
 		return;
 	}
+
+#ifdef XRT_HAVE_VULKAN
+	auto *sc = comp_swapchain(set->xsc);
+	if (set->is_compositor && debug_get_bool_option("RIFTLINUX_STEAMVR_HANDOFF", false) &&
+	    comp_vulkan_is_radv(sc->vk)) {
+		if (comp_swapchain_enable_steamvr_color_handoff(sc) != VK_SUCCESS) {
+			ovrd_log("Direct mode: cannot initialize colour handoff\n");
+			std::lock_guard<std::mutex> lock(m_lock);
+			destroy_set_locked(set.get());
+			return;
+		}
+		// Require producer fences only for the RADV metadata transitions. Other drivers
+		// retain existing optional-fence/timing-guard path unless verified in future.
+		m_handoff = true;
+		ovrd_log("Direct mode: set %d uses batched colour attachment handoff\n", set->number);
+	}
+#endif
 
 	ovrd_log("Direct mode: imported into Monado as a swapchain; set %d shared images 0x%llx 0x%llx 0x%llx\n",
 	         set->number, (unsigned long long)set->handles[0], (unsigned long long)set->handles[1],
@@ -831,7 +873,7 @@ OvrdDirectMode::Present(vr::SharedTextureHandle_t syncTexture)
 			m_standby.store(false);
 		}
 		// The fences of every image this frame shows, both eyes, every layer (an image once): one sync file.
-		if (m_fence && m_fences_work != 0) {
+		if (m_handoff || (m_fence && m_fences_work != 0)) {
 			std::vector<int> fds;
 			for (const auto &layer : layers) {
 				for (const SubmitLayerPerEye_t &eye : layer) {
@@ -982,6 +1024,14 @@ OvrdDirectMode::submit_frame(std::vector<std::array<SubmitLayerPerEye_t, 2>> lay
                              int64_t entered_ns,
                              bool sync_given)
 {
+	// A timing guard cannot replace producer completion for metadata transitions.
+	if (m_handoff && !layers.empty() && fence < 0) {
+		if (m_missing_fences++ % 900 == 0) {
+			ovrd_log("Direct mode: dropping unsynchronized frame (no producer fence); total %llu\n",
+			         (unsigned long long)m_missing_fences);
+		}
+		return;
+	}
 	const int64_t submit_from_ns = os_monotonic_get_ns();
 	int64_t shown = 0;
 	// Monado's frame pacing: this waits until it is time to hand over the next frame, which paces SteamVR's
