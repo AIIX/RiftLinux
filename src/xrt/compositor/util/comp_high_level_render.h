@@ -1,5 +1,6 @@
 // Copyright 2019-2024, Collabora, Ltd.
 // Copyright 2024-2025, NVIDIA CORPORATION.
+// SPDX-FileCopyrightText: 2026 Ethan Dagnone <ethandagnone@gmail.com>
 // SPDX-License-Identifier: BSL-1.0
 /*!
  * @file
@@ -23,6 +24,18 @@
 #ifdef __cplusplus
 extern "C" {
 #endif
+
+
+/*!
+ * Transition SteamVR compositor-owned attachments before or after sampling.
+ * Recorded in the frame command buffer to avoid additional submissions and waits.
+ */
+void
+chl_steamvr_color_handoff(struct vk_bundle *vk,
+                          VkCommandBuffer cmd,
+                          const struct comp_layer *layers,
+                          uint32_t layer_count,
+                          bool before_sampling);
 
 
 /*!
@@ -150,6 +163,7 @@ chl_frame_state_gfx_default_pipeline(struct chl_frame_state *frame_state,
 
 	// Start the compute pipeline.
 	render_gfx_begin(render);
+	chl_steamvr_color_handoff(render->r->vk, render->r->cmd, layers, layer_count, true);
 
 	// Build the command buffer.
 	comp_render_gfx_dispatch( //
@@ -159,6 +173,7 @@ chl_frame_state_gfx_default_pipeline(struct chl_frame_state *frame_state,
 	    &frame_state->data);  //
 
 	// Make the command buffer submittable.
+	chl_steamvr_color_handoff(render->r->vk, render->r->cmd, layers, layer_count, false);
 	render_gfx_end(render);
 }
 
@@ -233,6 +248,7 @@ chl_frame_state_cs_default_pipeline(struct chl_frame_state *frame_state,
 
 	// Start the compute pipeline.
 	render_compute_begin(render);
+	chl_steamvr_color_handoff(render->r->vk, render->r->cmd, layers, layer_count, true);
 
 	// Build the command buffer.
 	comp_render_cs_dispatch( //
@@ -242,6 +258,7 @@ chl_frame_state_cs_default_pipeline(struct chl_frame_state *frame_state,
 	    &frame_state->data); //
 
 	// Make the command buffer submittable.
+	chl_steamvr_color_handoff(render->r->vk, render->r->cmd, layers, layer_count, false);
 	render_compute_end(render);
 }
 

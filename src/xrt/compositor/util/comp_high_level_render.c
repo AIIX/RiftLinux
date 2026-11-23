@@ -1,5 +1,6 @@
 // Copyright 2019-2024, Collabora, Ltd.
 // Copyright 2024-2025, NVIDIA CORPORATION.
+// SPDX-FileCopyrightText: 2026 Ethan Dagnone <ethandagnone@gmail.com>
 // SPDX-License-Identifier: BSL-1.0
 /*!
  * @file
@@ -12,6 +13,8 @@
  */
 
 #include "comp_high_level_render.h"
+#include "comp_swapchain.h"
+#include "comp_layer_accum.h"
 
 
 /*
@@ -227,5 +230,67 @@ chl_frame_state_cs_set_target(struct chl_frame_state *frame_state,
 		    &layer_norm_rect,           // squash_as_src_norm_rect
 		    &views[i],                  // target_viewport_data
 		    &views[i]);                 // target_scissor_data
+	}
+}
+
+/*
+ * SteamVR currently leaves its direct-mode compositor attachments in COLOR_ATTACHMENT_OPTIMAL.
+ * Keep this compatibility contract local to explicitly marked swapchains. This is not an
+ * external queue-family ownership transfer: SteamVR supplies no matching release operation.
+ * The producer dma-buf fence is waited by the multi compositor before publishing the frame.
+ * Return the layout in the same submission, including repeated/reprojected frames, before
+ * the existing renderer completion wait allows the image to be returned to SteamVR.
+ */
+void
+chl_steamvr_color_handoff(struct vk_bundle *vk,
+                          VkCommandBuffer cmd,
+                          const struct comp_layer *layers,
+                          uint32_t layer_count,
+                          bool before_sampling)
+{
+	VkImageMemoryBarrier barriers[XRT_MAX_LAYERS * 2];
+	uint32_t count = 0;
+	assert(layer_count <= XRT_MAX_LAYERS);
+	for (uint32_t l = 0; l < layer_count; l++) {
+		// The direct-mode adapter submits stereo projection layers exclusively.
+		if (layers[l].data.type != XRT_LAYER_PROJECTION) {
+			continue;
+		}
+		for (uint32_t eye = 0; eye < 2; eye++) {
+			struct comp_swapchain *sc = comp_swapchain(layers[l].sc_array[eye]);
+			if (sc == NULL || !sc->steamvr_color_handoff) {
+				continue;
+			}
+			uint32_t index = layers[l].data.proj.v[eye].sub.image_index;
+			assert(index < sc->vkic.image_count);
+			VkImage image = sc->vkic.images[index].handle;
+			bool seen = false;
+			for (uint32_t i = 0; i < count; i++) {
+				seen |= barriers[i].image == image;
+			}
+			if (seen) {
+				continue;
+			}
+			barriers[count++] = (VkImageMemoryBarrier){
+			    .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+			    .srcAccessMask =
+			        before_sampling ? VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT : VK_ACCESS_SHADER_READ_BIT,
+			    .dstAccessMask = before_sampling ? VK_ACCESS_SHADER_READ_BIT
+			                                     : VK_ACCESS_COLOR_ATTACHMENT_READ_BIT |
+			                                           VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
+			    .oldLayout = before_sampling ? VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL
+			                                 : VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+			    .newLayout = before_sampling ? VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL
+			                                 : VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+			    .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+			    .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+			    .image = image,
+			    .subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1},
+			};
+		}
+	}
+	if (count > 0) {
+		vk->vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0,
+		                         0, NULL, 0, NULL, count, barriers);
 	}
 }

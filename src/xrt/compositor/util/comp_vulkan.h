@@ -1,5 +1,6 @@
 // Copyright 2019-2021, Collabora, Ltd.
 // Copyright 2025-2026, NVIDIA CORPORATION.
+// SPDX-FileCopyrightText: 2026 Ethan Dagnone <ethandagnone@gmail.com>
 // SPDX-License-Identifier: BSL-1.0
 /*!
  * @file
@@ -23,6 +24,10 @@
 extern "C" {
 #endif
 
+
+//! Identify RADV on the selected physical device, not merely an AMD GPU.
+bool
+comp_vulkan_is_radv(struct vk_bundle *vk);
 
 /*!
  * Arguments to Vulkan bundle initialisation, all args needs setting.
@@ -52,6 +57,9 @@ struct comp_vulkan_arguments
 
 	//! Should we look for a queue with no graphics, only compute.
 	bool only_compute_queue;
+
+	//! Enable the SteamVR colour handoff workaround when the selected driver is RADV.
+	bool steamvr_color_handoff;
 
 	//! Should we try to enable timeline semaphores if available
 	bool timeline_semaphore;

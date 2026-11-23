@@ -1,6 +1,7 @@
 // Copyright 2019-2024, Collabora, Ltd.
 // Copyright 2025-2026, NVIDIA CORPORATION.
 // SPDX-FileCopyrightText: 2026 Aditya Mehra <aix.m@outlook.com>
+// SPDX-FileCopyrightText: 2026 Ethan Dagnone <ethandagnone@gmail.com>
 // SPDX-License-Identifier: BSL-1.0
 /*!
  * @file
@@ -783,6 +784,7 @@ compositor_init_vulkan(struct comp_compositor *c)
 	    .optional_device_extensions = optional_device_ext_list,
 	    .log_level = c->settings.log_level,
 	    .only_compute_queue = c->settings.use_compute,
+	    .steamvr_color_handoff = debug_get_bool_option("RIFTLINUX_STEAMVR_HANDOFF", false),
 	    .selected_gpu_index = c->settings.selected_gpu_index,
 	    .client_gpu_index = c->settings.client_gpu_index,
 	    .timeline_semaphore = true, // Flag is optional, not a hard requirement.

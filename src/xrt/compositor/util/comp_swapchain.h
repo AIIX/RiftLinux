@@ -1,4 +1,5 @@
 // Copyright 2019-2023, Collabora, Ltd.
+// SPDX-FileCopyrightText: 2026 Ethan Dagnone <ethandagnone@gmail.com>
 // SPDX-License-Identifier: BSL-1.0
 /*!
  * @file
@@ -95,6 +96,10 @@ struct comp_swapchain
 	struct vk_bundle *vk;
 	struct comp_swapchain_shared *cscs;
 
+	//! SteamVR compositor-owned attachments: restore colour layout after each sampling submission.
+	//! Set once before publishing the swapchain to the renderer; false for native OpenXR/app images.
+	bool steamvr_color_handoff;
+
 	struct vk_image_collection vkic;
 	struct comp_swapchain_image images[XRT_MAX_SWAPCHAIN_IMAGES];
 
@@ -108,6 +113,10 @@ struct comp_swapchain
 	comp_swapchain_destroy_func_t real_destroy;
 };
 
+
+//! Before publishing a SteamVR compositor-owned swapchain, establish its boundary layout.
+VkResult
+comp_swapchain_enable_steamvr_color_handoff(struct comp_swapchain *sc);
 
 /*
  *

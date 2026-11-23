@@ -1,6 +1,7 @@
 // Copyright 2020,2024 Collabora, Ltd.
 // Copyright 2026, NVIDIA CORPORATION.
 // SPDX-FileCopyrightText: 2026 Aditya Mehra <aix.m@outlook.com>
+// SPDX-FileCopyrightText: 2026 Ethan Dagnone <ethandagnone@gmail.com>
 // SPDX-License-Identifier: BSL-1.0
 /*!
  * @file
@@ -4429,6 +4430,8 @@ CServerDriver_Monado::Init(vr::IVRDriverContext *pDriverContext)
 	xret = xrt_instance_create_system(m_xinst, &m_xsys, &m_xsysd, &m_xso, NULL);
 	ovrd_log("Devices up in %.1f s\n", (double)(os_monotonic_get_ns() - init_start_ns) / 1e9);
 	if (xret >= 0 && direct_mode && m_xsysd->static_roles.head != NULL) {
+		// Confined to this SteamVR process; native OpenXR keeps its normal queue selection.
+		setenv("RIFTLINUX_STEAMVR_HANDOFF", "1", 0);
 		m_xsysc = direct_mode_compositor_start(m_xsysd->static_roles.head, init_start_ns, direct_mode_deadline_s);
 		if (m_xsysc == NULL) {
 			direct_mode = false;
